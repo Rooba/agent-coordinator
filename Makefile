@@ -10,6 +10,7 @@ test:
 install: build
 	install -D -m 0755 $(BIN) $(PREFIX)/bin/$(BIN)
 	$(PREFIX)/bin/$(BIN) install
+	systemctl --user try-restart agent-coordinator.service
 
 uninstall:
 	$(PREFIX)/bin/$(BIN) install --uninstall

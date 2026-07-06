@@ -61,7 +61,9 @@ runs `agent-coordinator install`, which:
   (`agent-coordinator.socket` + `agent-coordinator.service`),
 - merges the four hooks into `~/.claude/settings.json` (existing hooks are
   preserved; the merge is idempotent),
-- registers the MCP server: `claude mcp add --scope user agent-coordinator`.
+- registers the MCP server (done for you; equivalent to `claude mcp add
+  --scope user --transport stdio agent-coordinator --
+  ~/.local/bin/agent-coordinator mcp`).
 
 Uninstall with `make uninstall` (or `agent-coordinator install
 --uninstall`): removes the units, strips exactly the hooks it added, and

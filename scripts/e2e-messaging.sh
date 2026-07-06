@@ -53,11 +53,13 @@ name). Your final reply must contain exactly one line: 'E2E-SENT' if the \
 send succeeded, or 'E2E-FAIL: <reason>' otherwise."
 
 # Sessions resolve their coordinator scope from their cwd, so both must be
-# launched FROM the e2e repo (subshell cd, not --add-dir).
-( cd "$REPO" && claude -p "$PROMPT_A" --allowedTools "$ALLOWED" ) > "$LOG_A" 2>&1 &
+# launched FROM the e2e repo (subshell cd, not --add-dir). Each session is
+# bounded by timeout(1) so a regressed push path fails the gate fast
+# instead of hanging it.
+( cd "$REPO" && timeout 300 claude -p "$PROMPT_A" --allowedTools "$ALLOWED" ) > "$LOG_A" 2>&1 &
 PID_A=$!
 sleep 8
-( cd "$REPO" && claude -p "$PROMPT_B" --allowedTools "$ALLOWED" ) > "$LOG_B" 2>&1 || true
+( cd "$REPO" && timeout 300 claude -p "$PROMPT_B" --allowedTools "$ALLOWED" ) > "$LOG_B" 2>&1 || true
 wait "$PID_A" || true
 
 echo "--- session A output ---"
@@ -66,6 +68,7 @@ echo "--- session B output ---"
 cat "$LOG_B"
 echo "------------------------"
 
+# On failure the temp logs and repo are intentionally left behind for postmortem.
 FAIL=0
 grep -q "E2E-SENT" "$LOG_B" || { echo "E2E FAIL: B did not report E2E-SENT"; FAIL=1; }
 grep -q "E2E-GOT: .*e2e-ping-42" "$LOG_A" || { echo "E2E FAIL: A did not receive the DM"; FAIL=1; }
