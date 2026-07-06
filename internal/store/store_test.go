@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -31,6 +32,38 @@ func TestRegisterAssignsStableUniqueNames(t *testing.T) {
 	n2, _ := s.Register("/repo", "sess-2", "startup")
 	if n2 == n1 {
 		t.Fatal("two sessions got the same name")
+	}
+}
+
+// Regression: two sessions whose friendlyName collides must get distinct
+// names, backed by the unique (scope, name) index.
+func TestRegisterCollidingFriendlyNames(t *testing.T) {
+	s := open(t)
+	base := friendlyName("seed-0")
+	other := ""
+	for i := 1; i < 100000; i++ {
+		if id := fmt.Sprintf("seed-%d", i); friendlyName(id) == base {
+			other = id
+			break
+		}
+	}
+	if other == "" {
+		t.Fatal("no colliding session id found")
+	}
+	n1, err := s.Register("/r", "seed-0", "startup")
+	if err != nil || n1 != base {
+		t.Fatalf("first register: %q %v", n1, err)
+	}
+	n2, err := s.Register("/r", other, "startup")
+	if err != nil || n2 != base+"-2" {
+		t.Fatalf("colliding register must take next suffix, got %q %v", n2, err)
+	}
+	// The index itself must reject a duplicate name, and Register's retry
+	// must recognize the driver's unique-violation error.
+	_, err = s.db.Exec(`INSERT INTO agents (scope, session_id, agent_id, name, status, registered_at, last_seen)
+		VALUES ('/r','dupe','dupe',?, 'active',0,0)`, base)
+	if !isUniqueViolation(err) {
+		t.Fatalf("want unique violation on duplicate name, got %v", err)
 	}
 }
 

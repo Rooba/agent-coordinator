@@ -42,6 +42,9 @@ func MergeHooks(settings []byte, binPath string) ([]byte, bool, error) {
 	if err := json.Unmarshal(settings, &root); err != nil {
 		return nil, false, fmt.Errorf("settings.json is not valid JSON: %w", err)
 	}
+	if root == nil { // settings.json was the JSON literal null
+		root = map[string]any{}
+	}
 	hooks := map[string]any{}
 	if v, exists := root["hooks"]; exists {
 		m, ok := v.(map[string]any)
@@ -159,6 +162,28 @@ func containsCommand(entries []any, cmd string) bool {
 	return false
 }
 
+// writeFileAtomic writes via a temp file in the same directory + rename, so a
+// crash mid-write can never leave a truncated settings.json behind.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name()) // no-op after a successful rename
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
+}
+
 func UnitFiles(binPath string) (string, string) {
 	socket := `[Unit]
 Description=Agent coordinator socket
@@ -197,6 +222,10 @@ func Install(binPath, home string, run func(string, ...string) error) error {
 	if err := run("systemctl", "--user", "enable", "--now", "agent-coordinator.socket"); err != nil {
 		return err
 	}
+	// Pick up the new binary on re-install; exits 0 when nothing is running.
+	if err := run("systemctl", "--user", "try-restart", "agent-coordinator.service"); err != nil {
+		return err
+	}
 	settingsPath := filepath.Join(home, ".claude", "settings.json")
 	cur, err := os.ReadFile(settingsPath)
 	if err != nil && !os.IsNotExist(err) {
@@ -210,7 +239,7 @@ func Install(binPath, home string, run func(string, ...string) error) error {
 		if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o755); err != nil {
 			return err
 		}
-		if err := os.WriteFile(settingsPath, merged, 0o644); err != nil {
+		if err := writeFileAtomic(settingsPath, merged, 0o644); err != nil {
 			return err
 		}
 	}
@@ -232,7 +261,7 @@ func Uninstall(binPath, home string, run func(string, ...string) error) error {
 	settingsPath := filepath.Join(home, ".claude", "settings.json")
 	if cur, err := os.ReadFile(settingsPath); err == nil {
 		if out, changed, err := RemoveHooks(cur, binPath); err == nil && changed {
-			os.WriteFile(settingsPath, out, 0o644)
+			writeFileAtomic(settingsPath, out, 0o644)
 		}
 	}
 	run("claude", "mcp", "remove", "--scope", "user", "agent-coordinator")

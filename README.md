@@ -58,9 +58,11 @@ This builds the binary, copies it to `~/.local/bin/agent-coordinator`, and
 runs `agent-coordinator install`, which:
 
 - writes and enables a systemd user socket unit
-  (`agent-coordinator.socket` + `agent-coordinator.service`),
+  (`agent-coordinator.socket` + `agent-coordinator.service`), then
+  `try-restart`s the service so a running daemon picks up the new binary
+  (a no-op when nothing is running),
 - merges the four hooks into `~/.claude/settings.json` (existing hooks are
-  preserved; the merge is idempotent),
+  preserved; the merge is idempotent and the write is atomic),
 - registers the MCP server (done for you; equivalent to `claude mcp add
   --scope user --transport stdio agent-coordinator --
   ~/.local/bin/agent-coordinator mcp`).
@@ -117,7 +119,9 @@ read (30 days unconditionally).
 
 ## Environment variables
 
-- `AC_SOCKET` - socket path. Default `$XDG_RUNTIME_DIR/agent-coordinator.sock`.
+- `AC_SOCKET` - socket path. Default `$XDG_RUNTIME_DIR/agent-coordinator.sock`;
+  if `XDG_RUNTIME_DIR` is unset, a private per-uid directory
+  `/tmp/agent-coordinator-<uid>/agent-coordinator.sock` (mode 0700).
 - `AC_DB` - database path. Default `~/.local/state/agent-coordinator/coordinator.db`.
 - `AC_DEBUG` - when set, the hook logs diagnostics to stderr instead of
   failing silently. Try `AC_DEBUG=1 agent-coordinator hook < event.json`.

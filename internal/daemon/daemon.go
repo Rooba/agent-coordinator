@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -34,8 +35,6 @@ func Listener() (net.Listener, bool, error) {
 }
 
 func Serve(l net.Listener, st *store.Store, idleTimeout time.Duration) error {
-	defer l.Close()
-	defer st.Close()
 	st.Housekeep()
 
 	var lastActivity atomic.Int64
@@ -67,19 +66,31 @@ func Serve(l net.Listener, st *store.Store, idleTimeout time.Duration) error {
 		}
 	}()
 
+	// Drain on shutdown: whatever ends the accept loop, close the listener,
+	// wait for in-flight handlers, and only then close the store.
+	var wg sync.WaitGroup
+	var serveErr error
 	for {
 		conn, err := l.Accept()
 		if err != nil {
 			select {
-			case <-stop:
-				return nil // clean idle-exit or signal
+			case <-stop: // clean idle-exit or signal
 			default:
-				return err
+				serveErr = err
 			}
+			break
 		}
 		lastActivity.Store(time.Now().UnixNano())
-		go handle(conn, st)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			handle(conn, st)
+		}()
 	}
+	l.Close()
+	wg.Wait()
+	st.Close()
+	return serveErr
 }
 
 func handle(conn net.Conn, st *store.Store) {

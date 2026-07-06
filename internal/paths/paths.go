@@ -13,7 +13,12 @@ func Socket() string {
 	if rt := os.Getenv("XDG_RUNTIME_DIR"); rt != "" {
 		return filepath.Join(rt, "agent-coordinator.sock")
 	}
-	return filepath.Join(os.TempDir(), fmt.Sprintf("agent-coordinator-%d.sock", os.Getuid()))
+	// /tmp fallback: a private per-uid directory so another local user cannot
+	// squat the socket path. If the dir exists with foreign ownership/perms,
+	// the daemon's Listen fails on its own - no extra checks here.
+	dir := filepath.Join(os.TempDir(), fmt.Sprintf("agent-coordinator-%d", os.Getuid()))
+	os.MkdirAll(dir, 0o700)
+	return filepath.Join(dir, "agent-coordinator.sock")
 }
 
 func DB() (string, error) {

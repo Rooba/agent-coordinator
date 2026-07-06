@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/agent-coordinator/go/internal/protocol"
@@ -20,6 +21,7 @@ CREATE TABLE IF NOT EXISTS agents (
   registered_at INTEGER NOT NULL, last_seen INTEGER NOT NULL,
   PRIMARY KEY (scope, session_id)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_scope_name ON agents(scope, name);
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   scope TEXT NOT NULL, agent_id TEXT NOT NULL,
@@ -94,19 +96,33 @@ func (s *Store) Register(scope, sessionID, source string) (string, error) {
 	}
 	base := friendlyName(sessionID)
 	name = base
-	for n := 2; ; n++ {
+	for n := 2; n <= 50; n++ {
 		var count int
 		if err := s.db.QueryRow(`SELECT COUNT(*) FROM agents WHERE scope=? AND name=?`, scope, name).Scan(&count); err != nil {
 			return "", err
 		}
 		if count == 0 {
-			break
+			_, err := s.db.Exec(`INSERT INTO agents (scope, session_id, agent_id, name, status, registered_at, last_seen)
+				VALUES (?,?,?,?,'active',?,?)`, scope, sessionID, agentID(sessionID), name, now, now)
+			if err == nil {
+				return name, nil
+			}
+			if !isUniqueViolation(err) {
+				return "", err
+			}
+			// Unique race: either a concurrent Register won this session's PK
+			// (return its name) or took this name (try the next suffix).
+			if e := s.db.QueryRow(`SELECT name FROM agents WHERE scope=? AND session_id=?`, scope, sessionID).Scan(&name); e == nil {
+				return name, nil
+			}
 		}
 		name = fmt.Sprintf("%s-%d", base, n)
 	}
-	_, err = s.db.Exec(`INSERT INTO agents (scope, session_id, agent_id, name, status, registered_at, last_seen)
-		VALUES (?,?,?,?,'active',?,?)`, scope, sessionID, agentID(sessionID), name, now, now)
-	return name, err
+	return "", fmt.Errorf("register: no free name near %q in scope %q", base, scope)
+}
+
+func isUniqueViolation(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
 
 func (s *Store) SetStatus(scope, sessionID, status string) error {
@@ -234,7 +250,15 @@ func (s *Store) Read(scope, name string) ([]protocol.Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.db.Query(`
+	// Collect+mark must be one transaction: with SetMaxOpenConns(1) the tx
+	// holds the sole connection, so a concurrent Read cannot see the same
+	// unread rows and double-deliver.
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`
 		SELECT m.id, a.name, m.body, m.created_at, m.to_agent IS NULL
 		FROM deliveries d
 		JOIN messages m ON m.id = d.message_id
@@ -253,15 +277,18 @@ func (s *Store) Read(scope, name string) ([]protocol.Message, error) {
 		}
 		out = append(out, m)
 	}
-	rows.Close() // release the sole connection before the UPDATEs below
+	rows.Close() // release the tx's connection before the UPDATEs below
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	now := s.Now().Unix()
 	for _, m := range out {
-		if _, err := s.db.Exec(`UPDATE deliveries SET read_at=? WHERE message_id=? AND agent_id=?`, now, m.ID, aid); err != nil {
+		if _, err := tx.Exec(`UPDATE deliveries SET read_at=? WHERE message_id=? AND agent_id=?`, now, m.ID, aid); err != nil {
 			return nil, err
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -270,7 +297,15 @@ func (s *Store) Read(scope, name string) ([]protocol.Message, error) {
 func (s *Store) noticesFor(scope, aid string, writes []string) ([]string, error) {
 	var notices []string
 	now := s.Now().Unix()
-	rows, err := s.db.Query(`
+	// Collect+mark must be one transaction: with SetMaxOpenConns(1) the tx
+	// holds the sole connection, so concurrent RecordEvent calls cannot both
+	// see the same undelivered rows and emit duplicate notices.
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`
 		SELECT m.id, a.name, m.to_agent IS NULL
 		FROM deliveries d
 		JOIN messages m ON m.id = d.message_id
@@ -298,8 +333,16 @@ func (s *Store) noticesFor(scope, aid string, writes []string) ([]string, error)
 			dmCount[from]++
 		}
 	}
-	rows.Close()
+	rows.Close() // release the tx's connection before the UPDATEs below
 	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for _, id := range ids {
+		if _, err := tx.Exec(`UPDATE deliveries SET notice_sent_at=? WHERE message_id=? AND agent_id=?`, now, id, aid); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	for from, n := range dmCount {
@@ -311,11 +354,6 @@ func (s *Store) noticesFor(scope, aid string, writes []string) ([]string, error)
 	}
 	for _, from := range bcasts {
 		notices = append(notices, fmt.Sprintf("[coordinator] broadcast from %s - call read_messages", from))
-	}
-	for _, id := range ids {
-		if _, err := s.db.Exec(`UPDATE deliveries SET notice_sent_at=? WHERE message_id=? AND agent_id=?`, now, id, aid); err != nil {
-			return nil, err
-		}
 	}
 	// Conflicts: other agents' recent writes to the same paths.
 	cutoff := s.Now().Add(-conflictWindow).Unix()

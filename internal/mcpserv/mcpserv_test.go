@@ -68,6 +68,36 @@ func TestInitializeAndList(t *testing.T) {
 	}
 }
 
+// Regression: a single line over the old 1MiB Scanner cap must be served,
+// not kill Serve.
+func TestOversizedLineIsServed(t *testing.T) {
+	sock, _ := fakeDaemon(t, protocol.Response{OK: true})
+	pad := strings.Repeat("x", 1<<20+4096)
+	out := rpc(t, sock,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"pad":"`+pad+`"}}`)
+	if len(out) != 1 || !strings.Contains(out[0], "status_board") {
+		t.Fatalf("oversized request not served: %d responses", len(out))
+	}
+}
+
+// Regression: a garbage line must yield a JSON-RPC -32700 parse error and
+// Serve must keep serving subsequent requests.
+func TestGarbageLineYieldsParseError(t *testing.T) {
+	sock, _ := fakeDaemon(t, protocol.Response{OK: true})
+	out := rpc(t, sock,
+		"this is not json",
+		`{"jsonrpc":"2.0","id":7,"method":"tools/list"}`)
+	if len(out) != 2 {
+		t.Fatalf("want parse-error line + response, got %v", out)
+	}
+	if !strings.Contains(out[0], "-32700") || !strings.Contains(out[0], `"id":null`) || !strings.Contains(out[0], "parse error") {
+		t.Fatalf("parse error line: %s", out[0])
+	}
+	if !strings.Contains(out[1], `"id":7`) || !strings.Contains(out[1], "status_board") {
+		t.Fatalf("server must keep serving after garbage: %s", out[1])
+	}
+}
+
 func TestSendMessageToolCall(t *testing.T) {
 	sock, got := fakeDaemon(t, protocol.Response{OK: true})
 	out := rpc(t, sock,

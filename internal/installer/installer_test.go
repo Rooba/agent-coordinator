@@ -53,6 +53,28 @@ func TestMergeFromEmptySettings(t *testing.T) {
 	}
 }
 
+// Regression: a settings.json containing the JSON literal null must not panic.
+func TestMergeHooksNullSettings(t *testing.T) {
+	out, changed, err := MergeHooks([]byte("null"), "/bin/ac")
+	if err != nil || !changed {
+		t.Fatalf("changed=%v err=%v", changed, err)
+	}
+	if !strings.Contains(string(out), "/bin/ac hook") {
+		t.Fatalf("got %s", out)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatalf("output not valid JSON: %v", err)
+	}
+}
+
+func TestRemoveHooksNullSettings(t *testing.T) {
+	out, changed, err := RemoveHooks([]byte("null"), "/bin/ac")
+	if err != nil || changed || string(out) != "null" {
+		t.Fatalf("want unchanged null, got changed=%v err=%v out=%s", changed, err, out)
+	}
+}
+
 func TestRemoveHooksOnlyOurs(t *testing.T) {
 	merged, _, _ := MergeHooks([]byte(existing), "/bin/ac")
 	out, changed, err := RemoveHooks(merged, "/bin/ac")
@@ -153,6 +175,7 @@ func TestInstallUninstallRoundTrip(t *testing.T) {
 	for _, want := range [][]string{
 		{"systemctl", "--user", "daemon-reload"},
 		{"systemctl", "--user", "enable", "--now", "agent-coordinator.socket"},
+		{"systemctl", "--user", "try-restart", "agent-coordinator.service"},
 		{"claude", "mcp", "add", "--scope", "user", "--transport", "stdio", "agent-coordinator", "--", "/bin/ac", "mcp"},
 	} {
 		if !hasCall(calls, want) {

@@ -2,6 +2,7 @@ package mcpserv
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -26,33 +27,40 @@ type callParams struct {
 
 func Serve(stdin io.Reader, stdout io.Writer, socketPath, cwd string) error {
 	sc := scope.Resolve(cwd)
-	scanner := bufio.NewScanner(stdin)
-	scanner.Buffer(make([]byte, 0, 1<<20), 1<<20)
+	// bufio.Reader instead of Scanner: the peer is the local Claude Code
+	// process, so lines have no fixed cap and an oversized one must not
+	// kill the session.
+	r := bufio.NewReader(stdin)
 	enc := json.NewEncoder(stdout)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
+	for {
+		line, err := r.ReadBytes('\n')
+		if trimmed := bytes.TrimSpace(line); len(trimmed) > 0 {
+			var resp map[string]any
+			var req rpcReq
+			if json.Unmarshal(trimmed, &req) != nil {
+				resp = map[string]any{"jsonrpc": "2.0", "id": nil,
+					"error": map[string]any{"code": -32700, "message": "parse error"}}
+			} else if req.ID != nil { // notifications get no response
+				resp = map[string]any{"jsonrpc": "2.0", "id": req.ID}
+				if result, rpcErr := handle(req, sc, socketPath); rpcErr != nil {
+					resp["error"] = rpcErr
+				} else {
+					resp["result"] = result
+				}
+			}
+			if resp != nil {
+				if werr := enc.Encode(resp); werr != nil {
+					return werr
+				}
+			}
 		}
-		var req rpcReq
-		if err := json.Unmarshal(line, &req); err != nil {
-			continue
+		if err == io.EOF {
+			return nil // stdin closed: clean shutdown
 		}
-		if req.ID == nil { // notification
-			continue
-		}
-		result, rpcErr := handle(req, sc, socketPath)
-		resp := map[string]any{"jsonrpc": "2.0", "id": req.ID}
-		if rpcErr != nil {
-			resp["error"] = rpcErr
-		} else {
-			resp["result"] = result
-		}
-		if err := enc.Encode(resp); err != nil {
+		if err != nil {
 			return err
 		}
 	}
-	return scanner.Err()
 }
 
 func handle(req rpcReq, sc, socketPath string) (any, map[string]any) {

@@ -2,6 +2,7 @@ package store
 
 import (
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,6 +37,72 @@ func TestSendNoticeOnceThenRead(t *testing.T) {
 	}
 	if msgs, _ = s.Read("/r", nB); len(msgs) != 0 {
 		t.Fatal("read must mark messages read")
+	}
+}
+
+// Regression: the notice collect+mark in noticesFor must be atomic - two
+// concurrent RecordEvent calls for one recipient must emit exactly one notice.
+func TestConcurrentRecordEventEmitsNoticeOnce(t *testing.T) {
+	s, nA, nB := twoAgents(t)
+	if err := s.Send("/r", nA, nB, "ping"); err != nil {
+		t.Fatal(err)
+	}
+	var barrier, done sync.WaitGroup
+	barrier.Add(1)
+	notices := make([][]string, 2)
+	errs := make([]error, 2)
+	done.Add(2)
+	for i := range notices {
+		go func(i int) {
+			defer done.Done()
+			barrier.Wait()
+			notices[i], errs[i] = s.RecordEvent("/r", "sess-b", protocol.Request{Tool: "Read", Activity: "r"})
+		}(i)
+	}
+	barrier.Done()
+	done.Wait()
+	total := 0
+	for i := range notices {
+		if errs[i] != nil {
+			t.Fatal(errs[i])
+		}
+		total += len(notices[i])
+	}
+	if total != 1 {
+		t.Fatalf("want exactly one notice across both events, got %d: %v", total, notices)
+	}
+}
+
+// Regression: the unread collect+mark in Read must be atomic - two concurrent
+// Read calls must return the pending message exactly once between them.
+func TestConcurrentReadDeliversOnce(t *testing.T) {
+	s, nA, nB := twoAgents(t)
+	if err := s.Send("/r", nA, nB, "ping"); err != nil {
+		t.Fatal(err)
+	}
+	var barrier, done sync.WaitGroup
+	barrier.Add(1)
+	msgs := make([][]protocol.Message, 2)
+	errs := make([]error, 2)
+	done.Add(2)
+	for i := range msgs {
+		go func(i int) {
+			defer done.Done()
+			barrier.Wait()
+			msgs[i], errs[i] = s.Read("/r", nB)
+		}(i)
+	}
+	barrier.Done()
+	done.Wait()
+	total := 0
+	for i := range msgs {
+		if errs[i] != nil {
+			t.Fatal(errs[i])
+		}
+		total += len(msgs[i])
+	}
+	if total != 1 {
+		t.Fatalf("want the message delivered exactly once across both reads, got %d: %v", total, msgs)
 	}
 }
 

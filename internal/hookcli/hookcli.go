@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/agent-coordinator/go/internal/activity"
@@ -69,7 +70,7 @@ func Run(stdin io.Reader, stdout io.Writer, socketPath string) {
 	switch in.HookEventName {
 	case "PostToolUse":
 		if len(resp.Notices) > 0 {
-			emit(stdout, "PostToolUse", joinLines(resp.Notices))
+			emit(stdout, "PostToolUse", strings.Join(resp.Notices, "\n"))
 		}
 	case "SessionStart":
 		if resp.Name != "" {
@@ -111,17 +112,6 @@ func emit(w io.Writer, event, context string) {
 		return
 	}
 	w.Write(b)
-}
-
-func joinLines(ss []string) string {
-	out := ""
-	for i, s := range ss {
-		if i > 0 {
-			out += "\n"
-		}
-		out += s
-	}
-	return out
 }
 
 func debugf(format string, args ...any) {
