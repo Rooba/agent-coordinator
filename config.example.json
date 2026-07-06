@@ -1,0 +1,24 @@
+{
+  "server": {
+    "port": "8080",
+    "host": "localhost"
+  },
+  "logging": {
+    "level": "info",
+    "format": "text"
+  },
+  "features": {
+    "cross_codebase": true,
+    "persistence": false
+  },
+  "cleanup": {
+    "enabled": true,
+    "interval": "5m",
+    "agent_offline_timeout": "2m",
+    "completed_task_max_age": "24h"
+  },
+  "heartbeat": {
+    "interval": "30s",
+    "timeout": "60s"
+  }
+}
