@@ -1,11 +1,11 @@
 package installer
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 var hookEvents = []struct{ event, matcher string }{
@@ -17,24 +17,50 @@ var hookEvents = []struct{ event, matcher string }{
 
 func hookCommand(binPath string) string { return binPath + " hook" }
 
+// marshalSettings renders settings without HTML escaping so foreign commands
+// containing & < > survive byte-identical. Output ends with a newline.
+func marshalSettings(root map[string]any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(root); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 // MergeHooks ensures our hook entries exist; preserves everything else byte-for-byte
-// semantically (round-trips through map[string]any, 2-space indent).
+// semantically (round-trips through map[string]any, 2-space indent). It refuses to
+// proceed (returns an error) if "hooks" or an event list has an unexpected shape,
+// rather than clobbering foreign values.
 func MergeHooks(settings []byte, binPath string) ([]byte, bool, error) {
-	var root map[string]any
 	if len(settings) == 0 {
 		settings = []byte("{}")
 	}
+	var root map[string]any
 	if err := json.Unmarshal(settings, &root); err != nil {
 		return nil, false, fmt.Errorf("settings.json is not valid JSON: %w", err)
 	}
-	hooks, _ := root["hooks"].(map[string]any)
-	if hooks == nil {
-		hooks = map[string]any{}
+	hooks := map[string]any{}
+	if v, exists := root["hooks"]; exists {
+		m, ok := v.(map[string]any)
+		if !ok {
+			return nil, false, fmt.Errorf("settings.json: \"hooks\" is not an object; refusing to overwrite")
+		}
+		hooks = m
 	}
 	changed := false
 	cmd := hookCommand(binPath)
 	for _, he := range hookEvents {
-		entries, _ := hooks[he.event].([]any)
+		var entries []any
+		if v, exists := hooks[he.event]; exists {
+			list, ok := v.([]any)
+			if !ok {
+				return nil, false, fmt.Errorf("settings.json: hooks.%s is not an array; refusing to overwrite", he.event)
+			}
+			entries = list
+		}
 		if containsCommand(entries, cmd) {
 			continue
 		}
@@ -49,40 +75,56 @@ func MergeHooks(settings []byte, binPath string) ([]byte, bool, error) {
 		return settings, false, nil
 	}
 	root["hooks"] = hooks
-	out, err := json.MarshalIndent(root, "", "  ")
-	return out, true, err
+	out, err := marshalSettings(root)
+	return out, changed, err
 }
 
-// RemoveHooks strips matcher-groups whose every inner hook command contains binPath,
-// and strips our inner hooks from mixed groups.
+// RemoveHooks strips only inner hooks whose command is exactly "<binPath> hook",
+// dropping a matcher-group or event list only when it was entirely ours. Foreign
+// or oddly-shaped values are always kept as-is.
 func RemoveHooks(settings []byte, binPath string) ([]byte, bool, error) {
+	if binPath == "" {
+		// Defense in depth: an empty binPath must never match anything.
+		return settings, false, nil
+	}
 	var root map[string]any
 	if err := json.Unmarshal(settings, &root); err != nil {
 		return nil, false, err
 	}
-	hooks, _ := root["hooks"].(map[string]any)
-	if hooks == nil {
+	hooks, ok := root["hooks"].(map[string]any)
+	if !ok {
 		return settings, false, nil
 	}
+	cmd := hookCommand(binPath)
 	changed := false
 	for event, v := range hooks {
-		entries, _ := v.([]any)
+		entries, ok := v.([]any)
+		if !ok || len(entries) == 0 {
+			continue // not a list we manage, or nothing to strip; keep as-is
+		}
 		var kept []any
 		for _, e := range entries {
-			group, _ := e.(map[string]any)
-			inner, _ := group["hooks"].([]any)
+			group, ok := e.(map[string]any)
+			if !ok {
+				kept = append(kept, e)
+				continue
+			}
+			inner, ok := group["hooks"].([]any)
+			if !ok || len(inner) == 0 {
+				kept = append(kept, e)
+				continue
+			}
 			var keptInner []any
 			for _, h := range inner {
 				hm, _ := h.(map[string]any)
-				c, _ := hm["command"].(string)
-				if strings.Contains(c, binPath) {
+				if c, _ := hm["command"].(string); c == cmd {
 					changed = true
 					continue
 				}
 				keptInner = append(keptInner, h)
 			}
 			if len(keptInner) == 0 {
-				continue
+				continue // group was entirely ours
 			}
 			group["hooks"] = keptInner
 			kept = append(kept, group)
@@ -96,8 +138,11 @@ func RemoveHooks(settings []byte, binPath string) ([]byte, bool, error) {
 	if !changed {
 		return settings, false, nil
 	}
-	out, err := json.MarshalIndent(root, "", "  ")
-	return out, true, err
+	if len(hooks) == 0 {
+		delete(root, "hooks")
+	}
+	out, err := marshalSettings(root)
+	return out, changed, err
 }
 
 func containsCommand(entries []any, cmd string) bool {
@@ -162,6 +207,9 @@ func Install(binPath, home string, run func(string, ...string) error) error {
 		return err
 	}
 	if changed {
+		if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o755); err != nil {
+			return err
+		}
 		if err := os.WriteFile(settingsPath, merged, 0o644); err != nil {
 			return err
 		}
@@ -174,8 +222,7 @@ func Install(binPath, home string, run func(string, ...string) error) error {
 	return nil
 }
 
-func Uninstall(home string, run func(string, ...string) error) error {
-	binPath, _ := os.Executable()
+func Uninstall(binPath, home string, run func(string, ...string) error) error {
 	run("systemctl", "--user", "disable", "--now", "agent-coordinator.socket")
 	run("systemctl", "--user", "stop", "agent-coordinator.service")
 	unitDir := filepath.Join(home, ".config", "systemd", "user")

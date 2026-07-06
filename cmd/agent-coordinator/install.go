@@ -14,23 +14,23 @@ func runInstall(args []string) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	bin, err := os.Executable()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	run := func(name string, cargs ...string) error {
 		cmd := exec.Command(name, cargs...)
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 		return cmd.Run()
 	}
 	if len(args) > 0 && args[0] == "--uninstall" {
-		if err := installer.Uninstall(home, run); err != nil {
+		if err := installer.Uninstall(bin, home, run); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 		fmt.Println("uninstalled")
 		return
-	}
-	bin, err := os.Executable()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
 	}
 	if err := installer.Install(bin, home, run); err != nil {
 		fmt.Fprintln(os.Stderr, err)
