@@ -28,6 +28,3 @@ func main() {
 		os.Exit(2)
 	}
 }
-
-// Stubs, replaced by later tasks. Delete each when its real file lands.
-func runInstall(args []string) { fmt.Fprintln(os.Stderr, "not implemented"); os.Exit(1) }
