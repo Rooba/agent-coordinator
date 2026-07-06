@@ -1,4 +1,5 @@
 BIN := agent-coordinator
+PREFIX := $(HOME)/.local
 
 build:
 	go build -o $(BIN) ./cmd/agent-coordinator
@@ -7,9 +8,14 @@ test:
 	go test ./...
 
 install: build
-	./$(BIN) install
+	install -D -m 0755 $(BIN) $(PREFIX)/bin/$(BIN)
+	$(PREFIX)/bin/$(BIN) install
+
+uninstall:
+	$(PREFIX)/bin/$(BIN) install --uninstall
+	rm -f $(PREFIX)/bin/$(BIN)
 
 clean:
 	rm -f $(BIN)
 
-.PHONY: build test install clean
+.PHONY: build test install uninstall clean

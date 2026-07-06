@@ -1,299 +1,137 @@
-# Agent Coordinator (Go)
+# agent-coordinator
 
-A **Model Context Protocol (MCP) server** that enables multiple AI agents to coordinate their work seamlessly across codebases without conflicts. Built with Go for easy deployment and broad accessibility.
+Presence, status, and messaging for concurrent Claude Code sessions working
+in the same repository. v2 is hooks-based: session lifecycle events flow
+through Claude Code hooks into a small socket-activated daemon, and peer
+tools are exposed over MCP. There is no proxy in front of the model and no
+polling - message notices are pushed into an agent's context on its next
+tool call.
 
-## 🎯 What is Agent Coordinator?
+## How it works
 
-Agent Coordinator is an MCP server that solves the problem of multiple AI agents stepping on each other's toes when working on the same codebase. Instead of agents conflicting over files or duplicating work, they can register with the coordinator, receive tasks, and collaborate intelligently.
+One binary, four subcommands:
 
-**Key Features:**
+- `daemon` - owns the SQLite state, serves a line-JSON protocol on a unix
+  socket (systemd socket activation: the daemon only runs while in use).
+- `hook` - invoked by user-level Claude Code hooks (SessionStart,
+  PostToolUse, Stop, SessionEnd). Forwards the event to the daemon and
+  injects any response back into the session as additional context. Every
+  error path is a silent no-op: a broken coordinator can never break a
+  Claude session.
+- `mcp` - stdio MCP server exposing the five peer tools, backed by the
+  same socket.
+- `install` - registers all of the above (see Install below).
 
-- **🤖 Multi-Agent Coordination**: Register multiple AI agents (GitHub Copilot, Claude, etc.) with different capabilities
-- **📝 Intelligent Task Distribution**: Automatically assigns tasks to agents based on their capabilities and availability
-- **🔄 Cross-Codebase Support**: Coordinate work across multiple repositories and projects
-- **⚡ Real-Time Communication**: Agents can communicate and share progress via heartbeat system
-- **🎯 Smart Task Management**: Queue, prioritize, and track tasks with metadata and dependencies
-- **🔌 MCP Standard Compliance**: Works with any MCP-compatible AI agent or tool
-- **📦 Single Binary Deployment**: Easy deployment with no external dependencies
-
-## 🚀 How It Works
-
-```ascii
- Agent 1          Agent 2         Agent N
-(Copilot)         (Claude)        (Custom)
-     │               │               │
-     └──────── MCP Protocol ─────────┘
-                     │
-      ┌─────────────────────────────┐
-      │       Agent Coordinator     │
-      ├─────────────────────────────┤
-      │ ┌─────────────────────────┐ │
-      │ │     Task Registry       │ │
-      │ ├─────────────────────────┤ │
-      │ │   • Task Queuing        │ │
-      │ │   • Agent Matching      │ │
-      │ │   • Priority Handling   │ │
-      │ └─────────────────────────┘ │
-      │ ┌─────────────────────────┐ │
-      │ │     Agent Manager       │ │
-      │ ├─────────────────────────┤ │
-      │ │   • Registration        │ │
-      │ │   • Heartbeat           │ │
-      │ │   • Capability Match    │ │
-      │ └─────────────────────────┘ │
-      │ ┌─────────────────────────┐ │
-      │ │     Codebase Registry   │ │
-      │ ├─────────────────────────┤ │
-      │ │   • Cross-Repo Tasks    │ │
-      │ │   • Dependencies        │ │
-      │ │   • Workspace Mgmt      │ │
-      │ └─────────────────────────┘ │
-      └─────────────────────────────┘
 ```
-<!-- ᕦ(ò_óˇ)ᕤ -->
-
-## 🛠️ Prerequisites
-
-You need these installed to run Agent Coordinator:
-
-- **Go**: 1.21+
-- **Git**: For version control
-
-## ⚡ Quick Start
-
-### 1. Get the Code
-
-```bash
-git clone https://github.com/your-username/agent-coordinator-go.git
-cd agent-coordinator-go
+   Claude Code session A              Claude Code session B
+    |            |                     |            |
+    | hooks      | MCP (stdio)         | hooks      | MCP (stdio)
+    v            v                     v            v
+   `hook`      `mcp`                  `hook`      `mcp`
+      \           \                     /           /
+       +-----------+---------+---------+-----------+
+                             |
+                             v
+             $XDG_RUNTIME_DIR/agent-coordinator.sock
+                 (systemd socket activation)
+                             |
+                             v
+                 agent-coordinator daemon
+                             |
+                             v
+        ~/.local/state/agent-coordinator/coordinator.db
 ```
 
-### 2. Build and Start the MCP Server
+The push path: agent B calls `send_message`. The next time agent A
+finishes any tool call, A's PostToolUse hook reports the event and the
+daemon piggybacks a notice on the reply - `[coordinator] 1 new message
+from brisk-owl - call read_messages` - which Claude Code injects into A's
+context. A then reads it with `read_messages`.
 
-```bash
-# Build the binary
-go build -o agent-coordinator ./cmd/agent-coordinator
+## Install
 
-# Start the MCP server directly
-./agent-coordinator
-
-# Or with custom configuration
-./agent-coordinator -config config.json
+```
+make install
 ```
 
-### 3. Configure Your AI Tools
+This builds the binary, copies it to `~/.local/bin/agent-coordinator`, and
+runs `agent-coordinator install`, which:
 
-The agent coordinator is designed to work with VS Code and AI tools that support MCP. Add this to your VS Code `settings.json`:
+- writes and enables a systemd user socket unit
+  (`agent-coordinator.socket` + `agent-coordinator.service`),
+- merges the four hooks into `~/.claude/settings.json` (existing hooks are
+  preserved; the merge is idempotent),
+- registers the MCP server: `claude mcp add --scope user agent-coordinator`.
 
-```json
-{
-  "github.copilot.advanced": {
-    "mcp": {
-      "servers": {
-        "agent-coordinator": {
-          "command": "/path/to/agent-coordinator-go/agent-coordinator",
-          "args": [],
-          "env": {
-            "LOG_LEVEL": "info"
-          }
-        }
-      }
-    }
-  }
-}
+Uninstall with `make uninstall` (or `agent-coordinator install
+--uninstall`): removes the units, strips exactly the hooks it added, and
+deregisters the MCP server. State in `~/.local/state/agent-coordinator/`
+is left behind; delete it by hand if you want a clean slate.
+
+## The five tools
+
+All under the MCP server `agent-coordinator`. `from` is always YOUR agent
+name, given to you at session start.
+
+- `status_board` - the full workspace board: every coordinated agent with
+  name, presence, current task, task counts, latest activity and files.
+- `list_agents` - live peers (active or idle) in this workspace.
+- `send_message` - direct message to one agent, by name or agent_id.
+- `read_messages` - read and clear your unread messages.
+- `broadcast` - message every live peer in the workspace at once.
+
+## Agent naming and presence
+
+At SessionStart the daemon registers the session and the hook tells it its
+name: `[coordinator] you are 'deft-pika' in this workspace ...`. Names are
+adjective-animal pairs derived deterministically from the session id, with
+a `-2`, `-3` suffix on collision within a scope. Presence decays with
+inactivity: active (seen < 2 min ago), idle (< 15 min), stale (< 60 min),
+then gone. Stop marks a session idle immediately; SessionEnd marks it
+gone.
+
+## Broadcast etiquette
+
+A broadcast interrupts every live agent in the workspace on its next tool
+call. Keep broadcasts need-to-know only: schema changes, lock handoffs,
+"stop touching X". Anything meant for one agent is a `send_message`.
+
+## Scope semantics
+
+An agent's scope is the git repository root of its working directory.
+Linked worktrees resolve to the MAIN repository root, so a session working
+in a worktree shares the board with sessions in the main checkout.
+Non-git directories scope to themselves. Scopes are fully isolated:
+sessions in different repositories never see each other's agents, boards,
+or messages.
+
+## Data
+
+A single SQLite database at
+`~/.local/state/agent-coordinator/coordinator.db` (honors
+`XDG_STATE_HOME`). The daemon is the only writer. Housekeeping prunes
+agents unseen for 7 days, and messages 7 days after every delivery is
+read (30 days unconditionally).
+
+## Environment variables
+
+- `AC_SOCKET` - socket path. Default `$XDG_RUNTIME_DIR/agent-coordinator.sock`.
+- `AC_DB` - database path. Default `~/.local/state/agent-coordinator/coordinator.db`.
+- `AC_DEBUG` - when set, the hook logs diagnostics to stderr instead of
+  failing silently. Try `AC_DEBUG=1 agent-coordinator hook < event.json`.
+
+## Testing
+
+```
+make test                     # unit + integration tests
+scripts/e2e-messaging.sh      # live E2E: two headless claude sessions
+                              # exchange a DM through the coordinator
 ```
 
-### 4. Test It Works
+The E2E script requires an installed coordinator and the `claude` CLI.
 
-```bash
-# Run the demo to see it in action
-go run ./examples/workflow-demo/main.go
-```
+## History
 
-## 🎮 How to Use
-
-Once your AI agents are connected via MCP, they can:
-
-### Register as an Agent
-
-```bash
-# An agent identifies itself with capabilities
-register_agent("GitHub Copilot", ["coding", "testing"], codebase_id: "my-project")
-```
-
-### Create Tasks
-
-```bash
-# Tasks are created with requirements
-create_task("Fix login bug", "Authentication fails on mobile",
-  priority: "high",
-  required_capabilities: ["coding", "debugging"]
-)
-```
-
-### Coordinate Automatically
-
-The coordinator automatically:
-
-- **Matches** tasks to agents based on capabilities
-- **Queues** tasks when no suitable agents are available
-- **Tracks** agent heartbeats to ensure they're still working
-- **Handles** cross-codebase tasks that span multiple repositories
-
-### Available MCP Tools
-
-All MCP-compatible AI agents get these tools automatically:
-
-| Tool                         | Purpose                                |
-| ---------------------------- | -------------------------------------- |
-| `register_agent`             | Register an agent with capabilities    |
-| `create_task`                | Create a new task with requirements    |
-| `get_next_task`              | Get the next task assigned to an agent |
-| `complete_task`              | Mark current task as completed         |
-| `get_task_board`             | View all agents and their status       |
-| `heartbeat`                  | Send agent heartbeat to stay active    |
-| `register_codebase`          | Register a new codebase/repository     |
-| `create_cross_codebase_task` | Create tasks spanning multiple repos   |
-
-## 🧪 Development & Testing
-
-### Running Tests
-
-```bash
-# Run all tests
-go test ./...
-
-# Run with coverage
-go test -cover ./...
-
-# Run specific package tests
-go test ./internal/agent
-```
-
-### Code Quality
-
-```bash
-# Format code
-go fmt ./...
-
-# Run linter
-golangci-lint run
-
-# Generate documentation
-go doc -all > docs/api.md
-```
-
-## 📁 Project Structure
-
-```text
-agent-coordinator-go/
-├── cmd/
-│   └── agent-coordinator/           # Main application entry point
-├── internal/
-│   ├── agent/                      # Agent management
-│   ├── task/                       # Task data structures
-│   ├── registry/                   # Task and codebase registries
-│   ├── mcp/                        # MCP protocol implementation
-│   ├── inbox/                      # Agent inbox management
-│   └── config/                     # Configuration management
-├── pkg/
-│   └── types/                      # Public API types
-├── examples/                       # Working examples and demos
-├── scripts/                        # Build and deployment scripts
-├── docs/                          # Documentation
-└── tests/                         # Integration tests
-```
-
-## 🤔 Why This Design?
-
-**The Problem**: Multiple AI agents working on the same codebase step on each other, duplicate work, or create conflicts.
-
-**The Solution**: A coordination layer that:
-
-- Lets agents register their capabilities
-- Intelligently distributes tasks
-- Tracks progress and prevents conflicts
-- Scales across multiple repositories
-
-**Why Go?**: Single binary deployment, excellent performance, great concurrency support, and broad platform compatibility.
-
-## 🚀 Deployment
-
-### Single Binary
-
-```bash
-# Build for current platform
-go build -o agent-coordinator ./cmd/agent-coordinator
-
-# Cross-compile for different platforms
-GOOS=linux GOARCH=amd64 go build -o agent-coordinator-linux ./cmd/agent-coordinator
-GOOS=windows GOARCH=amd64 go build -o agent-coordinator.exe ./cmd/agent-coordinator
-GOOS=darwin GOARCH=amd64 go build -o agent-coordinator-mac ./cmd/agent-coordinator
-```
-
-### Docker
-
-```bash
-# Build Docker image
-docker build -t agent-coordinator .
-
-# Run with Docker
-docker run -p 8080:8080 agent-coordinator
-```
-
-## 📄 Configuration
-
-Agent Coordinator can be configured via:
-
-1. **Command line flags**:
-   ```bash
-   ./agent-coordinator -port 8080 -log-level debug
-   ```
-
-2. **Environment variables**:
-   ```bash
-   export AGENT_COORDINATOR_PORT=8080
-   export AGENT_COORDINATOR_LOG_LEVEL=debug
-   ```
-
-3. **Configuration file**:
-   ```json
-   {
-     "server": {
-       "port": 8080,
-       "host": "localhost"
-     },
-     "logging": {
-       "level": "info",
-       "format": "json"
-     },
-     "features": {
-       "cross_codebase": true,
-       "persistence": false
-     }
-   }
-   ```
-
-## 🤝 Contributing
-
-Contributions are welcome! Here's how:
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- [Model Context Protocol](https://modelcontextprotocol.io/) for the agent communication standard
-- [Go](https://golang.org/) community for the excellent ecosystem
-- AI development teams pushing the boundaries of collaborative coding
-
----
-
-**Agent Coordinator (Go)** - Making AI agents work together, not against each other.
+v1 of this project was a task-registry MCP server with a very different
+design. Its code and docs live in git history at baseline commit
+`236d6d9`.
