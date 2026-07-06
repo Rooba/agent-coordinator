@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"os/signal"
@@ -82,14 +83,15 @@ func Serve(l net.Listener, st *store.Store, idleTimeout time.Duration) error {
 }
 
 func handle(conn net.Conn, st *store.Store) {
+	defer func() { _ = recover() }() // a panicking handler must not kill the daemon
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
-	line, err := bufio.NewReaderSize(conn, 1<<20).ReadBytes('\n')
+	line, err := bufio.NewReader(io.LimitReader(conn, 1<<20)).ReadBytes('\n')
 	if err != nil && len(line) == 0 {
 		return
 	}
 	var req protocol.Request
-	resp := protocol.Response{OK: true}
+	var resp protocol.Response
 	if err := json.Unmarshal(line, &req); err != nil {
 		resp = protocol.Response{Error: "bad request: " + err.Error()}
 	} else {
