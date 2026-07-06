@@ -30,7 +30,6 @@ func main() {
 }
 
 // Stubs, replaced by later tasks. Delete each when its real file lands.
-func runDaemon()               { fmt.Fprintln(os.Stderr, "not implemented"); os.Exit(1) }
 func runHook()                 { os.Exit(0) } // fail-open even as a stub
 func runMCP()                  { fmt.Fprintln(os.Stderr, "not implemented"); os.Exit(1) }
 func runInstall(args []string) { fmt.Fprintln(os.Stderr, "not implemented"); os.Exit(1) }
