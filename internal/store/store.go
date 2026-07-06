@@ -115,9 +115,8 @@ func (s *Store) SetStatus(scope, sessionID, status string) error {
 	return err
 }
 
-// RecordEvent ingests one PostToolUse event and returns notices for the agent.
-// Notice generation (messages, conflicts) is completed in Task 6; part 1
-// returns nil notices.
+// RecordEvent ingests one PostToolUse event and returns notices for the agent
+// (unread messages, broadcasts, conflict warnings).
 func (s *Store) RecordEvent(scope, sessionID string, req protocol.Request) ([]string, error) {
 	if _, err := s.Register(scope, sessionID, "event"); err != nil { // auto-register + freshness
 		return nil, err
@@ -157,9 +156,232 @@ func (s *Store) RecordEvent(scope, sessionID string, req protocol.Request) ([]st
 	return s.noticesFor(scope, aid, req.Writes)
 }
 
-// noticesFor is completed in Task 6.
-func (s *Store) noticesFor(scope, agentID string, writes []string) ([]string, error) {
-	return nil, nil
+const conflictWindow = 30 * time.Minute
+
+func (s *Store) resolveAgent(scope, nameOrID string) (aid, name string, err error) {
+	err = s.db.QueryRow(`SELECT agent_id, name FROM agents WHERE scope=? AND (name=? OR agent_id=?)`,
+		scope, nameOrID, nameOrID).Scan(&aid, &name)
+	if err == sql.ErrNoRows {
+		return "", "", fmt.Errorf("no agent %q in this workspace", nameOrID)
+	}
+	return aid, name, err
+}
+
+func (s *Store) Send(scope, fromName, toName, body string) error {
+	fromID, _, err := s.resolveAgent(scope, fromName)
+	if err != nil {
+		return err
+	}
+	toID, _, err := s.resolveAgent(scope, toName)
+	if err != nil {
+		return err
+	}
+	now := s.Now().Unix()
+	res, err := s.db.Exec(`INSERT INTO messages (scope, from_agent, to_agent, body, created_at) VALUES (?,?,?,?,?)`,
+		scope, fromID, toID, body, now)
+	if err != nil {
+		return err
+	}
+	mid, _ := res.LastInsertId()
+	_, err = s.db.Exec(`INSERT INTO deliveries (message_id, agent_id) VALUES (?,?)`, mid, toID)
+	return err
+}
+
+func (s *Store) Broadcast(scope, fromName, body string) error {
+	fromID, _, err := s.resolveAgent(scope, fromName)
+	if err != nil {
+		return err
+	}
+	now := s.Now().Unix()
+	res, err := s.db.Exec(`INSERT INTO messages (scope, from_agent, to_agent, body, created_at) VALUES (?,?,NULL,?,?)`,
+		scope, fromID, body, now)
+	if err != nil {
+		return err
+	}
+	mid, _ := res.LastInsertId()
+	// NOTE: with db.SetMaxOpenConns(1), never Exec while a rows cursor is open -
+	// collect first, Close, then write (same deadlock Task 5 hit in Board).
+	rows, err := s.db.Query(`SELECT agent_id, status, last_seen FROM agents WHERE scope=? AND agent_id != ?`, scope, fromID)
+	if err != nil {
+		return err
+	}
+	var targets []string
+	for rows.Next() {
+		var aid, explicit string
+		var seen int64
+		if err := rows.Scan(&aid, &explicit, &seen); err != nil {
+			rows.Close()
+			return err
+		}
+		if st := s.freshStatus(explicit, seen); st == "active" || st == "idle" {
+			targets = append(targets, aid)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, aid := range targets {
+		if _, err := s.db.Exec(`INSERT INTO deliveries (message_id, agent_id) VALUES (?,?)`, mid, aid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) Read(scope, name string) ([]protocol.Message, error) {
+	aid, _, err := s.resolveAgent(scope, name)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.Query(`
+		SELECT m.id, a.name, m.body, m.created_at, m.to_agent IS NULL
+		FROM deliveries d
+		JOIN messages m ON m.id = d.message_id
+		JOIN agents a ON a.scope = m.scope AND a.agent_id = m.from_agent
+		WHERE d.agent_id = ? AND m.scope = ? AND d.read_at IS NULL
+		ORDER BY m.created_at, m.id`, aid, scope)
+	if err != nil {
+		return nil, err
+	}
+	var out []protocol.Message
+	for rows.Next() {
+		var m protocol.Message
+		if err := rows.Scan(&m.ID, &m.From, &m.Body, &m.SentAt, &m.Broadcast); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	rows.Close() // release the sole connection before the UPDATEs below
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	now := s.Now().Unix()
+	for _, m := range out {
+		if _, err := s.db.Exec(`UPDATE deliveries SET read_at=? WHERE message_id=? AND agent_id=?`, now, m.ID, aid); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// noticesFor: unread-message notices (once per message) + conflict warnings.
+func (s *Store) noticesFor(scope, aid string, writes []string) ([]string, error) {
+	var notices []string
+	now := s.Now().Unix()
+	rows, err := s.db.Query(`
+		SELECT m.id, a.name, m.to_agent IS NULL
+		FROM deliveries d
+		JOIN messages m ON m.id = d.message_id
+		JOIN agents a ON a.scope = m.scope AND a.agent_id = m.from_agent
+		WHERE d.agent_id = ? AND m.scope = ? AND d.notice_sent_at IS NULL AND d.read_at IS NULL
+		ORDER BY m.created_at`, aid, scope)
+	if err != nil {
+		return nil, err
+	}
+	dmCount := map[string]int{}
+	var ids []int64
+	var bcasts []string
+	for rows.Next() {
+		var id int64
+		var from string
+		var bc bool
+		if err := rows.Scan(&id, &from, &bc); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+		if bc {
+			bcasts = append(bcasts, from)
+		} else {
+			dmCount[from]++
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for from, n := range dmCount {
+		plural := ""
+		if n > 1 {
+			plural = "s"
+		}
+		notices = append(notices, fmt.Sprintf("[coordinator] %d new message%s from %s - call read_messages", n, plural, from))
+	}
+	for _, from := range bcasts {
+		notices = append(notices, fmt.Sprintf("[coordinator] broadcast from %s - call read_messages", from))
+	}
+	for _, id := range ids {
+		if _, err := s.db.Exec(`UPDATE deliveries SET notice_sent_at=? WHERE message_id=? AND agent_id=?`, now, id, aid); err != nil {
+			return nil, err
+		}
+	}
+	// Conflicts: other agents' recent writes to the same paths.
+	cutoff := s.Now().Add(-conflictWindow).Unix()
+	for _, p := range writes {
+		crows, err := s.db.Query(`
+			SELECT a.name, ft.ts FROM file_touches ft
+			JOIN agents a ON a.scope = ft.scope AND a.agent_id = ft.agent_id
+			WHERE ft.scope=? AND ft.path=? AND ft.agent_id != ? AND ft.ts >= ?`, scope, p, aid, cutoff)
+		if err != nil {
+			return nil, err
+		}
+		for crows.Next() {
+			var name string
+			var ts int64
+			if err := crows.Scan(&name, &ts); err != nil {
+				crows.Close()
+				return nil, err
+			}
+			notices = append(notices, fmt.Sprintf("[coordinator] heads-up: %s also edited %s %s ago", name, p, age(now-ts)))
+		}
+		crows.Close()
+		if err := crows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return notices, nil
+}
+
+func age(secs int64) string {
+	switch {
+	case secs < 60:
+		return fmt.Sprintf("%ds", secs)
+	case secs < 3600:
+		return fmt.Sprintf("%dm", secs/60)
+	default:
+		return fmt.Sprintf("%dh", secs/3600)
+	}
+}
+
+func (s *Store) Housekeep() error {
+	now := s.Now()
+	day := int64(86400)
+	stmts := []struct {
+		q   string
+		arg int64
+	}{
+		{`DELETE FROM events WHERE ts < ?`, now.Unix() - 7*day},
+		{`DELETE FROM file_touches WHERE ts < ?`, now.Add(-time.Hour).Unix()},
+		{`DELETE FROM messages WHERE created_at < ? AND id IN (SELECT message_id FROM deliveries GROUP BY message_id HAVING COUNT(*) = SUM(read_at IS NOT NULL))`, now.Unix() - 7*day},
+		{`DELETE FROM messages WHERE created_at < ?`, now.Unix() - 30*day},
+		{`DELETE FROM deliveries WHERE message_id NOT IN (SELECT id FROM messages)`, 0},
+		{`DELETE FROM agents WHERE last_seen < ?`, now.Unix() - 7*day},
+		{`DELETE FROM tasks WHERE updated_at < ?`, now.Unix() - 7*day},
+	}
+	for _, st := range stmts {
+		var err error
+		if st.arg != 0 {
+			_, err = s.db.Exec(st.q, st.arg)
+		} else {
+			_, err = s.db.Exec(st.q)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) freshStatus(explicit string, lastSeen int64) string {
