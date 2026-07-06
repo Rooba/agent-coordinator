@@ -51,6 +51,10 @@ func Run(stdin io.Reader, stdout io.Writer, socketPath string) {
 		req.Op = protocol.OpDeregister
 	case "Stop":
 		req.Op = protocol.OpIdle
+	case "UserPromptSubmit":
+		req.Op = protocol.OpEvent
+		req.Tool = "UserPromptSubmit"
+		req.Activity = "Handling user prompt"
 	case "PostToolUse":
 		req.Op = protocol.OpEvent
 		req.Tool = in.ToolName
@@ -68,14 +72,26 @@ func Run(stdin io.Reader, stdout io.Writer, socketPath string) {
 		return
 	}
 	switch in.HookEventName {
-	case "PostToolUse":
+	case "PostToolUse", "UserPromptSubmit":
 		if len(resp.Notices) > 0 {
-			emit(stdout, "PostToolUse", strings.Join(resp.Notices, "\n"))
+			emit(stdout, in.HookEventName, strings.Join(resp.Notices, "\n"))
+		}
+	case "Stop":
+		// Blocking Stop-hook output: the reason is fed back to the model, so
+		// pending mail notices wake the agent at turn end. The daemon marks
+		// them noticed, so a repeat Stop returns none - no Stop loop.
+		if len(resp.Notices) > 0 {
+			if b, err := json.Marshal(map[string]string{
+				"decision": "block", "reason": strings.Join(resp.Notices, "\n")}); err == nil {
+				stdout.Write(b)
+			}
 		}
 	case "SessionStart":
 		if resp.Name != "" {
 			emit(stdout, "SessionStart", fmt.Sprintf(
-				"[coordinator] you are '%s' in this workspace. Peer tools (MCP agent-coordinator): status_board, list_agents, send_message, read_messages, broadcast.", resp.Name))
+				"[coordinator] you are '%s' in this workspace. Peer tools (MCP agent-coordinator): status_board, list_agents, send_message, read_messages, broadcast. "+
+					"To be wakeable while waiting or delegating, arm a background task first: agent-coordinator wait '%s' - it exits the moment a DM arrives and the harness re-invokes you.",
+				resp.Name, resp.Name))
 		}
 	}
 }

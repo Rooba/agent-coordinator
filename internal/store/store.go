@@ -293,6 +293,30 @@ func (s *Store) Read(scope, name string) ([]protocol.Message, error) {
 	return out, nil
 }
 
+// UnreadCount reports how many deliveries for the named agent are still
+// unread in this scope. Strictly read-only - it never touches notice_sent_at,
+// so peeking cannot consume the once-only nudge.
+func (s *Store) UnreadCount(scope, name string) (int, error) {
+	aid, _, err := s.resolveAgent(scope, name)
+	if err != nil {
+		return 0, err
+	}
+	var n int
+	err = s.db.QueryRow(`
+		SELECT COUNT(*) FROM deliveries d
+		JOIN messages m ON m.id = d.message_id
+		WHERE d.agent_id = ? AND m.scope = ? AND d.read_at IS NULL`, aid, scope).Scan(&n)
+	return n, err
+}
+
+// PendingNotices runs the notice collect+mark for the session's agent without
+// recording any event or conflict check - the drain used by touchpoints that
+// carry no work (Stop, UserPromptSubmit). Nudge-once by construction: the
+// same notice_sent_at marking RecordEvent uses.
+func (s *Store) PendingNotices(scope, sessionID string) ([]string, error) {
+	return s.noticesFor(scope, agentID(sessionID), nil)
+}
+
 // noticesFor: unread-message notices (once per message) + conflict warnings.
 func (s *Store) noticesFor(scope, aid string, writes []string) ([]string, error) {
 	var notices []string

@@ -25,7 +25,7 @@ func TestMergePreservesExistingAndIsIdempotent(t *testing.T) {
 		t.Fatalf("changed=%v err=%v", changed, err)
 	}
 	s := string(out)
-	for _, want := range []string{"cbm-session-reminder", "agent-coordinator hook", "PostToolUse", "SessionEnd", "Stop", `"effortLevel": "xhigh"`} {
+	for _, want := range []string{"cbm-session-reminder", "agent-coordinator hook", "UserPromptSubmit", "PostToolUse", "SessionEnd", "Stop", `"effortLevel": "xhigh"`} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("missing %q in:\n%s", want, s)
 		}
@@ -155,10 +155,10 @@ func TestInstallUninstallRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := string(after)
-	if got := strings.Count(s, `"/bin/ac hook"`); got != 4 {
-		t.Fatalf("want 4 coordinator hook entries, got %d in:\n%s", got, s)
+	if got := strings.Count(s, `"/bin/ac hook"`); got != 5 {
+		t.Fatalf("want 5 coordinator hook entries, got %d in:\n%s", got, s)
 	}
-	for _, event := range []string{"SessionStart", "PostToolUse", "Stop", "SessionEnd"} {
+	for _, event := range []string{"SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd"} {
 		if !strings.Contains(s, `"`+event+`"`) {
 			t.Fatalf("missing event %q in:\n%s", event, s)
 		}

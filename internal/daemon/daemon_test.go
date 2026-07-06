@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -67,6 +68,29 @@ func TestRegisterEventAgentsFlow(t *testing.T) {
 	r = roundTrip(t, sock, protocol.Request{Op: "bogus", Scope: "/r"})
 	if r.OK || r.Error == "" {
 		t.Fatalf("bogus op must error: %+v", r)
+	}
+}
+
+func TestIdleReturnsNoticesOnce(t *testing.T) {
+	sock, _ := startDaemon(t, time.Minute)
+	a := roundTrip(t, sock, protocol.Request{Op: protocol.OpRegister, Scope: "/r", SessionID: "sa", Source: "startup"})
+	b := roundTrip(t, sock, protocol.Request{Op: protocol.OpRegister, Scope: "/r", SessionID: "sb", Source: "startup"})
+	r := roundTrip(t, sock, protocol.Request{Op: protocol.OpSend, Scope: "/r", From: a.Name, To: b.Name, Body: "ping"})
+	if !r.OK {
+		t.Fatalf("send: %+v", r)
+	}
+	r = roundTrip(t, sock, protocol.Request{Op: protocol.OpIdle, Scope: "/r", SessionID: "sb"})
+	if !r.OK || len(r.Notices) != 1 || !strings.Contains(r.Notices[0], a.Name) {
+		t.Fatalf("first idle must carry one notice naming %s: %+v", a.Name, r)
+	}
+	r = roundTrip(t, sock, protocol.Request{Op: protocol.OpIdle, Scope: "/r", SessionID: "sb"})
+	if !r.OK || len(r.Notices) != 0 {
+		t.Fatalf("second idle must carry no notices (no Stop loop): %+v", r)
+	}
+	// Peek still sees the unread mail: idle consumed the nudge, not the message.
+	r = roundTrip(t, sock, protocol.Request{Op: protocol.OpPeek, Scope: "/r", From: b.Name})
+	if !r.OK || r.Unread != 1 {
+		t.Fatalf("peek: %+v", r)
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 
 var hookEvents = []struct{ event, matcher string }{
 	{"SessionStart", "startup|resume|clear|compact"},
+	{"UserPromptSubmit", ""},
 	{"PostToolUse", ""},
 	{"Stop", ""},
 	{"SessionEnd", ""},

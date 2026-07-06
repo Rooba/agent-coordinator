@@ -106,6 +106,35 @@ func TestConcurrentReadDeliversOnce(t *testing.T) {
 	}
 }
 
+func TestUnreadCountIsReadOnly(t *testing.T) {
+	s, nA, nB := twoAgents(t)
+	if n, err := s.UnreadCount("/r", nB); err != nil || n != 0 {
+		t.Fatalf("want 0 unread before send, got %d (%v)", n, err)
+	}
+	if err := s.Send("/r", nA, nB, "ping"); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.UnreadCount("/r", nB); n != 1 {
+		t.Fatalf("want 1 unread after send, got %d", n)
+	}
+	if n, _ := s.UnreadCount("/r", nB); n != 1 {
+		t.Fatalf("second count must not consume anything, got %d", n)
+	}
+	// Peeking must not have consumed the once-only notice either.
+	if notices, err := s.PendingNotices("/r", "sess-b"); err != nil || len(notices) != 1 {
+		t.Fatalf("peek consumed the nudge: %v (%v)", notices, err)
+	}
+	if _, err := s.Read("/r", nB); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.UnreadCount("/r", nB); n != 0 {
+		t.Fatalf("want 0 unread after read, got %d", n)
+	}
+	if _, err := s.UnreadCount("/r", "nobody-here"); err == nil {
+		t.Fatal("want error for unknown agent")
+	}
+}
+
 func TestSendToUnknownAgentFails(t *testing.T) {
 	s, nA, _ := twoAgents(t)
 	if err := s.Send("/r", nA, "nobody-here", "x"); err == nil {

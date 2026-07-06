@@ -19,12 +19,14 @@ func main() {
 		runHook()
 	case "mcp":
 		runMCP()
+	case "wait":
+		runWait(os.Args[2:])
 	case "install":
 		runInstall(os.Args[2:])
 	case "version":
 		fmt.Println(version)
 	default:
-		fmt.Fprintln(os.Stderr, "usage: agent-coordinator daemon|hook|mcp|install [--uninstall]|version")
+		fmt.Fprintln(os.Stderr, "usage: agent-coordinator daemon|hook|mcp|wait <name>|install [--uninstall]|version")
 		os.Exit(2)
 	}
 }

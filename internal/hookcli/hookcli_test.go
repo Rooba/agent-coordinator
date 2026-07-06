@@ -81,6 +81,57 @@ func TestSessionStartIntroducesName(t *testing.T) {
 	if !strings.Contains(out.String(), "amber-fox") {
 		t.Fatalf("stdout: %s", out.String())
 	}
+	// The injection teaches the wake pattern with the agent's actual name.
+	if !strings.Contains(out.String(), "agent-coordinator wait 'amber-fox'") {
+		t.Fatalf("missing wake-pattern teaching: %s", out.String())
+	}
+}
+
+func TestStopEmitsBlockOnNotices(t *testing.T) {
+	sock, got := fakeDaemon(t, protocol.Response{OK: true,
+		Notices: []string{"[coordinator] 1 new message from amber-fox - call read_messages"}})
+	var out bytes.Buffer
+	Run(bytes.NewReader(fixture(t, "stop.json")), &out, sock)
+	if len(*got) != 1 || (*got)[0].Op != protocol.OpIdle {
+		t.Fatalf("daemon saw %+v", got)
+	}
+	for _, want := range []string{`"decision"`, `"block"`, "amber-fox", "read_messages"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("stdout missing %q: %s", want, out.String())
+		}
+	}
+}
+
+func TestStopSilentWithoutNotices(t *testing.T) {
+	sock, _ := fakeDaemon(t, protocol.Response{OK: true})
+	var out bytes.Buffer
+	Run(bytes.NewReader(fixture(t, "stop.json")), &out, sock)
+	if out.Len() != 0 {
+		t.Fatalf("stop without notices must emit nothing, got %s", out.String())
+	}
+}
+
+func TestUserPromptSubmitDrainsNotices(t *testing.T) {
+	// No captured fixture exists for UserPromptSubmit, so the input is built
+	// from the known common hook fields (session_id, cwd, hook_event_name)
+	// plus this event's "prompt" field.
+	const input = `{"session_id":"3cdc4c5b-e78d-4fbb-9859-f18d8dc2b200","cwd":"/home/ra/agent-coordinator-go","hook_event_name":"UserPromptSubmit","prompt":"please continue"}`
+	sock, got := fakeDaemon(t, protocol.Response{OK: true,
+		Notices: []string{"[coordinator] broadcast from brisk-owl - call read_messages"}})
+	var out bytes.Buffer
+	Run(strings.NewReader(input), &out, sock)
+	if len(*got) != 1 {
+		t.Fatalf("daemon saw %+v", got)
+	}
+	if r := (*got)[0]; r.Op != protocol.OpEvent || r.Tool != "UserPromptSubmit" ||
+		r.Activity != "Handling user prompt" || len(r.Files) != 0 || len(r.Writes) != 0 || r.TaskEv != nil {
+		t.Fatalf("daemon saw %+v", r)
+	}
+	for _, want := range []string{`"UserPromptSubmit"`, "additionalContext", "brisk-owl"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("stdout missing %q: %s", want, out.String())
+		}
+	}
 }
 
 func TestFailOpenWithoutDaemon(t *testing.T) {

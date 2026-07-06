@@ -9,17 +9,19 @@ tool call.
 
 ## How it works
 
-One binary, four subcommands:
+One binary, five subcommands:
 
 - `daemon` - owns the SQLite state, serves a line-JSON protocol on a unix
   socket (systemd socket activation: the daemon only runs while in use).
 - `hook` - invoked by user-level Claude Code hooks (SessionStart,
-  PostToolUse, Stop, SessionEnd). Forwards the event to the daemon and
-  injects any response back into the session as additional context. Every
-  error path is a silent no-op: a broken coordinator can never break a
-  Claude session.
+  UserPromptSubmit, PostToolUse, Stop, SessionEnd). Forwards the event to
+  the daemon and injects any response back into the session as additional
+  context. Every error path is a silent no-op: a broken coordinator can
+  never break a Claude session.
 - `mcp` - stdio MCP server exposing the five peer tools, backed by the
   same socket.
+- `wait` - blocks until mail arrives for an agent, for the wake pattern
+  (see below).
 - `install` - registers all of the above (see Install below).
 
 ```
@@ -48,6 +50,46 @@ daemon piggybacks a notice on the reply - `[coordinator] 1 new message
 from brisk-owl - call read_messages` - which Claude Code injects into A's
 context. A then reads it with `read_messages`.
 
+## Wake levers
+
+A notice can only reach an agent at a harness touchpoint. Four are wired
+up; each notice is delivered exactly once (the first touchpoint that
+fires consumes it, the mail itself stays unread until `read_messages`):
+
+- PostToolUse - the classic push path above: notices ride the next tool
+  call.
+- Stop (turn-end nudge) - when an agent ends its turn with pending
+  notices, the Stop hook emits blocking output (`decision: block`) whose
+  reason carries the notices, so the model sees the mail instead of going
+  idle. Once-only by construction: a repeat Stop with unread-but-noticed
+  mail returns nothing, so there is no Stop loop.
+- UserPromptSubmit - pending notices are injected as additional context
+  when the user submits a prompt, so a fresh turn starts already knowing
+  about the mail.
+- `agent-coordinator wait` - programmatic wake for agents that would
+  otherwise be unreachable (blocked on a synchronous subagent, or simply
+  idle with no hook touchpoint coming).
+
+### The wake pattern (`wait`)
+
+```
+agent-coordinator wait <name> [-timeout <seconds>] [-interval <seconds>]
+```
+
+`wait` resolves the workspace scope from its cwd and polls the daemon
+(read-only peek, default every 2s) until the named agent has unread mail.
+It exits 0 the moment mail arrives (`mail: N unread - call
+read_messages`), 1 on timeout (default 570s, under common 600s background
+caps), 2 on usage error. Peeking never consumes the once-only notice
+nudge - the other levers still fire.
+
+An agent blocked on a synchronous subagent has no harness touchpoint and
+cannot be woken. But an agent that arms `wait` as a BACKGROUND task
+before delegating or idling gets re-invoked by the harness the moment
+`wait` exits - i.e. the moment a DM arrives. Arm first, then delegate.
+The SessionStart injection teaches every agent this pattern with its own
+name filled in.
+
 ## Install
 
 ```
@@ -61,7 +103,7 @@ runs `agent-coordinator install`, which:
   (`agent-coordinator.socket` + `agent-coordinator.service`), then
   `try-restart`s the service so a running daemon picks up the new binary
   (a no-op when nothing is running),
-- merges the four hooks into `~/.claude/settings.json` (existing hooks are
+- merges the five hooks into `~/.claude/settings.json` (existing hooks are
   preserved; the merge is idempotent and the write is atomic),
 - registers the MCP server (done for you; equivalent to `claude mcp add
   --scope user --transport stdio agent-coordinator --

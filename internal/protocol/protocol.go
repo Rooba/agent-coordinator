@@ -9,6 +9,7 @@ const (
 	OpBoard      = "board"
 	OpSend       = "send"
 	OpRead       = "read"
+	OpPeek       = "peek"
 	OpBroadcast  = "broadcast"
 )
 
@@ -61,4 +62,5 @@ type Response struct {
 	Notices  []string    `json:"notices,omitempty"` // event: inbox/conflict lines
 	Agents   []AgentInfo `json:"agents,omitempty"`
 	Messages []Message   `json:"messages,omitempty"`
+	Unread   int         `json:"unread,omitempty"` // peek: unread delivery count
 }

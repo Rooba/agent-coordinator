@@ -129,6 +129,14 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 		if err := st.SetStatus(req.Scope, req.SessionID, "idle"); err != nil {
 			return fail(err)
 		}
+		// Drain pending notices at turn end so the Stop hook can nudge the
+		// model. notice_sent_at makes this once-only: a repeat idle with
+		// unread-but-noticed mail returns nothing (no Stop loop).
+		notices, err := st.PendingNotices(req.Scope, req.SessionID)
+		if err != nil {
+			return fail(err)
+		}
+		return protocol.Response{OK: true, Notices: notices}
 	case protocol.OpEvent:
 		notices, err := st.RecordEvent(req.Scope, req.SessionID, req)
 		if err != nil {
@@ -157,6 +165,12 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 			return fail(err)
 		}
 		return protocol.Response{OK: true, Messages: msgs}
+	case protocol.OpPeek:
+		n, err := st.UnreadCount(req.Scope, req.From)
+		if err != nil {
+			return fail(err)
+		}
+		return protocol.Response{OK: true, Unread: n}
 	case protocol.OpBroadcast:
 		if err := st.Broadcast(req.Scope, req.From, req.Body); err != nil {
 			return fail(err)
