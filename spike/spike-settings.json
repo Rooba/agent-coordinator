@@ -1,0 +1,10 @@
+{
+  "hooks": {
+    "SessionStart": [{"matcher": "", "hooks": [{"type": "command", "command": "/home/ra/agent-coordinator-go/spike/hooklog.sh", "timeout": 5}]}],
+    "PostToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": "/home/ra/agent-coordinator-go/spike/hooklog.sh", "timeout": 5}]}],
+    "Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "/home/ra/agent-coordinator-go/spike/hooklog.sh", "timeout": 5}]}],
+    "SessionEnd": [{"matcher": "", "hooks": [{"type": "command", "command": "/home/ra/agent-coordinator-go/spike/hooklog.sh", "timeout": 5}]}],
+    "SubagentStart": [{"matcher": "", "hooks": [{"type": "command", "command": "/home/ra/agent-coordinator-go/spike/hooklog.sh", "timeout": 5}]}],
+    "SubagentStop": [{"matcher": "", "hooks": [{"type": "command", "command": "/home/ra/agent-coordinator-go/spike/hooklog.sh", "timeout": 5}]}]
+  }
+}
