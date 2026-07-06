@@ -56,3 +56,30 @@ func TestResolveNonGit(t *testing.T) {
 		t.Fatalf("got %q want %q", got, want)
 	}
 }
+
+func TestResolveWorktreeRelativeGitdir(t *testing.T) {
+	tmp := t.TempDir()
+	main := filepath.Join(tmp, "mainrepo")
+	wt := filepath.Join(tmp, "wt1")
+	gitdir := filepath.Join(main, ".git", "worktrees", "wt1")
+	write(t, filepath.Join(gitdir, "commondir"), "../..\n")
+	if err := os.MkdirAll(filepath.Join(main, ".git", "objects"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// relative gitdir pointer, resolved against the .git file's directory
+	write(t, filepath.Join(wt, ".git"), "gitdir: ../mainrepo/.git/worktrees/wt1\n")
+	want, _ := filepath.EvalSymlinks(main)
+	if got := Resolve(wt); got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+func TestResolveGitFileWithoutGitdirFallsBack(t *testing.T) {
+	tmp := t.TempDir()
+	wt := filepath.Join(tmp, "odd")
+	write(t, filepath.Join(wt, ".git"), "not a gitdir pointer\n")
+	want, _ := filepath.EvalSymlinks(wt)
+	if got := Resolve(wt); got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
