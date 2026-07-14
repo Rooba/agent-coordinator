@@ -115,7 +115,7 @@ func TestUserPromptSubmitDrainsNotices(t *testing.T) {
 	// No captured fixture exists for UserPromptSubmit, so the input is built
 	// from the known common hook fields (session_id, cwd, hook_event_name)
 	// plus this event's "prompt" field.
-	const input = `{"session_id":"3cdc4c5b-e78d-4fbb-9859-f18d8dc2b200","cwd":"/home/ra/agent-coordinator-go","hook_event_name":"UserPromptSubmit","prompt":"please continue"}`
+	const input = `{"session_id":"3cdc4c5b-e78d-4fbb-9859-f18d8dc2b200","cwd":"/home/user/agent-coordinator-go","hook_event_name":"UserPromptSubmit","prompt":"please continue"}`
 	sock, got := fakeDaemon(t, protocol.Response{OK: true,
 		Notices: []string{"[coordinator] broadcast from brisk-owl - call read_messages"}})
 	var out bytes.Buffer
