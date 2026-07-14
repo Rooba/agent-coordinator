@@ -19,8 +19,23 @@ import (
 	"github.com/agent-coordinator/go/internal/store"
 )
 
+// ErrAlreadyServing means another daemon already owns the socket. The caller
+// should exit 0 quietly: spawn-on-miss makes racing daemons routine, and the
+// losers must self-resolve harmlessly.
+var ErrAlreadyServing = errors.New("another daemon is already serving")
+
+// sockLock pins the daemon's socket lock file open for the process lifetime.
+// The OS lock is released only at process exit - strictly after Serve has
+// closed (and thereby unlinked) the listener - so there is no window in which
+// a successor binds the path and this process then unlinks the live socket.
+var sockLock *os.File
+
 // Listener returns the systemd-activated socket (LISTEN_FDS=1, fd 3) or
-// creates the fallback unix socket for dev runs.
+// binds the unix socket itself. An OS file lock on sock+".lock" (flock /
+// LockFileEx, held until the daemon exits) serializes check-remove-bind, so
+// racing spawns can never unlink each other's live socket: the lock loser,
+// and any winner that still finds a dialable peer (e.g. systemd-activated),
+// gets ErrAlreadyServing. Only a dead socket file is removed before binding.
 func Listener() (net.Listener, bool, error) {
 	if os.Getenv("LISTEN_PID") == strconv.Itoa(os.Getpid()) && os.Getenv("LISTEN_FDS") == "1" {
 		f := os.NewFile(3, "systemd-socket")
@@ -29,9 +44,37 @@ func Listener() (net.Listener, bool, error) {
 		return l, true, err
 	}
 	sock := paths.Socket()
-	os.Remove(sock) // stale socket from an unclean dev shutdown
+	lock, err := os.OpenFile(sock+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, false, err // unusable socket dir: surface, do not swallow
+	}
+	if held, err := tryLock(lock); err != nil || !held {
+		lock.Close()
+		if err != nil {
+			return nil, false, err
+		}
+		return nil, false, ErrAlreadyServing // a peer owns the lock (serving or about to)
+	}
+	if dialable(sock) { // live peer that never took the lock (systemd-activated)
+		lock.Close()
+		return nil, false, ErrAlreadyServing
+	}
+	os.Remove(sock) // dead socket from an unclean shutdown; safe under the lock
 	l, err := net.Listen("unix", sock)
-	return l, false, err
+	if err != nil {
+		lock.Close()
+		return nil, false, err
+	}
+	sockLock = lock // hold the lock for the daemon's lifetime
+	return l, false, nil
+}
+
+func dialable(sock string) bool {
+	conn, err := net.DialTimeout("unix", sock, 250*time.Millisecond)
+	if err == nil {
+		conn.Close()
+	}
+	return err == nil
 }
 
 func Serve(l net.Listener, st *store.Store, idleTimeout time.Duration) error {

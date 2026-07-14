@@ -135,6 +135,9 @@ func TestUserPromptSubmitDrainsNotices(t *testing.T) {
 }
 
 func TestFailOpenWithoutDaemon(t *testing.T) {
+	// AC_NO_SPAWN keeps the test hermetic - otherwise the miss would spawn the
+	// test binary itself as "daemon".
+	t.Setenv("AC_NO_SPAWN", "1")
 	var out bytes.Buffer
 	Run(bytes.NewReader(fixture(t, "post_read.json")), &out, filepath.Join(t.TempDir(), "absent.sock"))
 	if out.Len() != 0 {

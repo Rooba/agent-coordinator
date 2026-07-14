@@ -3,7 +3,9 @@ package daemon
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -92,6 +94,58 @@ func TestIdleReturnsNoticesOnce(t *testing.T) {
 	if !r.OK || r.Unread != 1 {
 		t.Fatalf("peek: %+v", r)
 	}
+}
+
+// Bind-as-lock: a second daemon finding a live listener on the socket must
+// report ErrAlreadyServing so its process can exit 0 quietly.
+func TestListenerExitsWhenPeerServes(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "d.sock")
+	t.Setenv("AC_SOCKET", sock)
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if _, _, err := Listener(); !errors.Is(err, ErrAlreadyServing) {
+		t.Fatalf("want ErrAlreadyServing with a live peer, got %v", err)
+	}
+}
+
+// The file lock is the serializer: while a peer holds sock+".lock", Listener
+// must defer with ErrAlreadyServing even though nothing is dialable yet (the
+// peer may be mid-bind) - it must never remove the file or bind itself.
+func TestListenerDefersToLockHolder(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "d.sock")
+	t.Setenv("AC_SOCKET", sock)
+	peer, err := os.OpenFile(sock+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	if held, err := tryLock(peer); err != nil || !held {
+		t.Fatalf("peer lock: held=%v err=%v", held, err)
+	}
+	if _, _, err := Listener(); !errors.Is(err, ErrAlreadyServing) {
+		t.Fatalf("want ErrAlreadyServing while a peer holds the lock, got %v", err)
+	}
+}
+
+// A dead socket file (unclean shutdown) is not a lock: Listener removes it
+// and binds.
+func TestListenerReplacesStaleSocket(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "d.sock")
+	t.Setenv("AC_SOCKET", sock)
+	stale, err := net.ListenUnix("unix", &net.UnixAddr{Name: sock, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.SetUnlinkOnClose(false)
+	stale.Close() // leaves the socket file behind, nobody listening
+	l, activated, err := Listener()
+	if err != nil || activated {
+		t.Fatalf("want a fresh listener over the stale socket, got activated=%v err=%v", activated, err)
+	}
+	l.Close()
 }
 
 func TestIdleExit(t *testing.T) {

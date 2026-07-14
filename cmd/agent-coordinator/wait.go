@@ -4,11 +4,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"net"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/agent-coordinator/go/internal/dialer"
 	"github.com/agent-coordinator/go/internal/paths"
 	"github.com/agent-coordinator/go/internal/protocol"
 	"github.com/agent-coordinator/go/internal/scope"
@@ -64,7 +64,7 @@ func waitForMail(socketPath, sc, name string, timeout, interval time.Duration) (
 }
 
 func peekOnce(socketPath, sc, name string) (int, bool) {
-	conn, err := net.DialTimeout("unix", socketPath, time.Second)
+	conn, err := dialer.Dial(socketPath, time.Second)
 	if err != nil {
 		return 0, false
 	}

@@ -3,7 +3,9 @@ package installer
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -212,6 +214,69 @@ func TestInstallUninstallRoundTrip(t *testing.T) {
 		if !hasCall(calls, want) {
 			t.Fatalf("missing recorded command %v in %v", want, calls)
 		}
+	}
+}
+
+// Without systemctl (WSL without systemd), Install must degrade: no unit
+// files left behind, but hooks merged and the MCP server registered.
+func TestInstallDegradesWithoutSystemctl(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("systemd unit setup is linux-only")
+	}
+	home := t.TempDir()
+	var calls [][]string
+	run := func(name string, args ...string) error {
+		calls = append(calls, append([]string{name}, args...))
+		if name == "systemctl" {
+			return exec.ErrNotFound
+		}
+		return nil
+	}
+	if err := Install("/bin/ac", home, run); err != nil {
+		t.Fatalf("Install must degrade without systemctl, not fail: %v", err)
+	}
+	unitDir := filepath.Join(home, ".config", "systemd", "user")
+	for _, unit := range []string{"agent-coordinator.socket", "agent-coordinator.service"} {
+		if _, err := os.Stat(filepath.Join(unitDir, unit)); !os.IsNotExist(err) {
+			t.Fatalf("unit %s left behind without systemd (stat err=%v)", unit, err)
+		}
+	}
+	after, err := os.ReadFile(filepath.Join(home, ".claude", "settings.json"))
+	if err != nil {
+		t.Fatalf("hooks not merged: %v", err)
+	}
+	if got := strings.Count(string(after), `"/bin/ac hook"`); got != 5 {
+		t.Fatalf("want 5 coordinator hook entries, got %d in:\n%s", got, after)
+	}
+	if !hasCall(calls, []string{"claude", "mcp", "add", "--scope", "user", "--transport", "stdio", "agent-coordinator", "--", "/bin/ac", "mcp"}) {
+		t.Fatalf("MCP server not registered: %v", calls)
+	}
+}
+
+// A binary path with spaces (common under C:\Program Files) must be quoted in
+// the hook command, and the quoted form must merge/remove symmetrically.
+func TestHookCommandQuotesSpacedPath(t *testing.T) {
+	const spaced = `C:\Program Files\agent-coordinator.exe`
+	if got := hookCommand(spaced); got != `"C:\Program Files\agent-coordinator.exe" hook` {
+		t.Fatalf("hookCommand(%q) = %q", spaced, got)
+	}
+	if got := hookCommand("/bin/ac"); got != "/bin/ac hook" {
+		t.Fatalf("plain path must stay unquoted, got %q", got)
+	}
+	merged, changed, err := MergeHooks([]byte("{}"), spaced)
+	if err != nil || !changed {
+		t.Fatalf("merge: changed=%v err=%v", changed, err)
+	}
+	again, changed, err := MergeHooks(merged, spaced)
+	if err != nil || changed || string(again) != string(merged) {
+		t.Fatalf("quoted merge must be idempotent: changed=%v err=%v", changed, err)
+	}
+	out, changed, err := RemoveHooks(merged, spaced)
+	if err != nil || !changed {
+		t.Fatalf("remove: changed=%v err=%v", changed, err)
+	}
+	if strings.Contains(string(out), "agent-coordinator.exe") {
+		t.Fatalf("quoted hook not removed:\n%s", out)
 	}
 }
 

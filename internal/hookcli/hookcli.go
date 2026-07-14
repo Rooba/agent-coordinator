@@ -4,12 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/agent-coordinator/go/internal/activity"
+	"github.com/agent-coordinator/go/internal/dialer"
 	"github.com/agent-coordinator/go/internal/protocol"
 	"github.com/agent-coordinator/go/internal/scope"
 )
@@ -97,7 +97,7 @@ func Run(stdin io.Reader, stdout io.Writer, socketPath string) {
 }
 
 func roundTrip(socketPath string, req protocol.Request) (protocol.Response, bool) {
-	conn, err := net.DialTimeout("unix", socketPath, 150*time.Millisecond)
+	conn, err := dialer.Dial(socketPath, 150*time.Millisecond)
 	if err != nil {
 		debugf("dial: %v", err)
 		return protocol.Response{}, false

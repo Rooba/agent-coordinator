@@ -4,6 +4,9 @@ PREFIX := $(HOME)/.local
 build:
 	go build -o $(BIN) ./cmd/agent-coordinator
 
+build-windows:
+	GOOS=windows GOARCH=amd64 go build -o $(BIN).exe ./cmd/agent-coordinator
+
 test:
 	go test ./...
 
@@ -16,6 +19,6 @@ uninstall:
 	rm -f $(PREFIX)/bin/$(BIN)
 
 clean:
-	rm -f $(BIN)
+	rm -f $(BIN) $(BIN).exe
 
-.PHONY: build test install uninstall clean
+.PHONY: build build-windows test install uninstall clean

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -11,15 +12,20 @@ import (
 )
 
 func runDaemon() {
+	// Listener first: binding is the single-daemon lock, so a duplicate
+	// spawn exits before ever touching the store.
+	l, _, err := daemon.Listener()
+	if errors.Is(err, daemon.ErrAlreadyServing) {
+		return // a peer daemon won the socket; nothing to do
+	}
+	if err != nil {
+		fatal(err)
+	}
 	dbPath, err := paths.DB()
 	if err != nil {
 		fatal(err)
 	}
 	st, err := store.Open(dbPath)
-	if err != nil {
-		fatal(err)
-	}
-	l, _, err := daemon.Listener()
 	if err != nil {
 		fatal(err)
 	}

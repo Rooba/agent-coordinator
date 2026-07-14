@@ -59,6 +59,9 @@ func TestWaitForMailTimesOut(t *testing.T) {
 
 func TestWaitForMailSurvivesMissingDaemon(t *testing.T) {
 	// A failed poll is a miss, not an error: the daemon may be idle-restarting.
+	// AC_NO_SPAWN keeps the test hermetic - otherwise the miss would spawn the
+	// test binary itself as "daemon".
+	t.Setenv("AC_NO_SPAWN", "1")
 	sock := filepath.Join(t.TempDir(), "absent.sock")
 	if _, found := waitForMail(sock, "/r", "x", 30*time.Millisecond, 10*time.Millisecond); found {
 		t.Fatal("must time out quietly without a daemon")

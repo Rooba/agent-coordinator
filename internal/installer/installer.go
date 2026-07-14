@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 )
 
 var hookEvents = []struct{ event, matcher string }{
@@ -16,7 +18,15 @@ var hookEvents = []struct{ event, matcher string }{
 	{"SessionEnd", ""},
 }
 
-func hookCommand(binPath string) string { return binPath + " hook" }
+// hookCommand is the exact identity key for our entries in settings.json.
+// A path with spaces is double-quoted: hook commands run through a shell
+// (cmd on Windows), which would otherwise split the path.
+func hookCommand(binPath string) string {
+	if strings.Contains(binPath, " ") {
+		return `"` + binPath + `" hook`
+	}
+	return binPath + " hook"
+}
 
 // marshalSettings renders settings without HTML escaping so foreign commands
 // containing & < > survive byte-identical. Output ends with a newline.
@@ -205,27 +215,45 @@ ExecStart=` + binPath + ` daemon
 	return socket, service
 }
 
-func Install(binPath, home string, run func(string, ...string) error) error {
+// installUnits sets up systemd socket activation - an optional Linux nicety
+// now that clients spawn the daemon on demand. Any systemctl failure (absent
+// binary, WSL without systemd) degrades: the freshly written units are
+// removed, a note is printed, and install continues with hooks + MCP.
+func installUnits(binPath, home string, run func(string, ...string) error) error {
 	unitDir := filepath.Join(home, ".config", "systemd", "user")
 	if err := os.MkdirAll(unitDir, 0o755); err != nil {
 		return err
 	}
 	sock, svc := UnitFiles(binPath)
-	if err := os.WriteFile(filepath.Join(unitDir, "agent-coordinator.socket"), []byte(sock), 0o644); err != nil {
+	sockPath := filepath.Join(unitDir, "agent-coordinator.socket")
+	svcPath := filepath.Join(unitDir, "agent-coordinator.service")
+	if err := os.WriteFile(sockPath, []byte(sock), 0o644); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(unitDir, "agent-coordinator.service"), []byte(svc), 0o644); err != nil {
+	if err := os.WriteFile(svcPath, []byte(svc), 0o644); err != nil {
 		return err
 	}
-	if err := run("systemctl", "--user", "daemon-reload"); err != nil {
-		return err
+	for _, args := range [][]string{
+		{"--user", "daemon-reload"},
+		{"--user", "enable", "--now", "agent-coordinator.socket"},
+		// Pick up the new binary on re-install; exits 0 when nothing is running.
+		{"--user", "try-restart", "agent-coordinator.service"},
+	} {
+		if err := run("systemctl", args...); err != nil {
+			os.Remove(sockPath)
+			os.Remove(svcPath)
+			fmt.Fprintln(os.Stderr, "note: systemctl unavailable; skipping socket activation - clients start the daemon on demand")
+			return nil
+		}
 	}
-	if err := run("systemctl", "--user", "enable", "--now", "agent-coordinator.socket"); err != nil {
-		return err
-	}
-	// Pick up the new binary on re-install; exits 0 when nothing is running.
-	if err := run("systemctl", "--user", "try-restart", "agent-coordinator.service"); err != nil {
-		return err
+	return nil
+}
+
+func Install(binPath, home string, run func(string, ...string) error) error {
+	if runtime.GOOS == "linux" {
+		if err := installUnits(binPath, home, run); err != nil {
+			return err
+		}
 	}
 	settingsPath := filepath.Join(home, ".claude", "settings.json")
 	cur, err := os.ReadFile(settingsPath)
@@ -253,12 +281,16 @@ func Install(binPath, home string, run func(string, ...string) error) error {
 }
 
 func Uninstall(binPath, home string, run func(string, ...string) error) error {
-	run("systemctl", "--user", "disable", "--now", "agent-coordinator.socket")
-	run("systemctl", "--user", "stop", "agent-coordinator.service")
-	unitDir := filepath.Join(home, ".config", "systemd", "user")
-	os.Remove(filepath.Join(unitDir, "agent-coordinator.socket"))
-	os.Remove(filepath.Join(unitDir, "agent-coordinator.service"))
-	run("systemctl", "--user", "daemon-reload")
+	// Unit removal mirrors installUnits: Linux-only, and every systemctl
+	// error is ignored so a systemd-less host still gets hooks + MCP stripped.
+	if runtime.GOOS == "linux" {
+		run("systemctl", "--user", "disable", "--now", "agent-coordinator.socket")
+		run("systemctl", "--user", "stop", "agent-coordinator.service")
+		unitDir := filepath.Join(home, ".config", "systemd", "user")
+		os.Remove(filepath.Join(unitDir, "agent-coordinator.socket"))
+		os.Remove(filepath.Join(unitDir, "agent-coordinator.service"))
+		run("systemctl", "--user", "daemon-reload")
+	}
 	settingsPath := filepath.Join(home, ".claude", "settings.json")
 	if cur, err := os.ReadFile(settingsPath); err == nil {
 		if out, changed, err := RemoveHooks(cur, binPath); err == nil && changed {
