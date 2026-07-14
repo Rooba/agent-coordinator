@@ -6,9 +6,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/agent-coordinator/go/internal/daemon"
-	"github.com/agent-coordinator/go/internal/paths"
-	"github.com/agent-coordinator/go/internal/store"
+	"github.com/Rooba/agent-coordinator/internal/daemon"
+	"github.com/Rooba/agent-coordinator/internal/paths"
+	"github.com/Rooba/agent-coordinator/internal/store"
 )
 
 func runDaemon() {

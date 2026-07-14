@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-coordinator/go/internal/protocol"
+	"github.com/Rooba/agent-coordinator/internal/protocol"
 )
 
 // peekDaemon answers peek with 0 unread for the first `misses` polls, then 1.

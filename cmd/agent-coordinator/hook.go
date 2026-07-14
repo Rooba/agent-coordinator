@@ -3,8 +3,8 @@ package main
 import (
 	"os"
 
-	"github.com/agent-coordinator/go/internal/hookcli"
-	"github.com/agent-coordinator/go/internal/paths"
+	"github.com/Rooba/agent-coordinator/internal/hookcli"
+	"github.com/Rooba/agent-coordinator/internal/paths"
 )
 
 func runHook() {

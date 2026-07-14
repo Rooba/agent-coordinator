@@ -1,4 +1,4 @@
-module github.com/agent-coordinator/go
+module github.com/Rooba/agent-coordinator
 
 go 1.25.0
 
