@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/agent-coordinator/go/internal/protocol"
+	"github.com/Rooba/agent-coordinator/internal/protocol"
 )
 
 func fakeDaemon(t *testing.T, resp protocol.Response) (string, *[]protocol.Request) {

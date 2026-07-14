@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/agent-coordinator/go/internal/protocol"
+	"github.com/Rooba/agent-coordinator/internal/protocol"
 	_ "modernc.org/sqlite"
 )
 

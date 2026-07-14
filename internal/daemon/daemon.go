@@ -14,9 +14,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/agent-coordinator/go/internal/paths"
-	"github.com/agent-coordinator/go/internal/protocol"
-	"github.com/agent-coordinator/go/internal/store"
+	"github.com/Rooba/agent-coordinator/internal/paths"
+	"github.com/Rooba/agent-coordinator/internal/protocol"
+	"github.com/Rooba/agent-coordinator/internal/store"
 )
 
 // ErrAlreadyServing means another daemon already owns the socket. The caller

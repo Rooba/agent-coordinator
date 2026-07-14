@@ -5,7 +5,7 @@ import (
 	"os"
 	"os/exec"
 
-	"github.com/agent-coordinator/go/internal/installer"
+	"github.com/Rooba/agent-coordinator/internal/installer"
 )
 
 func runInstall(args []string) {

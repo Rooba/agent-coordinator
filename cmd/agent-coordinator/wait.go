@@ -8,10 +8,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/agent-coordinator/go/internal/dialer"
-	"github.com/agent-coordinator/go/internal/paths"
-	"github.com/agent-coordinator/go/internal/protocol"
-	"github.com/agent-coordinator/go/internal/scope"
+	"github.com/Rooba/agent-coordinator/internal/dialer"
+	"github.com/Rooba/agent-coordinator/internal/paths"
+	"github.com/Rooba/agent-coordinator/internal/protocol"
+	"github.com/Rooba/agent-coordinator/internal/scope"
 )
 
 // runWait blocks until the named agent has unread mail (exit 0) or the

@@ -8,9 +8,9 @@ import (
 	"io"
 	"time"
 
-	"github.com/agent-coordinator/go/internal/dialer"
-	"github.com/agent-coordinator/go/internal/protocol"
-	"github.com/agent-coordinator/go/internal/scope"
+	"github.com/Rooba/agent-coordinator/internal/dialer"
+	"github.com/Rooba/agent-coordinator/internal/protocol"
+	"github.com/Rooba/agent-coordinator/internal/scope"
 )
 
 type rpcReq struct {

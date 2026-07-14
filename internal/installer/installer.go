@@ -217,8 +217,10 @@ ExecStart=` + binPath + ` daemon
 
 // installUnits sets up systemd socket activation - an optional Linux nicety
 // now that clients spawn the daemon on demand. Any systemctl failure (absent
-// binary, WSL without systemd) degrades: the freshly written units are
-// removed, a note is printed, and install continues with hooks + MCP.
+// binary, WSL without systemd, or a transient error on a real systemd host)
+// degrades: the socket is disabled best-effort so no sockets.target.wants
+// symlink dangles, the freshly written units are removed, a note is printed,
+// and install continues with hooks + MCP.
 func installUnits(binPath, home string, run func(string, ...string) error) error {
 	unitDir := filepath.Join(home, ".config", "systemd", "user")
 	if err := os.MkdirAll(unitDir, 0o755); err != nil {
@@ -240,9 +242,13 @@ func installUnits(binPath, home string, run func(string, ...string) error) error
 		{"--user", "try-restart", "agent-coordinator.service"},
 	} {
 		if err := run("systemctl", args...); err != nil {
+			// Best-effort: on a real systemd host an earlier successful enable
+			// left a sockets.target.wants symlink that would dangle once the
+			// unit files go; without systemd this is a harmless no-op.
+			run("systemctl", "--user", "disable", "--now", "agent-coordinator.socket")
 			os.Remove(sockPath)
 			os.Remove(svcPath)
-			fmt.Fprintln(os.Stderr, "note: systemctl unavailable; skipping socket activation - clients start the daemon on demand")
+			fmt.Fprintln(os.Stderr, "note: systemctl unavailable or failed; skipping socket activation - clients start the daemon on demand")
 			return nil
 		}
 	}

@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/agent-coordinator/go/internal/mcpserv"
-	"github.com/agent-coordinator/go/internal/paths"
+	"github.com/Rooba/agent-coordinator/internal/mcpserv"
+	"github.com/Rooba/agent-coordinator/internal/paths"
 )
 
 func runMCP() {

@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/agent-coordinator/go/internal/protocol"
+	"github.com/Rooba/agent-coordinator/internal/protocol"
 )
 
 func str(m map[string]any, key string) string {

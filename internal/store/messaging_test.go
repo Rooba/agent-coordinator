@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-coordinator/go/internal/protocol"
+	"github.com/Rooba/agent-coordinator/internal/protocol"
 )
 
 func twoAgents(t *testing.T) (*Store, string, string) {

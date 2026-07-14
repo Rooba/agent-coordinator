@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-coordinator/go/internal/protocol"
-	"github.com/agent-coordinator/go/internal/store"
+	"github.com/Rooba/agent-coordinator/internal/protocol"
+	"github.com/Rooba/agent-coordinator/internal/store"
 )
 
 func roundTrip(t *testing.T, sock string, req protocol.Request) protocol.Response {

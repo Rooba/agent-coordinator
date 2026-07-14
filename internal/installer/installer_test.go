@@ -251,6 +251,66 @@ func TestInstallDegradesWithoutSystemctl(t *testing.T) {
 	if !hasCall(calls, []string{"claude", "mcp", "add", "--scope", "user", "--transport", "stdio", "agent-coordinator", "--", "/bin/ac", "mcp"}) {
 		t.Fatalf("MCP server not registered: %v", calls)
 	}
+	// The degrade path must disable the socket (no-op here) so a real systemd
+	// host is never left with a dangling sockets.target.wants symlink.
+	if !hasCall(calls, []string{"systemctl", "--user", "disable", "--now", "agent-coordinator.socket"}) {
+		t.Fatalf("degrade path did not disable the socket: %v", calls)
+	}
+}
+
+// On a REAL systemd host a transient failure (here: try-restart, after
+// daemon-reload and enable succeeded) must still degrade, but first disable
+// the socket so the enablement symlink from the successful enable is cleaned
+// up before the unit files are removed.
+func TestInstallDegradeCleansEnablementOnTransientFailure(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("systemd unit setup is linux-only")
+	}
+	home := t.TempDir()
+	var calls [][]string
+	run := func(name string, args ...string) error {
+		calls = append(calls, append([]string{name}, args...))
+		if name == "systemctl" && len(args) > 1 && args[1] == "try-restart" {
+			return exec.ErrNotFound
+		}
+		return nil
+	}
+	if err := Install("/bin/ac", home, run); err != nil {
+		t.Fatalf("Install must degrade on a transient systemctl failure, not fail: %v", err)
+	}
+	unitDir := filepath.Join(home, ".config", "systemd", "user")
+	for _, unit := range []string{"agent-coordinator.socket", "agent-coordinator.service"} {
+		if _, err := os.Stat(filepath.Join(unitDir, unit)); !os.IsNotExist(err) {
+			t.Fatalf("unit %s left behind after degrade (stat err=%v)", unit, err)
+		}
+	}
+	disable := []string{"systemctl", "--user", "disable", "--now", "agent-coordinator.socket"}
+	if !hasCall(calls, disable) {
+		t.Fatalf("dangling-symlink cleanup (disable) not run: %v", calls)
+	}
+	// The disable must come after the enable that created the symlink.
+	enableIdx, disableIdx := -1, -1
+	for i, c := range calls {
+		if enableIdx == -1 && len(c) > 2 && c[0] == "systemctl" && c[2] == "enable" {
+			enableIdx = i
+		}
+		if hasCall([][]string{c}, disable) {
+			disableIdx = i
+		}
+	}
+	if enableIdx == -1 || disableIdx <= enableIdx {
+		t.Fatalf("disable (%d) must follow enable (%d): %v", disableIdx, enableIdx, calls)
+	}
+	after, err := os.ReadFile(filepath.Join(home, ".claude", "settings.json"))
+	if err != nil {
+		t.Fatalf("hooks not merged: %v", err)
+	}
+	if got := strings.Count(string(after), `"/bin/ac hook"`); got != 5 {
+		t.Fatalf("want 5 coordinator hook entries, got %d in:\n%s", got, after)
+	}
+	if !hasCall(calls, []string{"claude", "mcp", "add", "--scope", "user", "--transport", "stdio", "agent-coordinator", "--", "/bin/ac", "mcp"}) {
+		t.Fatalf("MCP server not registered: %v", calls)
+	}
 }
 
 // A binary path with spaces (common under C:\Program Files) must be quoted in

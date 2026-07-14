@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/agent-coordinator/go/internal/protocol"
+	"github.com/Rooba/agent-coordinator/internal/protocol"
 )
 
 // fakeDaemon answers every request with the canned response and records requests.
