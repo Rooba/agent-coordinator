@@ -11,6 +11,76 @@ on-demand daemon, and peer tools are exposed over MCP. There is no proxy in
 front of the model and no polling - message notices are pushed into an
 agent's context on its next tool call.
 
+## Tell your agents to use it
+
+Paste the block below into your project's `CLAUDE.md` (or equivalent agent instructions file) so every agent that opens the repo knows to use the coordinator without being told:
+
+```markdown
+# Agent Coordinator - use it, actively
+
+This workspace is served by the **agent-coordinator**: a lightweight presence + messaging mesh that
+lets multiple agents and sessions see each other and collaborate without colliding. When more than
+one agent or session may share a workspace, USING IT IS NOT OPTIONAL - it markedly improves speed and
+prevents duplicated or conflicting work. The five tools below are exposed via the `agent-coordinator`
+MCP server; the `agent-coordinator` CLI provides the `wait` wake-lever.
+
+## Your identity
+
+At SessionStart the coordinator hook injects your name:
+`[coordinator] you are '<name>' in this workspace` (an adjective-animal, e.g. `deft-pika`).
+Use that exact `<name>` as `from` in every coordinator call. It is already in your context - do not
+grep the filesystem for it.
+
+## The five tools
+
+- `status_board` - every agent with name, presence (active / idle / gone), current task, touched files, last activity.
+- `list_agents` - who is active or idle right now (presence only).
+- `send_message(from, to, body)` - direct message to one agent by name.
+- `read_messages(from)` - read AND CLEAR your own unread messages (`from` = your name).
+- `broadcast(from, body)` - workspace-wide, need-to-know channel. Sparingly - it notifies everyone.
+
+## Wake pattern (be woken, do not busy-poll)
+
+Arm a background task: `agent-coordinator wait '<yourname>' -timeout <sec>` (default 570s). It exits
+the moment a DM arrives (or on timeout) and the harness re-invokes you. Treat it as a WAKE SIGNAL,
+then confirm with `read_messages` - it can return early on a residual notice, so it is not a precise
+timer.
+
+## DO
+
+- On start, or when joining shared work: call `status_board` and `read_messages`, and announce your presence.
+- Check the board BEFORE heavy or shared work so you do not duplicate or collide with a peer.
+- DM peers to divide work: agree ONE writer per file and disjoint dir/file namespaces up front. This
+  alone let ~30 concurrent agents run with zero file conflicts in testing.
+- Resolve races deterministically (e.g. alphabetical tie-break on who creates a shared resource).
+- Under heavy agent load, COORDINATE load-bearing host operations: elect ONE agent (or take turns) to
+  build binaries (`go build`), index a repo, run migrations, or start a dev server. Run concurrently
+  these thrash the host (a real incident: an uncoordinated rebuild storm consumed ~17 GB/min);
+  coordinated, they are normal-impact.
+- Retry with backoff on a transient `daemon unreachable` / socket i/o timeout (seen under ~30-agent load).
+- Key durable work artifacts by your stable `agent_id`, not by display name (names can collide).
+
+## DON'T
+
+- Don't broadcast anything that is not genuine need-to-know - it notifies every active agent.
+- Don't have N agents independently run the same expensive command (build / index / deploy) - coordinate one.
+- Don't reply-all storm; one hello per peer is enough.
+- Don't assume a broadcast reached later-spawned agents - broadcasts are one-shot; DM critical directives.
+- Don't launch a large recursive subagent fan-out on a quota-limited model without checking headroom.
+- Don't trust display-name self-identification under concurrent spawns; verify against `status_board`.
+
+## Subagent identity (current limitation - read if you spawn or are a subagent)
+
+Agent-tool subagents inherit the parent session's id, so the SessionStart hook may NOT mint them a
+distinct coordinator name, and peer tools reject an unregistered `from` (`no agent X in this
+workspace`). If you are a subagent without a name: use any `you are '<name>'` line in your context;
+otherwise call `list_agents` and take the newest active entry that is unmistakably you. For
+multi-agent runs prefer a FRESH (non-resumed) session - a resumed session currently fails to register
+its subagents into the mesh.
+```
+
+The same guide lives at the repo root as `CLAUDE.md`, ready to copy as-is.
+
 ## Install
 
 ### Release binary (easiest)
@@ -220,6 +290,26 @@ A single SQLite database at
 daemon is the only writer. Housekeeping prunes agents unseen for 7 days,
 and messages 7 days after every delivery is read (30 days
 unconditionally).
+
+## Known limitations and field findings
+
+Findings from a two-session, ~30-agent stress test:
+
+- Subagent identity - Agent-tool subagents inherit the parent's `CLAUDE_CODE_SESSION_ID`, so
+  SessionStart never mints them a distinct coordinator name; a resumed session cannot register its
+  subagents into the mesh at all (a fresh session can - see the "Subagent identity" note in the
+  pasteable CLAUDE.md above).
+- Name collisions - simultaneous sibling spawns can independently land on the same adjective-animal
+  name; agents that keyed work files by display name saw those files clobbered between siblings.
+  Key durable artifacts by the stable `agent_id` instead.
+- `wait` is a wake signal, not a precise timer - it can return early on a residual (already-delivered)
+  notice, so treat exit 0 as "check now," not "mail is new," and confirm with `read_messages`.
+- Under ~30-agent load the daemon's unix socket produced transient i/o timeouts on `send_message`;
+  retry with backoff.
+- Broadcasts are one-shot (see Broadcast etiquette above) - an agent spawned after a broadcast fired
+  never sees it; DM critical directives instead of relying on broadcast for late joiners.
+
+Proposed fixes are tracked in TODO.md.
 
 ## Development
 
