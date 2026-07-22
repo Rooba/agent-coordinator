@@ -10,11 +10,19 @@ import (
 	"testing"
 
 	"github.com/Rooba/agent-coordinator/internal/protocol"
+	"github.com/Rooba/agent-coordinator/internal/scope"
+	"github.com/Rooba/agent-coordinator/internal/socktest"
 )
+
+// cwd is the working directory Serve is started with in these tests.
+// Assertions on the forwarded scope must compare against scope.Resolve(cwd),
+// never the literal: Resolve canonicalizes per-OS (on windows this becomes a
+// volume-qualified backslash path).
+const cwd = "/some/repo"
 
 func fakeDaemon(t *testing.T, resp protocol.Response) (string, *[]protocol.Request) {
 	t.Helper()
-	sock := filepath.Join(t.TempDir(), "d.sock")
+	sock := filepath.Join(socktest.Dir(t), "d.sock")
 	l, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatal(err)
@@ -43,7 +51,7 @@ func rpc(t *testing.T, sock string, lines ...string) []string {
 	t.Helper()
 	in := strings.NewReader(strings.Join(lines, "\n") + "\n")
 	var out bytes.Buffer
-	if err := Serve(in, &out, sock, "/some/repo"); err != nil {
+	if err := Serve(in, &out, sock, cwd); err != nil {
 		t.Fatal(err)
 	}
 	return strings.Split(strings.TrimSpace(out.String()), "\n")
@@ -102,7 +110,7 @@ func TestSendMessageToolCall(t *testing.T) {
 	sock, got := fakeDaemon(t, protocol.Response{OK: true})
 	out := rpc(t, sock,
 		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_message","arguments":{"from":"amber-fox","to":"brisk-owl","body":"ping"}}}`)
-	if len(*got) != 1 || (*got)[0].Op != protocol.OpSend || (*got)[0].To != "brisk-owl" || (*got)[0].Scope != "/some/repo" {
+	if len(*got) != 1 || (*got)[0].Op != protocol.OpSend || (*got)[0].To != "brisk-owl" || (*got)[0].Scope != scope.Resolve(cwd) {
 		t.Fatalf("daemon saw %+v", *got)
 	}
 	if !strings.Contains(out[0], `"content"`) {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Rooba/agent-coordinator/internal/protocol"
+	"github.com/Rooba/agent-coordinator/internal/socktest"
 	"github.com/Rooba/agent-coordinator/internal/store"
 )
 
@@ -38,7 +39,7 @@ func roundTrip(t *testing.T, sock string, req protocol.Request) protocol.Respons
 
 func startDaemon(t *testing.T, idle time.Duration) (string, chan error) {
 	t.Helper()
-	dir := t.TempDir()
+	dir := socktest.Dir(t)
 	sock := filepath.Join(dir, "d.sock")
 	st, err := store.Open(filepath.Join(dir, "d.db"))
 	if err != nil {
@@ -46,10 +47,26 @@ func startDaemon(t *testing.T, idle time.Duration) (string, chan error) {
 	}
 	l, err := net.Listen("unix", sock)
 	if err != nil {
+		st.Close()
 		t.Fatal(err)
 	}
 	done := make(chan error, 1)
-	go func() { done <- Serve(l, st, idle) }()
+	exited := make(chan struct{})
+	go func() { done <- Serve(l, st, idle); close(exited) }()
+	// Drive the real shutdown path before the temp dir is removed: closing
+	// the listener ends Serve, which joins its goroutines and closes the
+	// store, so the db handle is released (windows cannot delete open files).
+	t.Cleanup(func() {
+		l.Close()
+		<-exited
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("serve: %v", err)
+			}
+		default: // the test consumed it (idle-exit path)
+		}
+	})
 	return sock, done
 }
 
@@ -99,7 +116,7 @@ func TestIdleReturnsNoticesOnce(t *testing.T) {
 // Bind-as-lock: a second daemon finding a live listener on the socket must
 // report ErrAlreadyServing so its process can exit 0 quietly.
 func TestListenerExitsWhenPeerServes(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "d.sock")
+	sock := filepath.Join(socktest.Dir(t), "d.sock")
 	t.Setenv("AC_SOCKET", sock)
 	l, err := net.Listen("unix", sock)
 	if err != nil {
@@ -115,7 +132,7 @@ func TestListenerExitsWhenPeerServes(t *testing.T) {
 // must defer with ErrAlreadyServing even though nothing is dialable yet (the
 // peer may be mid-bind) - it must never remove the file or bind itself.
 func TestListenerDefersToLockHolder(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "d.sock")
+	sock := filepath.Join(socktest.Dir(t), "d.sock")
 	t.Setenv("AC_SOCKET", sock)
 	peer, err := os.OpenFile(sock+".lock", os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
@@ -133,7 +150,7 @@ func TestListenerDefersToLockHolder(t *testing.T) {
 // A dead socket file (unclean shutdown) is not a lock: Listener removes it
 // and binds.
 func TestListenerReplacesStaleSocket(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "d.sock")
+	sock := filepath.Join(socktest.Dir(t), "d.sock")
 	t.Setenv("AC_SOCKET", sock)
 	stale, err := net.ListenUnix("unix", &net.UnixAddr{Name: sock, Net: "unix"})
 	if err != nil {
@@ -146,6 +163,11 @@ func TestListenerReplacesStaleSocket(t *testing.T) {
 		t.Fatalf("want a fresh listener over the stale socket, got activated=%v err=%v", activated, err)
 	}
 	l.Close()
+	// Listener pinned sock+".lock" in sockLock for the process lifetime (by
+	// design for real daemons). Release it here so windows can delete the
+	// temp dir, and reset for other tests in this process.
+	sockLock.Close()
+	sockLock = nil
 }
 
 func TestIdleExit(t *testing.T) {

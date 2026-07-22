@@ -136,20 +136,26 @@ func TestInstallUninstallRoundTrip(t *testing.T) {
 		t.Fatalf("Install: %v", err)
 	}
 
+	// Systemd socket activation is a linux-only install step; on darwin and
+	// windows Install must leave ~/.config/systemd untouched.
 	unitDir := filepath.Join(home, ".config", "systemd", "user")
-	sock, err := os.ReadFile(filepath.Join(unitDir, "agent-coordinator.socket"))
-	if err != nil {
-		t.Fatalf("socket unit: %v", err)
-	}
-	if !strings.Contains(string(sock), "ListenStream=%t/agent-coordinator.sock") {
-		t.Fatalf("socket unit content: %s", sock)
-	}
-	svc, err := os.ReadFile(filepath.Join(unitDir, "agent-coordinator.service"))
-	if err != nil {
-		t.Fatalf("service unit: %v", err)
-	}
-	if !strings.Contains(string(svc), "ExecStart=/bin/ac daemon") {
-		t.Fatalf("service unit content: %s", svc)
+	if runtime.GOOS == "linux" {
+		sock, err := os.ReadFile(filepath.Join(unitDir, "agent-coordinator.socket"))
+		if err != nil {
+			t.Fatalf("socket unit: %v", err)
+		}
+		if !strings.Contains(string(sock), "ListenStream=%t/agent-coordinator.sock") {
+			t.Fatalf("socket unit content: %s", sock)
+		}
+		svc, err := os.ReadFile(filepath.Join(unitDir, "agent-coordinator.service"))
+		if err != nil {
+			t.Fatalf("service unit: %v", err)
+		}
+		if !strings.Contains(string(svc), "ExecStart=/bin/ac daemon") {
+			t.Fatalf("service unit content: %s", svc)
+		}
+	} else if _, err := os.Stat(unitDir); !os.IsNotExist(err) {
+		t.Fatalf("systemd unit dir created on %s (stat err=%v)", runtime.GOOS, err)
 	}
 
 	after, err := os.ReadFile(settingsPath)
@@ -174,16 +180,22 @@ func TestInstallUninstallRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(after, &m); err != nil {
 		t.Fatalf("settings not valid JSON after install: %v", err)
 	}
-	for _, want := range [][]string{
-		{"systemctl", "--user", "daemon-reload"},
-		{"systemctl", "--user", "enable", "--now", "agent-coordinator.socket"},
-		{"systemctl", "--user", "try-restart", "agent-coordinator.service"},
+	wantCalls := [][]string{
 		{"claude", "mcp", "add", "--scope", "user", "--transport", "stdio", "agent-coordinator", "--", "/bin/ac", "mcp"},
-	} {
+	}
+	if runtime.GOOS == "linux" {
+		wantCalls = append(wantCalls,
+			[]string{"systemctl", "--user", "daemon-reload"},
+			[]string{"systemctl", "--user", "enable", "--now", "agent-coordinator.socket"},
+			[]string{"systemctl", "--user", "try-restart", "agent-coordinator.service"},
+		)
+	}
+	for _, want := range wantCalls {
 		if !hasCall(calls, want) {
 			t.Fatalf("missing recorded command %v in %v", want, calls)
 		}
 	}
+	assertNoSystemctlOffLinux(t, calls)
 
 	calls = nil
 	if err := Uninstall("/bin/ac", home, fakeRun); err != nil {
@@ -202,17 +214,34 @@ func TestInstallUninstallRoundTrip(t *testing.T) {
 			t.Fatalf("uninstall dropped foreign command %q:\n%s", foreign, s)
 		}
 	}
+	// Holds on every OS: linux removed the units, darwin/windows never wrote any.
 	for _, unit := range []string{"agent-coordinator.socket", "agent-coordinator.service"} {
 		if _, err := os.Stat(filepath.Join(unitDir, unit)); !os.IsNotExist(err) {
 			t.Fatalf("unit file %s still present (stat err=%v)", unit, err)
 		}
 	}
-	for _, want := range [][]string{
-		{"systemctl", "--user", "disable", "--now", "agent-coordinator.socket"},
-		{"claude", "mcp", "remove", "--scope", "user", "agent-coordinator"},
-	} {
+	wantCalls = [][]string{{"claude", "mcp", "remove", "--scope", "user", "agent-coordinator"}}
+	if runtime.GOOS == "linux" {
+		wantCalls = append(wantCalls, []string{"systemctl", "--user", "disable", "--now", "agent-coordinator.socket"})
+	}
+	for _, want := range wantCalls {
 		if !hasCall(calls, want) {
 			t.Fatalf("missing recorded command %v in %v", want, calls)
+		}
+	}
+	assertNoSystemctlOffLinux(t, calls)
+}
+
+// assertNoSystemctlOffLinux fails if a systemctl invocation was recorded on a
+// non-linux OS, where the installer must not attempt systemd management.
+func assertNoSystemctlOffLinux(t *testing.T, calls [][]string) {
+	t.Helper()
+	if runtime.GOOS == "linux" {
+		return
+	}
+	for _, c := range calls {
+		if c[0] == "systemctl" {
+			t.Fatalf("systemctl invoked on %s: %v", runtime.GOOS, c)
 		}
 	}
 }

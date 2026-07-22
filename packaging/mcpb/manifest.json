@@ -1,0 +1,56 @@
+{
+  "manifest_version": "0.3",
+  "name": "agent-coordinator",
+  "display_name": "Agent Coordinator",
+  "version": "0.0.0-dev",
+  "description": "Presence, status, and messaging for concurrent coding agents sharing a workspace.",
+  "long_description": "A lightweight presence and messaging mesh for concurrent coding agents working in the same repository: a live status board of who is doing what, direct messages, broadcasts, and wake-on-mail. Zero infrastructure - a single binary; the daemon starts itself on demand and exits when idle.",
+  "author": {
+    "name": "Rooba",
+    "url": "https://github.com/Rooba"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Rooba/agent-coordinator"
+  },
+  "homepage": "https://github.com/Rooba/agent-coordinator",
+  "server": {
+    "type": "binary",
+    "entry_point": "server/agent-coordinator",
+    "mcp_config": {
+      "command": "${__dirname}/server/agent-coordinator",
+      "args": ["mcp"],
+      "platform_overrides": {
+        "win32": {
+          "command": "${__dirname}/server/agent-coordinator.exe"
+        }
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "status_board",
+      "description": "Every agent in the workspace with name, presence, current task, touched files, and last activity."
+    },
+    {
+      "name": "list_agents",
+      "description": "Who is active or idle right now (presence only)."
+    },
+    {
+      "name": "send_message",
+      "description": "Direct message to one agent by name."
+    },
+    {
+      "name": "read_messages",
+      "description": "Read and clear your own unread messages."
+    },
+    {
+      "name": "broadcast",
+      "description": "Workspace-wide need-to-know message to every active agent."
+    }
+  ],
+  "keywords": ["mcp", "agents", "coordination", "messaging", "presence"],
+  "compatibility": {
+    "platforms": ["darwin", "linux", "win32"]
+  }
+}

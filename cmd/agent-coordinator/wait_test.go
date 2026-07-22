@@ -10,12 +10,13 @@ import (
 	"time"
 
 	"github.com/Rooba/agent-coordinator/internal/protocol"
+	"github.com/Rooba/agent-coordinator/internal/socktest"
 )
 
 // peekDaemon answers peek with 0 unread for the first `misses` polls, then 1.
 func peekDaemon(t *testing.T, misses int64) string {
 	t.Helper()
-	sock := filepath.Join(t.TempDir(), "d.sock")
+	sock := filepath.Join(socktest.Dir(t), "d.sock")
 	l, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatal(err)
@@ -62,7 +63,7 @@ func TestWaitForMailSurvivesMissingDaemon(t *testing.T) {
 	// AC_NO_SPAWN keeps the test hermetic - otherwise the miss would spawn the
 	// test binary itself as "daemon".
 	t.Setenv("AC_NO_SPAWN", "1")
-	sock := filepath.Join(t.TempDir(), "absent.sock")
+	sock := filepath.Join(socktest.Dir(t), "absent.sock")
 	if _, found := waitForMail(sock, "/r", "x", 30*time.Millisecond, 10*time.Millisecond); found {
 		t.Fatal("must time out quietly without a daemon")
 	}
