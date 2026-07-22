@@ -18,13 +18,39 @@ jobs:
       - name: Build binaries
         run: |
           mkdir -p dist
+          VERSION="${GITHUB_REF_NAME#v}"
           for target in linux/amd64 linux/arm64 windows/amd64 darwin/amd64 darwin/arm64; do
             GOOS="${target%/*}"
             GOARCH="${target#*/}"
             ext=""
             if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
-            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -ldflags '-s -w' \
+            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath \
+              -ldflags "-s -w -X main.version=${VERSION}" \
               -o "dist/agent-coordinator_${GOOS}_${GOARCH}${ext}" ./cmd/agent-coordinator
+          done
+      - name: Build MCP bundles (.mcpb)
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          for target in linux/amd64 linux/arm64 windows/amd64 darwin/amd64 darwin/arm64; do
+            GOOS="${target%/*}"
+            GOARCH="${target#*/}"
+            ext=""
+            plat="$GOOS"
+            if [ "$GOOS" = "windows" ]; then ext=".exe"; plat="win32"; fi
+            stage="$(mktemp -d)"
+            mkdir -p "$stage/server"
+            install -m 0755 "dist/agent-coordinator_${GOOS}_${GOARCH}${ext}" \
+              "$stage/server/agent-coordinator${ext}"
+            jq --arg v "$VERSION" --arg p "$plat" \
+              '.version = $v | .compatibility.platforms = [$p]' \
+              packaging/mcpb/manifest.json > "$stage/manifest.json"
+            out="$PWD/dist/agent-coordinator_${GOOS}_${GOARCH}.mcpb"
+            # Prefer the official packer; a .mcpb is a zip archive, so fall back to zip.
+            npx --yes @anthropic-ai/mcpb pack "$stage" "$out" || {
+              rm -f "$out"
+              (cd "$stage" && zip -qr9 "$out" .)
+            }
+            rm -rf "$stage"
           done
       - uses: softprops/action-gh-release@v2
         with:

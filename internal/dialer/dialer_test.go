@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Rooba/agent-coordinator/internal/socktest"
 )
 
 // resetSpawn installs a stub spawn func, restoring the real one on cleanup.
@@ -28,7 +30,7 @@ func resetSpawn(t *testing.T, stub func(string) (<-chan struct{}, error)) {
 // The core spawn-on-miss promise: the first dial misses, the "spawned daemon"
 // (a listener that appears a beat later) binds, and Dial connects to it.
 func TestDialConnectsToLateListener(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "d.sock")
+	sock := filepath.Join(socktest.Dir(t), "d.sock")
 	lch := make(chan net.Listener, 1)
 	resetSpawn(t, func(string) (<-chan struct{}, error) {
 		go func() {
@@ -52,7 +54,7 @@ func TestDialConnectsToLateListener(t *testing.T) {
 // Repeated misses inside the cooldown fork exactly one daemon while still
 // telling every caller to keep redialing.
 func TestSpawnThrottleIsStampFileBased(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "absent.sock")
+	sock := filepath.Join(socktest.Dir(t), "absent.sock")
 	var attempts atomic.Int32
 	resetSpawn(t, func(string) (<-chan struct{}, error) {
 		attempts.Add(1)
@@ -74,7 +76,7 @@ func TestSpawnThrottleIsStampFileBased(t *testing.T) {
 // A fresh stamp written by another process throttles this one too: no spawn,
 // but the caller still redials (the other process's daemon may be binding).
 func TestSpawnThrottleHonorsForeignStamp(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "absent.sock")
+	sock := filepath.Join(socktest.Dir(t), "absent.sock")
 	touch(sock + ".spawn") // "another process" just spawned
 	resetSpawn(t, func(string) (<-chan struct{}, error) {
 		t.Error("spawned despite a fresh stamp")
@@ -89,7 +91,7 @@ func TestSpawnThrottleHonorsForeignStamp(t *testing.T) {
 // A spawned daemon that dies immediately (crash loop) must cut the redial
 // window short instead of stalling the caller for the full retryWindow.
 func TestDialAbortsWhenSpawnedDaemonDies(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "absent.sock")
+	sock := filepath.Join(socktest.Dir(t), "absent.sock")
 	resetSpawn(t, func(string) (<-chan struct{}, error) {
 		died := make(chan struct{})
 		close(died) // the "daemon" is already dead
@@ -108,7 +110,7 @@ func TestDialAbortsWhenSpawnedDaemonDies(t *testing.T) {
 // coming up, so neither this caller nor other processes should sit in the
 // redial window on its account.
 func TestSpawnStartFailureFailsFastWithoutStamp(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "absent.sock")
+	sock := filepath.Join(socktest.Dir(t), "absent.sock")
 	resetSpawn(t, func(string) (<-chan struct{}, error) { return nil, errors.New("spawn broken") })
 	if retry, _ := maybeSpawn(sock); retry {
 		t.Fatal("want retry=false when the spawn never started")
@@ -120,7 +122,7 @@ func TestSpawnStartFailureFailsFastWithoutStamp(t *testing.T) {
 
 func TestDialNoSpawnEnvDisablesSpawning(t *testing.T) {
 	t.Setenv("AC_NO_SPAWN", "1")
-	sock := filepath.Join(t.TempDir(), "absent.sock")
+	sock := filepath.Join(socktest.Dir(t), "absent.sock")
 	resetSpawn(t, func(string) (<-chan struct{}, error) {
 		t.Error("spawned despite AC_NO_SPAWN")
 		return nil, nil

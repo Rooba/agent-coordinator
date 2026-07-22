@@ -82,11 +82,13 @@ func Serve(l net.Listener, st *store.Store, idleTimeout time.Duration) error {
 
 	var lastActivity atomic.Int64
 	lastActivity.Store(time.Now().UnixNano())
-	stop := make(chan struct{})
+	done := make(chan struct{})         // closed when the accept loop ends
+	watchdogDone := make(chan struct{}) // closed when the watchdog goroutine exits
 	sigC := make(chan os.Signal, 1)
 	signal.Notify(sigC, syscall.SIGTERM, syscall.SIGINT)
 
 	go func() {
+		defer close(watchdogDone)
 		tick := time.NewTicker(idleTimeout / 4)
 		house := time.NewTicker(time.Hour)
 		defer tick.Stop()
@@ -95,30 +97,28 @@ func Serve(l net.Listener, st *store.Store, idleTimeout time.Duration) error {
 			select {
 			case <-tick.C:
 				if time.Since(time.Unix(0, lastActivity.Load())) > idleTimeout {
-					close(stop)
 					l.Close()
 					return
 				}
 			case <-house.C:
 				st.Housekeep()
 			case <-sigC:
-				close(stop)
 				l.Close()
+				return
+			case <-done:
 				return
 			}
 		}
 	}()
 
-	// Drain on shutdown: whatever ends the accept loop, close the listener,
-	// wait for in-flight handlers, and only then close the store.
+	// Closing the listener - idle timeout, signal, or an external shutdown
+	// (tests, socket handover) - is the one clean way to end the accept loop.
 	var wg sync.WaitGroup
 	var serveErr error
 	for {
 		conn, err := l.Accept()
 		if err != nil {
-			select {
-			case <-stop: // clean idle-exit or signal
-			default:
+			if !errors.Is(err, net.ErrClosed) {
 				serveErr = err
 			}
 			break
@@ -130,7 +130,12 @@ func Serve(l net.Listener, st *store.Store, idleTimeout time.Duration) error {
 			handle(conn, st)
 		}()
 	}
+	// Deterministic teardown: join the watchdog, drain in-flight handlers,
+	// then close the store, so no goroutine or handle outlives Serve.
+	close(done)
+	signal.Stop(sigC)
 	l.Close()
+	<-watchdogDone
 	wg.Wait()
 	st.Close()
 	return serveErr

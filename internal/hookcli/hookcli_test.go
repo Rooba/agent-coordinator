@@ -11,12 +11,13 @@ import (
 	"testing"
 
 	"github.com/Rooba/agent-coordinator/internal/protocol"
+	"github.com/Rooba/agent-coordinator/internal/socktest"
 )
 
 // fakeDaemon answers every request with the canned response and records requests.
 func fakeDaemon(t *testing.T, resp protocol.Response) (string, *[]protocol.Request) {
 	t.Helper()
-	sock := filepath.Join(t.TempDir(), "d.sock")
+	sock := filepath.Join(socktest.Dir(t), "d.sock")
 	l, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatal(err)
@@ -139,7 +140,7 @@ func TestFailOpenWithoutDaemon(t *testing.T) {
 	// test binary itself as "daemon".
 	t.Setenv("AC_NO_SPAWN", "1")
 	var out bytes.Buffer
-	Run(bytes.NewReader(fixture(t, "post_read.json")), &out, filepath.Join(t.TempDir(), "absent.sock"))
+	Run(bytes.NewReader(fixture(t, "post_read.json")), &out, filepath.Join(socktest.Dir(t), "absent.sock"))
 	if out.Len() != 0 {
 		t.Fatalf("must be silent when daemon is unreachable, got %s", out.String())
 	}
