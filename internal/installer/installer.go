@@ -3,19 +3,30 @@ package installer
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 )
 
-var hookEvents = []struct{ event, matcher string }{
+type hookEvent struct{ event, matcher string }
+
+var hookEvents = []hookEvent{
 	{"SessionStart", "startup|resume|clear|compact"},
 	{"UserPromptSubmit", ""},
 	{"PostToolUse", ""},
 	{"Stop", ""},
 	{"SessionEnd", ""},
+}
+
+var codexHookEvents = []hookEvent{
+	{"SessionStart", "startup|resume|clear|compact"},
+	{"UserPromptSubmit", ""},
+	{"PostToolUse", ""},
+	{"Stop", ""},
 }
 
 // hookCommand is the exact identity key for our entries in settings.json.
@@ -46,6 +57,14 @@ func marshalSettings(root map[string]any) ([]byte, error) {
 // proceed (returns an error) if "hooks" or an event list has an unexpected shape,
 // rather than clobbering foreign values.
 func MergeHooks(settings []byte, binPath string) ([]byte, bool, error) {
+	return mergeHooks(settings, binPath, hookEvents)
+}
+
+func MergeCodexHooks(settings []byte, binPath string) ([]byte, bool, error) {
+	return mergeHooks(settings, binPath, codexHookEvents)
+}
+
+func mergeHooks(settings []byte, binPath string, events []hookEvent) ([]byte, bool, error) {
 	if len(settings) == 0 {
 		settings = []byte("{}")
 	}
@@ -66,7 +85,7 @@ func MergeHooks(settings []byte, binPath string) ([]byte, bool, error) {
 	}
 	changed := false
 	cmd := hookCommand(binPath)
-	for _, he := range hookEvents {
+	for _, he := range events {
 		var entries []any
 		if v, exists := hooks[he.event]; exists {
 			list, ok := v.([]any)
@@ -173,6 +192,181 @@ func containsCommand(entries []any, cmd string) bool {
 	return false
 }
 
+func mergeOpenCodeConfig(config []byte, binPath string) ([]byte, bool, error) {
+	if len(bytes.TrimSpace(config)) == 0 {
+		config = []byte("{}")
+	}
+	var root map[string]any
+	if err := json.Unmarshal(config, &root); err != nil {
+		return nil, false, fmt.Errorf("opencode.json is not plain JSON: %w", err)
+	}
+	if root == nil {
+		root = map[string]any{}
+	}
+	mcp := map[string]any{}
+	if v, ok := root["mcp"]; ok {
+		var valid bool
+		mcp, valid = v.(map[string]any)
+		if !valid {
+			return nil, false, fmt.Errorf("opencode.json: \"mcp\" is not an object; refusing to overwrite")
+		}
+	}
+	if entry, ok := mcp["agent-coordinator"].(map[string]any); ok && openCodeEntryMatches(entry, binPath) {
+		return config, false, nil
+	}
+	mcp["agent-coordinator"] = map[string]any{
+		"type":    "local",
+		"command": []string{binPath, "mcp"},
+		"enabled": true,
+	}
+	root["mcp"] = mcp
+	out, err := marshalSettings(root)
+	return out, true, err
+}
+
+func removeOpenCodeConfig(config []byte, binPath string) ([]byte, bool, error) {
+	var root map[string]any
+	if err := json.Unmarshal(config, &root); err != nil {
+		return nil, false, err
+	}
+	mcp, ok := root["mcp"].(map[string]any)
+	if !ok {
+		return config, false, nil
+	}
+	entry, ok := mcp["agent-coordinator"].(map[string]any)
+	if !ok || !openCodeEntryMatches(entry, binPath) {
+		return config, false, nil
+	}
+	delete(mcp, "agent-coordinator")
+	if len(mcp) == 0 {
+		delete(root, "mcp")
+	}
+	out, err := marshalSettings(root)
+	return out, true, err
+}
+
+func openCodeEntryMatches(entry map[string]any, binPath string) bool {
+	if typ, _ := entry["type"].(string); typ != "local" {
+		return false
+	}
+	switch cmd := entry["command"].(type) {
+	case []any:
+		if len(cmd) != 2 {
+			return false
+		}
+		first, _ := cmd[0].(string)
+		second, _ := cmd[1].(string)
+		return first == binPath && second == "mcp"
+	case []string:
+		return len(cmd) == 2 && cmd[0] == binPath && cmd[1] == "mcp"
+	default:
+		return false
+	}
+}
+
+func installOpenCode(binPath, home string) error {
+	path := filepath.Join(home, ".config", "opencode", "opencode.json")
+	config, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	out, changed, err := mergeOpenCodeConfig(config, binPath)
+	if err != nil || !changed {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return writeFileAtomic(path, out, 0o644)
+}
+
+func uninstallOpenCode(binPath, home string) error {
+	path := filepath.Join(home, ".config", "opencode", "opencode.json")
+	config, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	out, changed, err := removeOpenCodeConfig(config, binPath)
+	if err != nil || !changed {
+		return err
+	}
+	return writeFileAtomic(path, out, 0o644)
+}
+
+func registerMCPClients(binPath string, run func(string, ...string) error) error {
+	clients := []struct {
+		name   string
+		remove []string
+		add    []string
+	}{
+		{
+			name:   "claude",
+			remove: []string{"mcp", "remove", "--scope", "user", "agent-coordinator"},
+			add:    []string{"mcp", "add", "--scope", "user", "--transport", "stdio", "agent-coordinator", "--", binPath, "mcp"},
+		},
+		{
+			name:   "codex",
+			remove: []string{"mcp", "remove", "agent-coordinator"},
+			add:    []string{"mcp", "add", "agent-coordinator", "--", binPath, "mcp"},
+		},
+		{
+			name:   "grok",
+			remove: []string{"mcp", "remove", "--scope", "user", "agent-coordinator"},
+			add:    []string{"mcp", "add", "--scope", "user", "agent-coordinator", "--", binPath, "mcp"},
+		},
+	}
+	for _, client := range clients {
+		// Replacing our named entry is what makes reinstall repair stale paths.
+		if err := run(client.name, client.remove...); errors.Is(err, exec.ErrNotFound) {
+			fmt.Fprintf(os.Stderr, "note: %s not installed; skipping MCP registration\n", client.name)
+			continue
+		}
+		if err := run(client.name, client.add...); err != nil {
+			if errors.Is(err, exec.ErrNotFound) {
+				fmt.Fprintf(os.Stderr, "note: %s not installed; skipping MCP registration\n", client.name)
+				continue
+			}
+			return fmt.Errorf("%s mcp add: %w", client.name, err)
+		}
+	}
+	return nil
+}
+
+func unregisterMCPClients(run func(string, ...string) error) {
+	_ = run("claude", "mcp", "remove", "--scope", "user", "agent-coordinator")
+	_ = run("codex", "mcp", "remove", "agent-coordinator")
+	_ = run("grok", "mcp", "remove", "--scope", "user", "agent-coordinator")
+}
+
+func installHookConfig(path, binPath string, merge func([]byte, string) ([]byte, bool, error)) error {
+	cur, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	merged, changed, err := merge(cur, binPath)
+	if err != nil || !changed {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return writeFileAtomic(path, merged, 0o644)
+}
+
+func uninstallHookConfig(path, binPath string) {
+	cur, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	out, changed, err := RemoveHooks(cur, binPath)
+	if err == nil && changed {
+		_ = writeFileAtomic(path, out, 0o644)
+	}
+}
+
 // writeFileAtomic writes via a temp file in the same directory + rename, so a
 // crash mid-write can never leave a truncated settings.json behind.
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
@@ -261,27 +455,17 @@ func Install(binPath, home string, run func(string, ...string) error) error {
 			return err
 		}
 	}
-	settingsPath := filepath.Join(home, ".claude", "settings.json")
-	cur, err := os.ReadFile(settingsPath)
-	if err != nil && !os.IsNotExist(err) {
+	if err := installHookConfig(filepath.Join(home, ".claude", "settings.json"), binPath, MergeHooks); err != nil {
 		return err
 	}
-	merged, changed, err := MergeHooks(cur, binPath)
-	if err != nil {
+	if err := installHookConfig(filepath.Join(home, ".codex", "hooks.json"), binPath, MergeCodexHooks); err != nil {
 		return err
 	}
-	if changed {
-		if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o755); err != nil {
-			return err
-		}
-		if err := writeFileAtomic(settingsPath, merged, 0o644); err != nil {
-			return err
-		}
+	if err := registerMCPClients(binPath, run); err != nil {
+		return err
 	}
-	// Idempotent: ignore "already exists".
-	if err := run("claude", "mcp", "add", "--scope", "user", "--transport", "stdio",
-		"agent-coordinator", "--", binPath, "mcp"); err != nil {
-		fmt.Fprintln(os.Stderr, "note: claude mcp add:", err, "(ok if already registered)")
+	if err := installOpenCode(binPath, home); err != nil {
+		fmt.Fprintln(os.Stderr, "note: OpenCode MCP config:", err)
 	}
 	return nil
 }
@@ -297,12 +481,11 @@ func Uninstall(binPath, home string, run func(string, ...string) error) error {
 		os.Remove(filepath.Join(unitDir, "agent-coordinator.service"))
 		run("systemctl", "--user", "daemon-reload")
 	}
-	settingsPath := filepath.Join(home, ".claude", "settings.json")
-	if cur, err := os.ReadFile(settingsPath); err == nil {
-		if out, changed, err := RemoveHooks(cur, binPath); err == nil && changed {
-			writeFileAtomic(settingsPath, out, 0o644)
-		}
+	uninstallHookConfig(filepath.Join(home, ".claude", "settings.json"), binPath)
+	uninstallHookConfig(filepath.Join(home, ".codex", "hooks.json"), binPath)
+	unregisterMCPClients(run)
+	if err := uninstallOpenCode(binPath, home); err != nil {
+		fmt.Fprintln(os.Stderr, "note: OpenCode MCP config:", err)
 	}
-	run("claude", "mcp", "remove", "--scope", "user", "agent-coordinator")
 	return nil
 }

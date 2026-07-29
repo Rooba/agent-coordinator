@@ -150,6 +150,17 @@ func (s *Store) RecordEvent(scope, sessionID string, req protocol.Request) ([]st
 			return nil, err
 		}
 	}
+	if req.ReplaceTasks {
+		if _, err := s.db.Exec(`DELETE FROM tasks WHERE scope=? AND agent_id=?`, scope, aid); err != nil {
+			return nil, err
+		}
+		for _, task := range req.Tasks {
+			if _, err := s.db.Exec(`INSERT INTO tasks (scope, agent_id, task_key, subject, status, updated_at)
+				VALUES (?,?,?,?,?,?)`, scope, aid, task.Key, task.Subject, task.Status, now); err != nil {
+				return nil, err
+			}
+		}
+	}
 	if ev := req.TaskEv; ev != nil {
 		switch ev.Kind {
 		case "create":

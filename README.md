@@ -1,12 +1,13 @@
 # agent-coordinator
 
-Presence, status, and messaging for concurrent Claude Code sessions working
-in the same repository. Run several agents in one repo and they stop
+Presence, status, and messaging for concurrent coding-agent sessions working
+in the same repository. Run Claude Code, Codex, Grok Build, or other MCP
+clients in one repo and they stop
 colliding: a live status board of who is doing what, direct messages,
 broadcasts, and wake-on-mail. Zero infrastructure - a single binary; the
 daemon starts itself on demand and exits when idle.
 
-Session lifecycle events flow through Claude Code hooks into a small
+Session lifecycle events flow through supported harness hooks into a small
 on-demand daemon, and peer tools are exposed over MCP. There is no proxy in
 front of the model and no polling - message notices are pushed into an
 agent's context on its next tool call.
@@ -21,23 +22,24 @@ Paste the block below into your project's `CLAUDE.md` (or equivalent agent instr
 This workspace is served by the **agent-coordinator**: a lightweight presence + messaging mesh that
 lets multiple agents and sessions see each other and collaborate without colliding. When more than
 one agent or session may share a workspace, USING IT IS NOT OPTIONAL - it markedly improves speed and
-prevents duplicated or conflicting work. The five tools below are exposed via the `agent-coordinator`
+prevents duplicated or conflicting work. The six tools below are exposed via the `agent-coordinator`
 MCP server; the `agent-coordinator` CLI provides the `wait` wake-lever.
 
 ## Your identity
 
 At SessionStart the coordinator hook injects your name:
 `[coordinator] you are '<name>' in this workspace` (an adjective-animal, e.g. `deft-pika`).
-Use that exact `<name>` as `from` in every coordinator call. It is already in your context - do not
-grep the filesystem for it.
+If no SessionStart hook ran, call `register_agent` to get a name. Use that exact `<name>` as `from`,
+or omit `from` after registering and let the MCP session supply it. Do not grep the filesystem for it.
 
-## The five tools
+## The six tools
 
+- `register_agent` - fallback for a session with no hook-assigned identity; do not call when SessionStart assigned a name.
 - `status_board` - every agent with name, presence (active / idle / gone), current task, touched files, last activity.
 - `list_agents` - who is active or idle right now (presence only).
-- `send_message(from, to, body)` - direct message to one agent by name.
-- `read_messages(from)` - read AND CLEAR your own unread messages (`from` = your name).
-- `broadcast(from, body)` - workspace-wide, need-to-know channel. Sparingly - it notifies everyone.
+- `send_message(to, body, from?)` - direct message to one agent by name.
+- `read_messages(from?)` - read AND CLEAR your own unread messages.
+- `broadcast(body, from?)` - workspace-wide, need-to-know channel. Sparingly - it notifies everyone.
 
 ## Wake pattern (be woken, do not busy-poll)
 
@@ -124,8 +126,10 @@ make install
 - merges the five hooks (SessionStart, UserPromptSubmit, PostToolUse, Stop,
   SessionEnd) into `~/.claude/settings.json` - existing hooks are preserved,
   the merge is idempotent, and the write is atomic,
-- registers the MCP server user-scope (equivalent to `claude mcp add --scope
-  user --transport stdio agent-coordinator -- <binary> mcp`),
+- merges the four lifecycle events currently supported by Codex (SessionStart,
+  UserPromptSubmit, PostToolUse, Stop) into `~/.codex/hooks.json`,
+- replaces stale `agent-coordinator` MCP registrations for Claude Code, Codex,
+  and Grok Build, and merges the local server into OpenCode's global JSON config,
 - on Linux with systemd, additionally sets up socket activation
   (`agent-coordinator.socket` + `agent-coordinator.service` user units) as a
   nicety, and `try-restart`s the service so a running daemon picks up a new
@@ -140,11 +144,26 @@ It removes the units, strips exactly the hooks it added, and deregisters
 the MCP server. State in `~/.local/state/agent-coordinator/` is left
 behind; delete it by hand for a clean slate.
 
-## The five tools
+### Harness support
 
-All under the MCP server `agent-coordinator`. `from` is always YOUR agent
-name, given to you at session start.
+- Claude Code: MCP plus full five-hook lifecycle tracking.
+- Codex: MCP plus native hook tracking. Codex has no SessionEnd event, so stale
+  presence is retired by the coordinator's freshness window.
+- Grok Build: MCP plus lifecycle tracking through its documented Claude Code
+  hook compatibility.
+- OpenCode: MCP registration is installed. Automatic activity/file/task tracking
+  still requires an OpenCode plugin adapter and is not yet claimed here.
 
+Codex requires new or changed non-managed hooks to be reviewed and trusted with
+`/hooks` before they execute.
+
+## The six tools
+
+All under the MCP server `agent-coordinator`. Hook-enabled clients receive an
+agent name at session start. MCP-only clients call `register_agent`; after that,
+`from` is optional for messaging calls.
+
+- `register_agent` - register this MCP process only when no hook assigned an identity.
 - `status_board` - the full workspace board: every coordinated agent with
   name, presence, current task, task counts, latest activity and files.
 - `list_agents` - live peers (active or idle) in this workspace.
@@ -159,19 +178,19 @@ One binary, five subcommands:
 - `daemon` - owns the SQLite state, serves a line-JSON protocol on a unix
   socket. Started on demand by the other subcommands and exits after 10
   minutes idle, so it only runs while in use.
-- `hook` - invoked by user-level Claude Code hooks (SessionStart,
-  UserPromptSubmit, PostToolUse, Stop, SessionEnd). Forwards the event to
+- `hook` - invoked by supported harness hooks (SessionStart, UserPromptSubmit,
+  PostToolUse, Stop, and SessionEnd where available). Forwards the event to
   the daemon and injects any response back into the session as additional
   context. Every error path is a silent no-op: a broken coordinator can
-  never break a Claude session.
-- `mcp` - stdio MCP server exposing the five peer tools, backed by the
+  never break the host agent session.
+- `mcp` - stdio MCP server exposing the six peer tools, backed by the
   same socket.
 - `wait` - blocks until mail arrives for an agent, for the wake pattern
   (see below).
 - `install` - registers all of the above (see Install above).
 
 ```
-   Claude Code session A              Claude Code session B
+      agent session A                    agent session B
     |            |                     |            |
     | hooks      | MCP (stdio)         | hooks      | MCP (stdio)
     v            v                     v            v
@@ -202,7 +221,7 @@ Linux, systemd socket activation still works as an optional nicety.
 The push path: agent B calls `send_message`. The next time agent A
 finishes any tool call, A's PostToolUse hook reports the event and the
 daemon piggybacks a notice on the reply - `[coordinator] 1 new message
-from brisk-owl - call read_messages` - which Claude Code injects into A's
+from brisk-owl - call read_messages` - which the harness injects into A's
 context. A then reads it with `read_messages`.
 
 ### Wake levers

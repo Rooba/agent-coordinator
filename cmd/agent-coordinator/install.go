@@ -36,5 +36,5 @@ func runInstall(args []string) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	fmt.Println("installed: user-level hooks, user-scope MCP server; daemon starts on demand (systemd socket unit when available)")
+	fmt.Println("installed: harness hooks and MCP registrations; daemon starts on demand (systemd socket unit when available)")
 }

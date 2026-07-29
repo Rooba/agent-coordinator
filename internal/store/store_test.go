@@ -121,6 +121,39 @@ func TestEventUpdatesBoardAndTasks(t *testing.T) {
 	}
 }
 
+func TestEventReplacesTaskSnapshot(t *testing.T) {
+	s := open(t)
+	s.Register("/r", "s1", "startup")
+	_, err := s.RecordEvent("/r", "s1", protocol.Request{
+		Tool:         "update_plan",
+		Activity:     "Working on: Patch",
+		ReplaceTasks: true,
+		Tasks: []protocol.TaskEvent{
+			{Kind: "upsert", Key: "plan-0", Subject: "Inspect", Status: "completed"},
+			{Kind: "upsert", Key: "plan-1", Subject: "Patch", Status: "in_progress"},
+			{Kind: "upsert", Key: "plan-2", Subject: "Test", Status: "pending"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	board, _ := s.Board("/r")
+	if len(board) != 1 || board[0].CurrentTask != "Patch" || board[0].TasksPending != 1 || board[0].TasksDone != 1 {
+		t.Fatalf("snapshot not reflected: %+v", board)
+	}
+	_, err = s.RecordEvent("/r", "s1", protocol.Request{
+		Tool: "update_plan", Activity: "Updating plan", ReplaceTasks: true,
+		Tasks: []protocol.TaskEvent{{Kind: "upsert", Key: "plan-0", Subject: "Done", Status: "completed"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	board, _ = s.Board("/r")
+	if board[0].CurrentTask != "" || board[0].TasksPending != 0 || board[0].TasksDone != 1 {
+		t.Fatalf("replacement left stale tasks: %+v", board[0])
+	}
+}
+
 func TestEventAutoRegisters(t *testing.T) {
 	s := open(t)
 	// Hook may fire PostToolUse before SessionStart ever reached us (daemon was down).

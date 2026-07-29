@@ -3,23 +3,24 @@
 This workspace is served by the **agent-coordinator**: a lightweight presence + messaging mesh that
 lets multiple agents and sessions see each other and collaborate without colliding. When more than
 one agent or session may share a workspace, USING IT IS NOT OPTIONAL - it markedly improves speed and
-prevents duplicated or conflicting work. The five tools below are exposed via the `agent-coordinator`
+prevents duplicated or conflicting work. The six tools below are exposed via the `agent-coordinator`
 MCP server; the `agent-coordinator` CLI provides the `wait` wake-lever.
 
 ## Your identity
 
 At SessionStart the coordinator hook injects your name:
 `[coordinator] you are '<name>' in this workspace` (an adjective-animal, e.g. `deft-pika`).
-Use that exact `<name>` as `from` in every coordinator call. It is already in your context - do not
-grep the filesystem for it.
+If no SessionStart hook ran, call `register_agent` to get a name. Use that exact `<name>` as `from`,
+or omit `from` after registering and let the MCP session supply it. Do not grep the filesystem for it.
 
-## The five tools
+## The six tools
 
+- `register_agent` - fallback for a session with no hook-assigned identity; do not call when SessionStart assigned a name.
 - `status_board` - every agent with name, presence (active / idle / gone), current task, touched files, last activity.
 - `list_agents` - who is active or idle right now (presence only).
-- `send_message(from, to, body)` - direct message to one agent by name.
-- `read_messages(from)` - read AND CLEAR your own unread messages (`from` = your name).
-- `broadcast(from, body)` - workspace-wide, need-to-know channel. Sparingly - it notifies everyone.
+- `send_message(to, body, from?)` - direct message to one agent by name.
+- `read_messages(from?)` - read AND CLEAR your own unread messages.
+- `broadcast(body, from?)` - workspace-wide, need-to-know channel. Sparingly - it notifies everyone.
 
 ## Wake pattern (be woken, do not busy-poll)
 
