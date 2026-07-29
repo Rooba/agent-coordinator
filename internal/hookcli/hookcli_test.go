@@ -14,6 +14,13 @@ import (
 	"github.com/Rooba/agent-coordinator/internal/socktest"
 )
 
+func TestNormalizePaths(t *testing.T) {
+	got := normalizePaths("/repo", []string{"internal/a.go", "/other/b.go"})
+	if len(got) != 2 || got[0] != "/repo/internal/a.go" || got[1] != "/other/b.go" {
+		t.Fatalf("got %v", got)
+	}
+}
+
 // fakeDaemon answers every request with the canned response and records requests.
 func fakeDaemon(t *testing.T, resp protocol.Response) (string, *[]protocol.Request) {
 	t.Helper()

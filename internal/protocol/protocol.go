@@ -21,18 +21,20 @@ type TaskEvent struct {
 }
 
 type Request struct {
-	Op        string     `json:"op"`
-	Scope     string     `json:"scope"`
-	SessionID string     `json:"session_id,omitempty"`
-	Source    string     `json:"source,omitempty"`
-	Tool      string     `json:"tool,omitempty"`
-	Activity  string     `json:"activity,omitempty"`
-	Files     []string   `json:"files,omitempty"`
-	Writes    []string   `json:"writes,omitempty"`
-	TaskEv    *TaskEvent `json:"task_ev,omitempty"`
-	From      string     `json:"from,omitempty"` // agent name (send/read/broadcast)
-	To        string     `json:"to,omitempty"`   // agent name or agent_id (send)
-	Body      string     `json:"body,omitempty"`
+	Op           string      `json:"op"`
+	Scope        string      `json:"scope"`
+	SessionID    string      `json:"session_id,omitempty"`
+	Source       string      `json:"source,omitempty"`
+	Tool         string      `json:"tool,omitempty"`
+	Activity     string      `json:"activity,omitempty"`
+	Files        []string    `json:"files,omitempty"`
+	Writes       []string    `json:"writes,omitempty"`
+	TaskEv       *TaskEvent  `json:"task_ev,omitempty"`
+	Tasks        []TaskEvent `json:"tasks,omitempty"` // complete task snapshot (for update_plan-style clients)
+	ReplaceTasks bool        `json:"replace_tasks,omitempty"`
+	From         string      `json:"from,omitempty"` // agent name (send/read/broadcast)
+	To           string      `json:"to,omitempty"`   // agent name or agent_id (send)
+	Body         string      `json:"body,omitempty"`
 }
 
 type AgentInfo struct {

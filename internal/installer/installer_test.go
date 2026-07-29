@@ -77,6 +77,64 @@ func TestRemoveHooksNullSettings(t *testing.T) {
 	}
 }
 
+func TestCodexHooksUseSupportedLifecycleEvents(t *testing.T) {
+	out, changed, err := MergeCodexHooks([]byte(`{"description":"keep"}`), "/bin/ac")
+	if err != nil || !changed {
+		t.Fatalf("MergeCodexHooks: changed=%v err=%v", changed, err)
+	}
+	s := string(out)
+	for _, event := range []string{"SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"} {
+		if !strings.Contains(s, `"`+event+`"`) {
+			t.Fatalf("missing Codex event %q in:\n%s", event, s)
+		}
+	}
+	if strings.Contains(s, `"SessionEnd"`) {
+		t.Fatalf("Codex does not support SessionEnd:\n%s", s)
+	}
+	if !strings.Contains(s, `"description": "keep"`) {
+		t.Fatalf("foreign Codex hook metadata was not preserved:\n%s", s)
+	}
+}
+
+func TestOpenCodeConfigRoundTripPreservesForeignServers(t *testing.T) {
+	seed := []byte(`{"theme":"system","mcp":{"foreign":{"type":"remote","url":"https://example.test/mcp"}}}`)
+	out, changed, err := mergeOpenCodeConfig(seed, "/bin/ac")
+	if err != nil || !changed {
+		t.Fatalf("mergeOpenCodeConfig: changed=%v err=%v", changed, err)
+	}
+	again, changed, err := mergeOpenCodeConfig(out, "/bin/ac")
+	if err != nil || changed || string(again) != string(out) {
+		t.Fatalf("OpenCode merge not idempotent: changed=%v err=%v", changed, err)
+	}
+	removed, changed, err := removeOpenCodeConfig(out, "/bin/ac")
+	if err != nil || !changed {
+		t.Fatalf("removeOpenCodeConfig: changed=%v err=%v", changed, err)
+	}
+	if strings.Contains(string(removed), "agent-coordinator") || !strings.Contains(string(removed), "foreign") || !strings.Contains(string(removed), "theme") {
+		t.Fatalf("OpenCode removal damaged foreign config:\n%s", removed)
+	}
+}
+
+func TestRegisterMCPClientsSkipsMissingClient(t *testing.T) {
+	var calls [][]string
+	run := func(name string, args ...string) error {
+		calls = append(calls, append([]string{name}, args...))
+		if name == "codex" {
+			return exec.ErrNotFound
+		}
+		return nil
+	}
+	if err := registerMCPClients("/bin/ac", run); err != nil {
+		t.Fatalf("missing optional client must not fail install: %v", err)
+	}
+	if hasCall(calls, []string{"codex", "mcp", "add", "agent-coordinator", "--", "/bin/ac", "mcp"}) {
+		t.Fatalf("add attempted after missing Codex executable: %v", calls)
+	}
+	if !hasCall(calls, []string{"grok", "mcp", "add", "--scope", "user", "agent-coordinator", "--", "/bin/ac", "mcp"}) {
+		t.Fatalf("missing Codex prevented Grok registration: %v", calls)
+	}
+}
+
 func TestRemoveHooksOnlyOurs(t *testing.T) {
 	merged, _, _ := MergeHooks([]byte(existing), "/bin/ac")
 	out, changed, err := RemoveHooks(merged, "/bin/ac")
@@ -180,8 +238,29 @@ func TestInstallUninstallRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(after, &m); err != nil {
 		t.Fatalf("settings not valid JSON after install: %v", err)
 	}
+	codexHooksPath := filepath.Join(home, ".codex", "hooks.json")
+	codexHooks, err := os.ReadFile(codexHooksPath)
+	if err != nil {
+		t.Fatalf("Codex hooks: %v", err)
+	}
+	if got := strings.Count(string(codexHooks), `"/bin/ac hook"`); got != 4 {
+		t.Fatalf("want 4 Codex hook entries, got %d in:\n%s", got, codexHooks)
+	}
+	if strings.Contains(string(codexHooks), `"SessionEnd"`) {
+		t.Fatalf("unsupported SessionEnd installed for Codex:\n%s", codexHooks)
+	}
+	openCodePath := filepath.Join(home, ".config", "opencode", "opencode.json")
+	openCode, err := os.ReadFile(openCodePath)
+	if err != nil || !strings.Contains(string(openCode), `"/bin/ac"`) {
+		t.Fatalf("OpenCode MCP config: err=%v content=%s", err, openCode)
+	}
 	wantCalls := [][]string{
+		{"claude", "mcp", "remove", "--scope", "user", "agent-coordinator"},
 		{"claude", "mcp", "add", "--scope", "user", "--transport", "stdio", "agent-coordinator", "--", "/bin/ac", "mcp"},
+		{"codex", "mcp", "remove", "agent-coordinator"},
+		{"codex", "mcp", "add", "agent-coordinator", "--", "/bin/ac", "mcp"},
+		{"grok", "mcp", "remove", "--scope", "user", "agent-coordinator"},
+		{"grok", "mcp", "add", "--scope", "user", "agent-coordinator", "--", "/bin/ac", "mcp"},
 	}
 	if runtime.GOOS == "linux" {
 		wantCalls = append(wantCalls,
@@ -214,13 +293,31 @@ func TestInstallUninstallRoundTrip(t *testing.T) {
 			t.Fatalf("uninstall dropped foreign command %q:\n%s", foreign, s)
 		}
 	}
+	codexHooks, err = os.ReadFile(codexHooksPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(codexHooks), "/bin/ac hook") {
+		t.Fatalf("coordinator Codex hooks not removed:\n%s", codexHooks)
+	}
+	openCode, err = os.ReadFile(openCodePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(openCode), "agent-coordinator") {
+		t.Fatalf("coordinator OpenCode MCP config not removed:\n%s", openCode)
+	}
 	// Holds on every OS: linux removed the units, darwin/windows never wrote any.
 	for _, unit := range []string{"agent-coordinator.socket", "agent-coordinator.service"} {
 		if _, err := os.Stat(filepath.Join(unitDir, unit)); !os.IsNotExist(err) {
 			t.Fatalf("unit file %s still present (stat err=%v)", unit, err)
 		}
 	}
-	wantCalls = [][]string{{"claude", "mcp", "remove", "--scope", "user", "agent-coordinator"}}
+	wantCalls = [][]string{
+		{"claude", "mcp", "remove", "--scope", "user", "agent-coordinator"},
+		{"codex", "mcp", "remove", "agent-coordinator"},
+		{"grok", "mcp", "remove", "--scope", "user", "agent-coordinator"},
+	}
 	if runtime.GOOS == "linux" {
 		wantCalls = append(wantCalls, []string{"systemctl", "--user", "disable", "--now", "agent-coordinator.socket"})
 	}

@@ -25,6 +25,8 @@ func TestInfer(t *testing.T) {
 		{"WebSearch", map[string]any{"query": "sqlite wal"}, "Searching web: sqlite wal", nil, nil},
 		{"WebFetch", map[string]any{"url": "https://x.test/y"}, "Fetching x.test", nil, nil},
 		{"TaskCreate", map[string]any{"subject": "Fix login"}, "Planning: Fix login", nil, nil},
+		{"apply_patch", map[string]any{"command": "*** Begin Patch\n*** Update File: internal/a.go\n*** Add File: docs/b.md\n*** End Patch"}, "Editing a.go, b.md", []string{"internal/a.go", "docs/b.md"}, []string{"internal/a.go", "docs/b.md"}},
+		{"update_plan", map[string]any{"plan": []any{map[string]any{"step": "Fix login", "status": "in_progress"}}}, "Working on: Fix login", nil, nil},
 		{"mcp__linear__list_issues", nil, "linear: list issues", nil, nil},
 		{"SomethingNew", nil, "Something new", nil, nil},
 	}
@@ -33,6 +35,17 @@ func TestInfer(t *testing.T) {
 		if a != c.activity || !reflect.DeepEqual(f, c.files) || !reflect.DeepEqual(w, c.writes) {
 			t.Errorf("%s: got (%q,%v,%v) want (%q,%v,%v)", c.tool, a, f, w, c.activity, c.files, c.writes)
 		}
+	}
+}
+
+func TestPlanSnapshot(t *testing.T) {
+	tasks := PlanSnapshot(map[string]any{"plan": []any{
+		map[string]any{"step": "Inspect", "status": "completed"},
+		map[string]any{"step": "Patch", "status": "in_progress"},
+		map[string]any{"step": "Test", "status": "pending"},
+	}})
+	if len(tasks) != 3 || tasks[1].Key != "plan-1" || tasks[1].Subject != "Patch" || tasks[1].Status != "in_progress" {
+		t.Fatalf("got %+v", tasks)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -29,7 +30,7 @@ type hookInput struct {
 }
 
 // Run processes one hook invocation. It never fails: every error path is a
-// silent no-op so a broken coordinator cannot break a Claude session.
+// silent no-op so a broken coordinator cannot break the host agent session.
 func Run(stdin io.Reader, stdout io.Writer, socketPath string) {
 	defer func() { recover() }() // absolute fail-open backstop
 	raw, err := io.ReadAll(io.LimitReader(stdin, 4<<20))
@@ -59,10 +60,16 @@ func Run(stdin io.Reader, stdout io.Writer, socketPath string) {
 		req.Op = protocol.OpEvent
 		req.Tool = in.ToolName
 		req.Activity, req.Files, req.Writes = activity.Infer(in.ToolName, in.ToolInput)
+		req.Files = normalizePaths(in.CWD, req.Files)
+		req.Writes = normalizePaths(in.CWD, req.Writes)
 		if in.AgentType != "" { // subagent work, tagged for the board
 			req.Activity += " (subagent: " + in.AgentType + ")"
 		}
 		req.TaskEv = activity.TaskSignal(in.ToolName, in.ToolInput, in.ToolResponse)
+		if in.ToolName == "update_plan" {
+			req.Tasks = activity.PlanSnapshot(in.ToolInput)
+			req.ReplaceTasks = true
+		}
 	default:
 		return
 	}
@@ -94,6 +101,16 @@ func Run(stdin io.Reader, stdout io.Writer, socketPath string) {
 				resp.Name, resp.Name))
 		}
 	}
+}
+
+func normalizePaths(cwd string, paths []string) []string {
+	for i, path := range paths {
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(cwd, path)
+		}
+		paths[i] = filepath.Clean(path)
+	}
+	return paths
 }
 
 func roundTrip(socketPath string, req protocol.Request) (protocol.Response, bool) {

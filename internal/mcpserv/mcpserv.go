@@ -3,9 +3,11 @@ package mcpserv
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"time"
 
 	"github.com/Rooba/agent-coordinator/internal/dialer"
@@ -25,11 +27,33 @@ type callParams struct {
 	Arguments map[string]any `json:"arguments"`
 }
 
+const latestProtocolVersion = "2025-11-25"
+
+var supportedProtocolVersions = map[string]bool{
+	"2024-11-05": true,
+	"2025-03-26": true,
+	"2025-06-18": true,
+	"2025-11-25": true,
+}
+
+type server struct {
+	scope      string
+	socketPath string
+	sessionID  string
+	source     string
+	name       string
+}
+
 func Serve(stdin io.Reader, stdout io.Writer, socketPath, cwd string) error {
-	sc := scope.Resolve(cwd)
-	// bufio.Reader instead of Scanner: the peer is the local Claude Code
-	// process, so lines have no fixed cap and an oversized one must not
-	// kill the session.
+	s := &server{
+		scope:      scope.Resolve(cwd),
+		socketPath: socketPath,
+		sessionID:  newSessionID(),
+		source:     "mcp",
+	}
+	defer s.deregister()
+
+	// MCP stdio messages are newline-delimited and have no protocol size cap.
 	r := bufio.NewReader(stdin)
 	enc := json.NewEncoder(stdout)
 	for {
@@ -42,7 +66,7 @@ func Serve(stdin io.Reader, stdout io.Writer, socketPath, cwd string) error {
 					"error": map[string]any{"code": -32700, "message": "parse error"}}
 			} else if req.ID != nil { // notifications get no response
 				resp = map[string]any{"jsonrpc": "2.0", "id": req.ID}
-				if result, rpcErr := handle(req, sc, socketPath); rpcErr != nil {
+				if result, rpcErr := s.handle(req); rpcErr != nil {
 					resp["error"] = rpcErr
 				} else {
 					resp["result"] = result
@@ -63,21 +87,43 @@ func Serve(stdin io.Reader, stdout io.Writer, socketPath, cwd string) error {
 	}
 }
 
-func handle(req rpcReq, sc, socketPath string) (any, map[string]any) {
+func newSessionID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return fmt.Sprintf("mcp-%x", b[:])
+	}
+	return fmt.Sprintf("mcp-%d-%d", os.Getpid(), time.Now().UnixNano())
+}
+
+func negotiateProtocolVersion(requested string) string {
+	if supportedProtocolVersions[requested] {
+		return requested
+	}
+	return latestProtocolVersion
+}
+
+func (s *server) handle(req rpcReq) (any, map[string]any) {
 	switch req.Method {
 	case "initialize":
 		var p struct {
 			ProtocolVersion string `json:"protocolVersion"`
+			ClientInfo      struct {
+				Name string `json:"name"`
+			} `json:"clientInfo"`
 		}
 		json.Unmarshal(req.Params, &p)
-		if p.ProtocolVersion == "" {
-			p.ProtocolVersion = "2025-06-18"
+		if p.ClientInfo.Name != "" {
+			s.source = "mcp:" + p.ClientInfo.Name
 		}
 		return map[string]any{
-			"protocolVersion": p.ProtocolVersion,
+			"protocolVersion": negotiateProtocolVersion(p.ProtocolVersion),
 			"capabilities":    map[string]any{"tools": map[string]any{}},
 			"serverInfo":      map[string]any{"name": "agent-coordinator", "version": "2.0.0"},
+			"instructions": "If session-start context assigned a coordinator name, use that name as from and do not call register_agent. " +
+				"Otherwise call register_agent once; after that, from is optional for messaging tools.",
 		}, nil
+	case "ping":
+		return map[string]any{}, nil
 	case "tools/list":
 		return map[string]any{"tools": toolDefs}, nil
 	case "tools/call":
@@ -85,7 +131,7 @@ func handle(req rpcReq, sc, socketPath string) (any, map[string]any) {
 		if err := json.Unmarshal(req.Params, &p); err != nil {
 			return nil, map[string]any{"code": -32602, "message": "bad params"}
 		}
-		return callTool(p, sc, socketPath), nil
+		return s.callTool(p), nil
 	default:
 		return nil, map[string]any{"code": -32601, "message": "method not found: " + req.Method}
 	}
@@ -93,9 +139,15 @@ func handle(req rpcReq, sc, socketPath string) (any, map[string]any) {
 
 func arg(m map[string]any, k string) string { s, _ := m[k].(string); return s }
 
-func callTool(p callParams, sc, socketPath string) map[string]any {
-	req := protocol.Request{Scope: sc}
+func (s *server) callTool(p callParams) map[string]any {
+	req := protocol.Request{Scope: s.scope}
 	switch p.Name {
+	case "register_agent":
+		name, err := s.ensureRegistered()
+		if err != nil {
+			return errResult("coordinator daemon unreachable: " + err.Error())
+		}
+		return textResult("registered as " + name)
 	case "status_board":
 		req.Op = protocol.OpBoard
 	case "list_agents":
@@ -112,7 +164,14 @@ func callTool(p callParams, sc, socketPath string) map[string]any {
 	default:
 		return errResult("unknown tool " + p.Name)
 	}
-	resp, err := roundTrip(socketPath, req)
+	if req.From == "" && (req.Op == protocol.OpSend || req.Op == protocol.OpRead || req.Op == protocol.OpBroadcast) {
+		name, err := s.ensureRegistered()
+		if err != nil {
+			return errResult("coordinator daemon unreachable: " + err.Error())
+		}
+		req.From = name
+	}
+	resp, err := roundTrip(s.socketPath, req)
 	if err != nil {
 		return errResult("coordinator daemon unreachable: " + err.Error())
 	}
@@ -136,6 +195,41 @@ func callTool(p callParams, sc, socketPath string) map[string]any {
 	default:
 		text = "ok"
 	}
+	return textResult(text)
+}
+
+func (s *server) ensureRegistered() (string, error) {
+	if s.name != "" {
+		return s.name, nil
+	}
+	resp, err := roundTrip(s.socketPath, protocol.Request{
+		Op:        protocol.OpRegister,
+		Scope:     s.scope,
+		SessionID: s.sessionID,
+		Source:    s.source,
+	})
+	if err != nil {
+		return "", err
+	}
+	if !resp.OK {
+		return "", fmt.Errorf("register: %s", resp.Error)
+	}
+	s.name = resp.Name
+	return s.name, nil
+}
+
+func (s *server) deregister() {
+	if s.name == "" {
+		return
+	}
+	_, _ = roundTrip(s.socketPath, protocol.Request{
+		Op:        protocol.OpDeregister,
+		Scope:     s.scope,
+		SessionID: s.sessionID,
+	})
+}
+
+func textResult(text string) map[string]any {
 	return map[string]any{"content": []map[string]any{{"type": "text", "text": text}}}
 }
 
@@ -169,6 +263,11 @@ func roundTrip(socketPath string, req protocol.Request) (protocol.Response, erro
 
 var toolDefs = []map[string]any{
 	{
+		"name":        "register_agent",
+		"description": "Fallback for clients without a coordinator SessionStart hook: register this MCP session and return its assigned agent name. Do not call when session-start context already assigned a name.",
+		"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
+	},
+	{
 		"name":        "status_board",
 		"description": "Status board for THIS workspace: every coordinated agent with name, presence, current task, task counts, latest activity and files.",
 		"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
@@ -180,20 +279,20 @@ var toolDefs = []map[string]any{
 	},
 	{
 		"name":        "send_message",
-		"description": "Send a direct message to another agent in this workspace. 'from' is YOUR agent name (given at session start); 'to' is the recipient's name or agent_id.",
-		"inputSchema": map[string]any{"type": "object", "required": []string{"from", "to", "body"}, "properties": map[string]any{
+		"description": "Send a direct message to another agent in this workspace. 'from' is optional after register_agent; 'to' is the recipient's name or agent_id.",
+		"inputSchema": map[string]any{"type": "object", "required": []string{"to", "body"}, "properties": map[string]any{
 			"from": map[string]any{"type": "string"}, "to": map[string]any{"type": "string"}, "body": map[string]any{"type": "string"}}},
 	},
 	{
 		"name":        "read_messages",
-		"description": "Read and clear your unread messages. 'from' is YOUR agent name (given at session start).",
-		"inputSchema": map[string]any{"type": "object", "required": []string{"from"}, "properties": map[string]any{
+		"description": "Read and clear your unread messages. 'from' is optional after register_agent.",
+		"inputSchema": map[string]any{"type": "object", "properties": map[string]any{
 			"from": map[string]any{"type": "string"}}},
 	},
 	{
 		"name":        "broadcast",
-		"description": "Global need-to-know channel for this workspace. Every active agent gets notified. Use sparingly - not a chatroom.",
-		"inputSchema": map[string]any{"type": "object", "required": []string{"from", "body"}, "properties": map[string]any{
+		"description": "Global need-to-know channel for this workspace. 'from' is optional after register_agent. Every active agent gets notified. Use sparingly - not a chatroom.",
+		"inputSchema": map[string]any{"type": "object", "required": []string{"body"}, "properties": map[string]any{
 			"from": map[string]any{"type": "string"}, "body": map[string]any{"type": "string"}}},
 	},
 }

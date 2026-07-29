@@ -2,6 +2,7 @@ package activity
 
 import (
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 
@@ -54,6 +55,19 @@ func Infer(tool string, input map[string]any) (string, []string, []string) {
 		return "Planning: " + str(input, "subject"), nil, nil
 	case "TaskUpdate":
 		return "Updating task " + str(input, "taskId") + " -> " + str(input, "status"), nil, nil
+	case "apply_patch":
+		paths := patchPaths(str(input, "command"))
+		if len(paths) == 0 {
+			return "Applying patch", nil, nil
+		}
+		return "Editing " + strings.Join(baseNames(paths), ", "), paths, paths
+	case "update_plan":
+		for _, task := range PlanSnapshot(input) {
+			if task.Status == "in_progress" {
+				return "Working on: " + task.Subject, nil, nil
+			}
+		}
+		return "Updating plan", nil, nil
 	}
 	if rest, ok := strings.CutPrefix(tool, "mcp__"); ok {
 		parts := strings.SplitN(rest, "__", 2)
@@ -62,6 +76,50 @@ func Infer(tool string, input map[string]any) (string, []string, []string) {
 		}
 	}
 	return humanize(tool), nil, nil
+}
+
+func patchPaths(patch string) []string {
+	var paths []string
+	seen := map[string]bool{}
+	for _, line := range strings.Split(patch, "\n") {
+		for _, prefix := range []string{"*** Add File: ", "*** Update File: ", "*** Delete File: "} {
+			if path, ok := strings.CutPrefix(line, prefix); ok {
+				path = strings.TrimSpace(path)
+				if path != "" && !seen[path] {
+					seen[path] = true
+					paths = append(paths, path)
+				}
+				break
+			}
+		}
+	}
+	return paths
+}
+
+func baseNames(paths []string) []string {
+	out := make([]string, 0, len(paths))
+	for _, path := range paths {
+		out = append(out, base(path))
+	}
+	return out
+}
+
+// PlanSnapshot maps Codex's update_plan input to a complete task snapshot.
+func PlanSnapshot(input map[string]any) []protocol.TaskEvent {
+	items, _ := input["plan"].([]any)
+	out := make([]protocol.TaskEvent, 0, len(items))
+	for i, item := range items {
+		m, _ := item.(map[string]any)
+		step, _ := m["step"].(string)
+		status, _ := m["status"].(string)
+		if step == "" || status == "" {
+			continue
+		}
+		out = append(out, protocol.TaskEvent{
+			Kind: "upsert", Key: fmt.Sprintf("plan-%d", i), Subject: step, Status: status,
+		})
+	}
+	return out
 }
 
 // TaskSignal extracts a task event from TaskCreate/TaskUpdate calls.
