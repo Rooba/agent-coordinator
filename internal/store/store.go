@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -50,6 +51,11 @@ CREATE TABLE IF NOT EXISTS deliveries (
   notice_sent_at INTEGER, read_at INTEGER,
   PRIMARY KEY (message_id, agent_id)
 );
+CREATE TABLE IF NOT EXISTS claims (
+  scope TEXT NOT NULL, path TEXT NOT NULL, agent_id TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '', since INTEGER NOT NULL,
+  PRIMARY KEY (scope, path)
+);
 `
 
 const (
@@ -72,6 +78,17 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, err
+	}
+	// Guarded migration: older databases predate these columns; a duplicate
+	// column error just means the migration already ran.
+	for _, alter := range []string{
+		`ALTER TABLE agents ADD COLUMN source TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE agents ADD COLUMN parent_session_id TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.Exec(alter); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, err
+		}
 	}
 	return &Store{db: db, Now: time.Now}, nil
 }
@@ -102,8 +119,8 @@ func (s *Store) Register(scope, sessionID, source string) (string, error) {
 			return "", err
 		}
 		if count == 0 {
-			_, err := s.db.Exec(`INSERT INTO agents (scope, session_id, agent_id, name, status, registered_at, last_seen)
-				VALUES (?,?,?,?,'active',?,?)`, scope, sessionID, agentID(sessionID), name, now, now)
+			_, err := s.db.Exec(`INSERT INTO agents (scope, session_id, agent_id, name, status, registered_at, last_seen, source)
+				VALUES (?,?,?,?,'active',?,?,?)`, scope, sessionID, agentID(sessionID), name, now, now, source)
 			if err == nil {
 				return name, nil
 			}
@@ -121,13 +138,153 @@ func (s *Store) Register(scope, sessionID, source string) (string, error) {
 	return "", fmt.Errorf("register: no free name near %q in scope %q", base, scope)
 }
 
+// ChildSessionID derives the synthetic session key for a subagent row. The
+// slash-joined form keeps child rows classified as hook-origin (no mcp- prefix).
+func ChildSessionID(parentSessionID, subagentID string) string {
+	return parentSessionID + "/" + subagentID
+}
+
+// RegisterChild registers (or refreshes) a subagent identity under its parent
+// session, giving it its own row and therefore its own inbox. Idempotent per
+// (scope, child session); names are <parent>/<agent_type|sub>-<n>.
+func (s *Store) RegisterChild(scope, parentSessionID, subagentID, agentType string) (string, error) {
+	child := ChildSessionID(parentSessionID, subagentID)
+	now := s.Now().Unix()
+	var name string
+	err := s.db.QueryRow(`SELECT name FROM agents WHERE scope=? AND session_id=?`, scope, child).Scan(&name)
+	if err == nil {
+		_, err = s.db.Exec(`UPDATE agents SET status='active', last_seen=? WHERE scope=? AND session_id=?`, now, scope, child)
+		return name, err
+	}
+	if err != sql.ErrNoRows {
+		return "", err
+	}
+	// The parent anchors the child's name; registering it also keeps the
+	// parent row fresh while its subagents work.
+	parentName, err := s.Register(scope, parentSessionID, "hook")
+	if err != nil {
+		return "", err
+	}
+	typ := strings.ToLower(agentType)
+	if typ == "" {
+		typ = "sub"
+	}
+	for n := 1; n <= 50; n++ {
+		name = fmt.Sprintf("%s/%s-%d", parentName, typ, n)
+		var count int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM agents WHERE scope=? AND name=?`, scope, name).Scan(&count); err != nil {
+			return "", err
+		}
+		if count > 0 {
+			continue
+		}
+		_, err := s.db.Exec(`INSERT INTO agents (scope, session_id, agent_id, name, status, registered_at, last_seen, source, parent_session_id)
+			VALUES (?,?,?,?,'active',?,?,'hook-subagent',?)`, scope, child, agentID(child), name, now, now, parentSessionID)
+		if err == nil {
+			return name, nil
+		}
+		if !isUniqueViolation(err) {
+			return "", err
+		}
+		// Unique race: a concurrent RegisterChild won this child's PK (return
+		// its name) or took this name (try the next suffix).
+		if e := s.db.QueryRow(`SELECT name FROM agents WHERE scope=? AND session_id=?`, scope, child).Scan(&name); e == nil {
+			return name, nil
+		}
+	}
+	return "", fmt.Errorf("register child: no free name under %q in scope %q", parentName, scope)
+}
+
 func isUniqueViolation(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
+}
+
+// ErrIdentityUnknown refuses a silent self-mint while hook-registered agents
+// are live in the scope: the caller is almost certainly one of them and must
+// name itself or bind explicitly.
+var ErrIdentityUnknown = errors.New("cannot determine your identity: pass from=<your name> or call register_agent")
+
+// RegisterIfNoLiveHook registers like Register, except a NEW identity is
+// refused while the scope has live hook-registered agents. Existing rows
+// refresh normally.
+func (s *Store) RegisterIfNoLiveHook(scope, sessionID, source string) (string, error) {
+	var name string
+	err := s.db.QueryRow(`SELECT name FROM agents WHERE scope=? AND session_id=?`, scope, sessionID).Scan(&name)
+	if err != nil && err != sql.ErrNoRows {
+		return "", err
+	}
+	if err == sql.ErrNoRows {
+		live, err := s.hasLiveHookAgents(scope)
+		if err != nil {
+			return "", err
+		}
+		if live {
+			return "", ErrIdentityUnknown
+		}
+	}
+	return s.Register(scope, sessionID, source)
+}
+
+// hasLiveHookAgents reports whether the scope has any active or idle agent
+// that came from a session hook. Hook origin is identified by session id
+// shape - only self-minted MCP identities carry the mcp- prefix - which also
+// classifies legacy rows that predate the source column.
+func (s *Store) hasLiveHookAgents(scope string) (bool, error) {
+	rows, err := s.db.Query(`SELECT status, last_seen FROM agents WHERE scope=? AND session_id NOT LIKE 'mcp-%'`, scope)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var explicit string
+		var seen int64
+		if err := rows.Scan(&explicit, &seen); err != nil {
+			return false, err
+		}
+		if st := s.freshStatus(explicit, seen); st == "active" || st == "idle" {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+// AgentIdentity is the whoami view of one agent row.
+type AgentIdentity struct {
+	Name    string
+	AgentID string
+	Source  string
+	Parent  string // parent agent's name, set only for subagent child rows
+}
+
+// Identity returns the stored identity for a session.
+func (s *Store) Identity(scope, sessionID string) (AgentIdentity, error) {
+	var id AgentIdentity
+	var parentSession string
+	err := s.db.QueryRow(`SELECT name, agent_id, source, parent_session_id FROM agents WHERE scope=? AND session_id=?`,
+		scope, sessionID).Scan(&id.Name, &id.AgentID, &id.Source, &parentSession)
+	if err == sql.ErrNoRows {
+		return id, fmt.Errorf("no agent for this session in this workspace")
+	}
+	if err != nil {
+		return id, err
+	}
+	if parentSession != "" {
+		s.db.QueryRow(`SELECT name FROM agents WHERE scope=? AND session_id=?`, scope, parentSession).Scan(&id.Parent)
+	}
+	return id, nil
 }
 
 func (s *Store) SetStatus(scope, sessionID, status string) error {
 	_, err := s.db.Exec(`UPDATE agents SET status=?, last_seen=? WHERE scope=? AND session_id=?`,
 		status, s.Now().Unix(), scope, sessionID)
+	return err
+}
+
+// Touch is the MCP-call heartbeat: it keeps a live row fresh and lifts sticky
+// idle back to active, but never resurrects an explicitly gone agent.
+func (s *Store) Touch(scope, sessionID string) error {
+	_, err := s.db.Exec(`UPDATE agents SET last_seen=?, status=CASE status WHEN 'idle' THEN 'active' ELSE status END
+		WHERE scope=? AND session_id=? AND status != 'gone'`, s.Now().Unix(), scope, sessionID)
 	return err
 }
 
@@ -269,11 +426,13 @@ func (s *Store) Read(scope, name string) ([]protocol.Message, error) {
 		return nil, err
 	}
 	defer tx.Rollback()
+	// LEFT JOIN: mail must stay readable after its sender is purged, falling
+	// back to the raw sender id as the label.
 	rows, err := tx.Query(`
-		SELECT m.id, a.name, m.body, m.created_at, m.to_agent IS NULL
+		SELECT m.id, COALESCE(a.name, m.from_agent), m.body, m.created_at, m.to_agent IS NULL
 		FROM deliveries d
 		JOIN messages m ON m.id = d.message_id
-		JOIN agents a ON a.scope = m.scope AND a.agent_id = m.from_agent
+		LEFT JOIN agents a ON a.scope = m.scope AND a.agent_id = m.from_agent
 		WHERE d.agent_id = ? AND m.scope = ? AND d.read_at IS NULL
 		ORDER BY m.created_at, m.id`, aid, scope)
 	if err != nil {
@@ -308,16 +467,67 @@ func (s *Store) Read(scope, name string) ([]protocol.Message, error) {
 // unread in this scope. Strictly read-only - it never touches notice_sent_at,
 // so peeking cannot consume the once-only nudge.
 func (s *Store) UnreadCount(scope, name string) (int, error) {
-	aid, _, err := s.resolveAgent(scope, name)
+	info, err := s.PeekMail(scope, name, 0)
 	if err != nil {
 		return 0, err
 	}
-	var n int
+	return info.Unread, nil
+}
+
+// PeekInfo is a read-only summary of an agent's inbox for OpPeek / wait.
+type PeekInfo struct {
+	Unread    int
+	HighWater int64
+	IDs       []int64
+	Froms     []string // unique sender names among matching unread, stable order
+}
+
+// PeekMail reports unread deliveries with message id > afterID, plus the
+// agent's high-water mark (max delivered message id, read or unread).
+// Strictly read-only - never touches notice_sent_at or read_at.
+func (s *Store) PeekMail(scope, name string, afterID int64) (PeekInfo, error) {
+	aid, _, err := s.resolveAgent(scope, name)
+	if err != nil {
+		return PeekInfo{}, err
+	}
+	var high int64
 	err = s.db.QueryRow(`
-		SELECT COUNT(*) FROM deliveries d
+		SELECT COALESCE(MAX(m.id), 0) FROM deliveries d
 		JOIN messages m ON m.id = d.message_id
-		WHERE d.agent_id = ? AND m.scope = ? AND d.read_at IS NULL`, aid, scope).Scan(&n)
-	return n, err
+		WHERE d.agent_id = ? AND m.scope = ?`, aid, scope).Scan(&high)
+	if err != nil {
+		return PeekInfo{}, err
+	}
+	rows, err := s.db.Query(`
+		SELECT m.id, COALESCE(a.name, m.from_agent) FROM deliveries d
+		JOIN messages m ON m.id = d.message_id
+		LEFT JOIN agents a ON a.scope = m.scope AND a.agent_id = m.from_agent
+		WHERE d.agent_id = ? AND m.scope = ? AND d.read_at IS NULL AND m.id > ?
+		ORDER BY m.id`, aid, scope, afterID)
+	if err != nil {
+		return PeekInfo{}, err
+	}
+	defer rows.Close()
+	var info PeekInfo
+	info.HighWater = high
+	seenFrom := map[string]bool{}
+	for rows.Next() {
+		var id int64
+		var from string
+		if err := rows.Scan(&id, &from); err != nil {
+			return PeekInfo{}, err
+		}
+		info.IDs = append(info.IDs, id)
+		if !seenFrom[from] {
+			seenFrom[from] = true
+			info.Froms = append(info.Froms, from)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return PeekInfo{}, err
+	}
+	info.Unread = len(info.IDs)
+	return info, nil
 }
 
 // PendingNotices runs the notice collect+mark for the session's agent without
@@ -341,32 +551,47 @@ func (s *Store) noticesFor(scope, aid string, writes []string) ([]string, error)
 	}
 	defer tx.Rollback()
 	rows, err := tx.Query(`
-		SELECT m.id, a.name, m.to_agent IS NULL
+		SELECT m.id, COALESCE(a.name, m.from_agent), m.body, m.to_agent IS NULL
 		FROM deliveries d
 		JOIN messages m ON m.id = d.message_id
-		JOIN agents a ON a.scope = m.scope AND a.agent_id = m.from_agent
+		LEFT JOIN agents a ON a.scope = m.scope AND a.agent_id = m.from_agent
 		WHERE d.agent_id = ? AND m.scope = ? AND d.notice_sent_at IS NULL AND d.read_at IS NULL
-		ORDER BY m.created_at`, aid, scope)
+		ORDER BY m.created_at, m.id`, aid, scope)
 	if err != nil {
 		return nil, err
 	}
-	dmCount := map[string]int{}
+	// One notice per DM sender (ids + newest body preview); broadcasts keep a
+	// line each with the same preview.
+	type dmAgg struct {
+		ids    []int64
+		newest string
+	}
+	dms := map[string]*dmAgg{}
+	var senders []string
 	var ids []int64
-	var bcasts []string
+	type bcast struct{ from, body string }
+	var bcasts []bcast
 	for rows.Next() {
 		var id int64
-		var from string
+		var from, body string
 		var bc bool
-		if err := rows.Scan(&id, &from, &bc); err != nil {
+		if err := rows.Scan(&id, &from, &body, &bc); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		ids = append(ids, id)
 		if bc {
-			bcasts = append(bcasts, from)
-		} else {
-			dmCount[from]++
+			bcasts = append(bcasts, bcast{from, body})
+			continue
 		}
+		agg := dms[from]
+		if agg == nil {
+			agg = &dmAgg{}
+			dms[from] = agg
+			senders = append(senders, from)
+		}
+		agg.ids = append(agg.ids, id)
+		agg.newest = body // rows arrive oldest-first, so the last one wins
 	}
 	rows.Close() // release the tx's connection before the UPDATEs below
 	if err := rows.Err(); err != nil {
@@ -380,15 +605,17 @@ func (s *Store) noticesFor(scope, aid string, writes []string) ([]string, error)
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	for from, n := range dmCount {
+	for _, from := range senders {
+		agg := dms[from]
 		plural := ""
-		if n > 1 {
+		if len(agg.ids) > 1 {
 			plural = "s"
 		}
-		notices = append(notices, fmt.Sprintf("[coordinator] %d new message%s from %s - call read_messages", n, plural, from))
+		notices = append(notices, fmt.Sprintf("[coordinator] %d new message%s from %s (ids %s) \"%s\" - call read_messages",
+			len(agg.ids), plural, from, joinIDs(agg.ids), preview(agg.newest)))
 	}
-	for _, from := range bcasts {
-		notices = append(notices, fmt.Sprintf("[coordinator] broadcast from %s - call read_messages", from))
+	for _, b := range bcasts {
+		notices = append(notices, fmt.Sprintf("[coordinator] broadcast from %s \"%s\" - call read_messages", b.from, preview(b.body)))
 	}
 	// Conflicts: other agents' recent writes to the same paths.
 	cutoff := s.Now().Add(-conflictWindow).Unix()
@@ -417,6 +644,25 @@ func (s *Store) noticesFor(scope, aid string, writes []string) ([]string, error)
 	return notices, nil
 }
 
+// preview flattens a message body to one notice-safe line: newlines become
+// spaces and anything past ~80 chars is clipped with "...".
+func preview(body string) string {
+	flat := strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(body)
+	r := []rune(flat)
+	if len(r) <= 80 {
+		return flat
+	}
+	return string(r[:80]) + "..."
+}
+
+func joinIDs(ids []int64) string {
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = fmt.Sprintf("%d", id)
+	}
+	return strings.Join(parts, ",")
+}
+
 func age(secs int64) string {
 	switch {
 	case secs < 60:
@@ -440,7 +686,16 @@ func (s *Store) Housekeep() error {
 		{`DELETE FROM messages WHERE created_at < ? AND id IN (SELECT message_id FROM deliveries GROUP BY message_id HAVING COUNT(*) = SUM(read_at IS NOT NULL))`, now.Unix() - 7*day},
 		{`DELETE FROM messages WHERE created_at < ?`, now.Unix() - 30*day},
 		{`DELETE FROM deliveries WHERE message_id NOT IN (SELECT id FROM messages)`, 0},
-		{`DELETE FROM agents WHERE last_seen < ?`, now.Unix() - 7*day},
+		// Agents idle-decay to gone after 2h without a heartbeat; explicit gone
+		// rows younger than that keep their board slot until they age out too.
+		{`DELETE FROM agents WHERE last_seen < ?`, now.Add(-2 * time.Hour).Unix()},
+		// Deliveries to a purged recipient can never be read again: drop them.
+		{`DELETE FROM deliveries WHERE agent_id NOT IN (SELECT agent_id FROM agents)`, 0},
+		// Claims never outlive their holder: drop rows whose holder was purged,
+		// marked gone, or has decayed to gone.
+		{`DELETE FROM claims WHERE NOT EXISTS (
+			SELECT 1 FROM agents a WHERE a.scope = claims.scope AND a.agent_id = claims.agent_id
+			AND a.status != 'gone' AND a.last_seen >= ?)`, now.Add(-staleWindow).Unix()},
 		{`DELETE FROM tasks WHERE updated_at < ?`, now.Unix() - 7*day},
 	}
 	for _, st := range stmts {
@@ -475,7 +730,7 @@ func (s *Store) freshStatus(explicit string, lastSeen int64) string {
 }
 
 func (s *Store) Agents(scope string) ([]protocol.AgentInfo, error) {
-	all, err := s.Board(scope)
+	all, err := s.Board(scope, false)
 	if err != nil {
 		return nil, err
 	}
@@ -488,30 +743,45 @@ func (s *Store) Agents(scope string) ([]protocol.AgentInfo, error) {
 	return out, nil
 }
 
-func (s *Store) Board(scope string) ([]protocol.AgentInfo, error) {
+// Board lists the scope's agents; gone rows are hidden unless includeGone.
+func (s *Store) Board(scope string, includeGone bool) ([]protocol.AgentInfo, error) {
 	// Read every agent row and close the cursor BEFORE per-agent enrichment:
 	// with SetMaxOpenConns(1) an open Rows holds the sole connection, so any
 	// QueryRow issued mid-iteration would deadlock waiting for that connection.
-	rows, err := s.db.Query(`SELECT session_id, agent_id, name, status, last_seen FROM agents WHERE scope=? ORDER BY registered_at`, scope)
+	rows, err := s.db.Query(`SELECT session_id, agent_id, name, status, last_seen, parent_session_id FROM agents WHERE scope=? ORDER BY registered_at`, scope)
 	if err != nil {
 		return nil, err
 	}
-	var out []protocol.AgentInfo
+	var all []protocol.AgentInfo
+	var parentSessions []string
+	nameBySession := map[string]string{} // every row, so a hidden parent still names its children
 	for rows.Next() {
-		var sid, explicit string
+		var sid, explicit, parentSession string
 		var a protocol.AgentInfo
-		if err := rows.Scan(&sid, &a.AgentID, &a.Name, &explicit, &a.LastSeen); err != nil {
+		if err := rows.Scan(&sid, &a.AgentID, &a.Name, &explicit, &a.LastSeen, &parentSession); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		a.Status = s.freshStatus(explicit, a.LastSeen)
-		out = append(out, a)
+		nameBySession[sid] = a.Name
+		parentSessions = append(parentSessions, parentSession)
+		all = append(all, a)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
 		return nil, err
 	}
 	rows.Close()
+	var out []protocol.AgentInfo
+	for i, a := range all {
+		if ps := parentSessions[i]; ps != "" {
+			a.Parent = nameBySession[ps] // empty if the parent row was purged
+		}
+		if a.Status == "gone" && !includeGone {
+			continue
+		}
+		out = append(out, a)
+	}
 
 	for i := range out {
 		a := &out[i]
@@ -524,6 +794,15 @@ func (s *Store) Board(scope string) ([]protocol.AgentInfo, error) {
 		s.db.QueryRow(`SELECT COUNT(*) FROM tasks WHERE scope=? AND agent_id=? AND status='completed'`, scope, a.AgentID).Scan(&a.TasksDone)
 		s.db.QueryRow(`SELECT subject FROM tasks WHERE scope=? AND agent_id=? AND status='in_progress' ORDER BY updated_at DESC LIMIT 1`,
 			scope, a.AgentID).Scan(&a.CurrentTask)
+		if crows, err := s.db.Query(`SELECT path FROM claims WHERE scope=? AND agent_id=? ORDER BY since, path`, scope, a.AgentID); err == nil {
+			for crows.Next() {
+				var p string
+				if crows.Scan(&p) == nil {
+					a.Claims = append(a.Claims, p)
+				}
+			}
+			crows.Close()
+		}
 	}
 	return out, nil
 }

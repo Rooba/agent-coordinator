@@ -1,5 +1,20 @@
 # agent-coordinator - findings, fixes, and improvements
 
+**Status 2026-08-05: retro backlog IMPLEMENTED** (pair: solid-mole/Claude + nimble-raven/Grok).
+All P0 (subagent identities + drain guard, hook/MCP identity unification via bind files,
+Grok bootstrap + join + whoami, wait high-water baseline), all P1 (board hides gone + 2h GC,
+MCP heartbeat, tool copy, notice previews, agent_id visibility), and P2.1/P2.2 (claims
+ledger, message journal) landed with tests; P2.3 stayed the documented .ignore/coordination
+file-drop convention; P3.1 shared LSP hub parked by design. A post-implementation review
+pass (10 findings, incl. bind-match selectivity, subagent whoami drain, purged-sender mail
+visibility) was fixed in the same session. See
+[`docs/IMPROVEMENTS-2026-08-05-pair-session-retro.md`](docs/IMPROVEMENTS-2026-08-05-pair-session-retro.md)
+for the original backlog and acceptance criteria.
+
+---
+
+## Historical: 2026-07-12 stress test
+
 Source: a live two-coordinator stress test (2026-07-12). Two Claude Code sessions
 (`solid-heron`, `proud-raven`) each drove a 3-2-1 subagent tree (15 agents/tree, 30 total)
 in one shared workspace, coordinating entirely through the coordinator. Co-authored by both

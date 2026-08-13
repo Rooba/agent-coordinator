@@ -87,7 +87,7 @@ func TestPresenceFreshness(t *testing.T) {
 	if len(agents) != 0 {
 		t.Fatalf("agent past 15m must drop off Agents(), got %d", len(agents))
 	}
-	board, _ := s.Board("/r")
+	board, _ := s.Board("/r", false)
 	if len(board) != 1 || board[0].Status != "stale" {
 		t.Fatalf("board must still show it as stale: %+v", board)
 	}
@@ -105,7 +105,7 @@ func TestEventUpdatesBoardAndTasks(t *testing.T) {
 		TaskEv: &protocol.TaskEvent{Kind: "create", Key: "1", Subject: "x", Status: "pending"}})
 	s.RecordEvent("/r", "s1", protocol.Request{Tool: "TaskUpdate", Activity: "Updating task 1 -> in_progress",
 		TaskEv: &protocol.TaskEvent{Kind: "update", Key: "1", Status: "in_progress"}})
-	board, _ := s.Board("/r")
+	board, _ := s.Board("/r", false)
 	if len(board) != 1 {
 		t.Fatalf("want 1 agent, got %d", len(board))
 	}
@@ -115,7 +115,7 @@ func TestEventUpdatesBoardAndTasks(t *testing.T) {
 	}
 	s.RecordEvent("/r", "s1", protocol.Request{Tool: "TaskUpdate", Activity: "Updating task 1 -> completed",
 		TaskEv: &protocol.TaskEvent{Kind: "update", Key: "1", Status: "completed"}})
-	board, _ = s.Board("/r")
+	board, _ = s.Board("/r", false)
 	if board[0].TasksDone != 1 || board[0].CurrentTask != "" {
 		t.Fatalf("completion not reflected: %+v", board[0])
 	}
@@ -137,7 +137,7 @@ func TestEventReplacesTaskSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	board, _ := s.Board("/r")
+	board, _ := s.Board("/r", false)
 	if len(board) != 1 || board[0].CurrentTask != "Patch" || board[0].TasksPending != 1 || board[0].TasksDone != 1 {
 		t.Fatalf("snapshot not reflected: %+v", board)
 	}
@@ -148,9 +148,83 @@ func TestEventReplacesTaskSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	board, _ = s.Board("/r")
+	board, _ = s.Board("/r", false)
 	if board[0].CurrentTask != "" || board[0].TasksPending != 0 || board[0].TasksDone != 1 {
 		t.Fatalf("replacement left stale tasks: %+v", board[0])
+	}
+}
+
+func TestBoardExcludesGoneByDefault(t *testing.T) {
+	s := open(t)
+	s.Register("/r", "s-live", "startup")
+	gone, _ := s.Register("/r", "s-gone", "startup")
+	s.SetStatus("/r", "s-gone", "gone")
+	board, err := s.Board("/r", false)
+	if err != nil || len(board) != 1 || board[0].Status == "gone" {
+		t.Fatalf("default board must hide gone rows: %+v err=%v", board, err)
+	}
+	board, err = s.Board("/r", true)
+	if err != nil || len(board) != 2 {
+		t.Fatalf("include_gone board must show all rows: %+v err=%v", board, err)
+	}
+	found := false
+	for _, a := range board {
+		if a.Name == gone && a.Status == "gone" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("gone row missing from full board: %+v", board)
+	}
+}
+
+func TestHousekeepPurgesLongGoneAgents(t *testing.T) {
+	s := open(t)
+	now := time.Unix(3000000, 0)
+	s.Now = func() time.Time { return now }
+	s.Register("/r", "s-old", "startup") // last_seen stays 3h behind
+	now = now.Add(2 * time.Hour)
+	s.Register("/r", "s-gone-recent", "startup")
+	s.SetStatus("/r", "s-gone-recent", "gone") // explicit gone, only 1h old at sweep
+	now = now.Add(time.Hour)
+	live, _ := s.Register("/r", "s-live", "startup")
+	if err := s.Housekeep(); err != nil {
+		t.Fatal(err)
+	}
+	board, _ := s.Board("/r", true)
+	names := map[string]bool{}
+	for _, a := range board {
+		names[a.Name] = true
+	}
+	if len(board) != 2 || !names[live] {
+		t.Fatalf("want live + recent-gone rows to survive: %+v", board)
+	}
+	if id, err := s.Identity("/r", "s-old"); err == nil {
+		t.Fatalf("3h-gone agent must be purged, still have %+v", id)
+	}
+	if _, err := s.Identity("/r", "s-gone-recent"); err != nil {
+		t.Fatalf("1h-old gone agent must survive: %v", err)
+	}
+}
+
+func TestTouchLiftsIdleButNotGone(t *testing.T) {
+	s := open(t)
+	s.Register("/r", "s1", "startup")
+	s.SetStatus("/r", "s1", "idle")
+	if err := s.Touch("/r", "s1"); err != nil {
+		t.Fatal(err)
+	}
+	board, _ := s.Board("/r", true)
+	if len(board) != 1 || board[0].Status != "active" {
+		t.Fatalf("touch must lift sticky idle to active: %+v", board)
+	}
+	s.SetStatus("/r", "s1", "gone")
+	if err := s.Touch("/r", "s1"); err != nil {
+		t.Fatal(err)
+	}
+	board, _ = s.Board("/r", true)
+	if len(board) != 1 || board[0].Status != "gone" {
+		t.Fatalf("touch must never resurrect a gone row: %+v", board)
 	}
 }
 

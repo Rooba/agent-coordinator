@@ -3,31 +3,35 @@
 This workspace is served by the **agent-coordinator**: a lightweight presence + messaging mesh that
 lets multiple agents and sessions see each other and collaborate without colliding. When more than
 one agent or session may share a workspace, USING IT IS NOT OPTIONAL - it markedly improves speed and
-prevents duplicated or conflicting work. The six tools below are exposed via the `agent-coordinator`
+prevents duplicated or conflicting work. The tools below are exposed via the `agent-coordinator`
 MCP server; the `agent-coordinator` CLI provides the `wait` wake-lever.
 
 ## Your identity
 
 At SessionStart the coordinator hook injects your name:
 `[coordinator] you are '<name>' in this workspace` (an adjective-animal, e.g. `deft-pika`).
-If no SessionStart hook ran, call `register_agent` to get a name. Use that exact `<name>` as `from`,
-or omit `from` after registering and let the MCP session supply it. Do not grep the filesystem for it.
+If no SessionStart hook ran, call `register_agent` (or shell `agent-coordinator join`) to get a name.
+Use that exact `<name>` as `from`, or omit `from` after registering and let the MCP session supply
+it. Do not grep the filesystem for it.
 
-## The six tools
+## The tools
 
-- `register_agent` - fallback for a session with no hook-assigned identity; do not call when SessionStart assigned a name.
-- `status_board` - every agent with name, presence (active / idle / gone), current task, touched files, last activity.
+- `register_agent` - fallback only when no SessionStart name; call once.
+- `whoami` - this connection's identity (name, agent_id, scope, parent?).
+- `status_board` - full detail; hides gone by default (`include_gone=true` to list ghosts).
 - `list_agents` - who is active or idle right now (presence only).
-- `send_message(to, body, from?)` - direct message to one agent by name.
-- `read_messages(from?)` - read AND CLEAR your own unread messages.
-- `broadcast(body, from?)` - workspace-wide, need-to-know channel. Sparingly - it notifies everyone.
+- `send_message(to, body, from?)` - DM by name or agent_id; short bodies preferred.
+- `read_messages(from?)` - **DESTRUCTIVE**: read AND CLEAR unread. Subagents must pass
+  `from='<child name>'` so they do not drain the parent inbox.
+- `peek_messages(from?)` - non-destructive unread preview.
+- `broadcast(body, from?)` - one-shot to agents registered **now**; late joiners miss it.
 
 ## Wake pattern (be woken, do not busy-poll)
 
-Arm a background task: `agent-coordinator wait '<yourname>' -timeout <sec>` (default 570s). It exits
-the moment a DM arrives (or on timeout) and the harness re-invokes you. Treat it as a WAKE SIGNAL,
-then confirm with `read_messages` - it can return early on a residual notice, so it is not a precise
-timer.
+Arm a background task: `agent-coordinator wait '<yourname>' -timeout <sec>` (default 570s). It
+baselines on your current high-water message id at arm time and exits 0 only when **newer** mail
+arrives (stale backlog does not wake). On success stdout is `mail from=... count=N ids=...`; on
+timeout `timeout` (exit 1). Treat exit 0 as a WAKE SIGNAL, then confirm with `read_messages`.
 
 ## DO
 
@@ -49,14 +53,16 @@ timer.
 - Don't have N agents independently run the same expensive command (build / index / deploy) - coordinate one.
 - Don't reply-all storm; one hello per peer is enough.
 - Don't assume a broadcast reached later-spawned agents - broadcasts are one-shot; DM critical directives.
-- Don't launch a large recursive subagent fan-out on a quota-limited model without checking headroom.
+- Don't launch a large recursive subagent fan-out on a quota-limited model without checking headroom
+  (prefer higher-capacity models for big trees; Fable-class quotas can crash fan-outs mid-run).
 - Don't trust display-name self-identification under concurrent spawns; verify against `status_board`.
 
-## Subagent identity (current limitation - read if you spawn or are a subagent)
+## Subagent identity
 
-Agent-tool subagents inherit the parent session's id, so the SessionStart hook may NOT mint them a
-distinct coordinator name, and peer tools reject an unregistered `from` (`no agent X in this
-workspace`). If you are a subagent without a name: use any `you are '<name>'` line in your context;
-otherwise call `list_agents` and take the newest active entry that is unmistakably you. For
-multi-agent runs prefer a FRESH (non-resumed) session - a resumed session currently fails to register
-its subagents into the mesh.
+Subagent tool events register a **child** coordinator identity (parent linkage on the board).
+Child `read_messages` only clears the child inbox. A bare `read_messages` from a subagent is
+denied by PreToolUse with the child name to use as `from`. `whoami` is for parent sessions and
+foreign harnesses joining without a hook name; on the shared MCP connection it reports the
+PARENT identity, so subagents must not rely on it. Subagents get their child name from the
+PreToolUse deny reason (it states it) or their spawn context, and must pass `from=<child name>`
+on every coordinator call. Key durable artifacts by `agent_id`, not display name.
