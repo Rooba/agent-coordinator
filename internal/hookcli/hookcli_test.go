@@ -15,8 +15,13 @@ import (
 )
 
 func TestNormalizePaths(t *testing.T) {
-	got := normalizePaths("/repo", []string{"internal/a.go", "/other/b.go"})
-	if len(got) != 2 || got[0] != "/repo/internal/a.go" || got[1] != "/other/b.go" {
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	abs := filepath.Join(cwd, "other", "b.go")
+	got := normalizePaths(cwd, []string{filepath.Join("internal", "a.go"), abs})
+	if len(got) != 2 || got[0] != filepath.Join(cwd, "internal", "a.go") || got[1] != abs {
 		t.Fatalf("got %v", got)
 	}
 }
