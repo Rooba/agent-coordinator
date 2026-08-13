@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -162,15 +163,58 @@ func handle(conn net.Conn, st *store.Store) {
 
 func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 	fail := func(err error) protocol.Response { return protocol.Response{Error: err.Error()} }
+	// Requests carrying the subagent AgentID target the CHILD row derived from
+	// the parent SessionID: register/refresh it up front and retarget the op.
+	childSession := ""
+	if req.AgentID != "" {
+		switch req.Op {
+		case protocol.OpRegister, protocol.OpEvent, protocol.OpDeregister:
+			childSession = store.ChildSessionID(req.SessionID, req.AgentID)
+			if req.Op != protocol.OpDeregister {
+				name, err := st.RegisterChild(req.Scope, req.SessionID, req.AgentID, req.AgentType)
+				if err != nil {
+					return fail(err)
+				}
+				if req.Op == protocol.OpRegister {
+					return protocol.Response{OK: true, Name: name}
+				}
+			}
+		}
+	}
+	// MCP heartbeat: any tool call that names its bound session keeps that row
+	// fresh (and lifts sticky idle); Touch never resurrects a gone row.
+	if req.SessionID != "" {
+		switch req.Op {
+		case protocol.OpBoard, protocol.OpAgents, protocol.OpSend, protocol.OpRead, protocol.OpPeek, protocol.OpBroadcast,
+			protocol.OpClaim, protocol.OpRelease, protocol.OpClaims, protocol.OpHistory:
+			if err := st.Touch(req.Scope, req.SessionID); err != nil {
+				return fail(err)
+			}
+		}
+	}
 	switch req.Op {
 	case protocol.OpRegister:
-		name, err := st.Register(req.Scope, req.SessionID, req.Source)
+		register := st.Register
+		if req.OnlyIfNoHook {
+			register = st.RegisterIfNoLiveHook
+		}
+		name, err := register(req.Scope, req.SessionID, req.Source)
 		if err != nil {
 			return fail(err)
 		}
 		return protocol.Response{OK: true, Name: name}
+	case protocol.OpWhoami:
+		id, err := st.Identity(req.Scope, req.SessionID)
+		if err != nil {
+			return fail(err)
+		}
+		return protocol.Response{OK: true, Name: id.Name, AgentID: id.AgentID, Source: id.Source, Parent: id.Parent}
 	case protocol.OpDeregister:
-		if err := st.SetStatus(req.Scope, req.SessionID, "gone"); err != nil {
+		sess := req.SessionID
+		if childSession != "" {
+			sess = childSession // SubagentStop retires the child, never the parent
+		}
+		if err := st.SetStatus(req.Scope, sess, "gone"); err != nil {
 			return fail(err)
 		}
 	case protocol.OpIdle:
@@ -186,7 +230,11 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 		}
 		return protocol.Response{OK: true, Notices: notices}
 	case protocol.OpEvent:
-		notices, err := st.RecordEvent(req.Scope, req.SessionID, req)
+		sess := req.SessionID
+		if childSession != "" {
+			sess = childSession // subagent activity lands on the child row
+		}
+		notices, err := st.RecordEvent(req.Scope, sess, req)
 		if err != nil {
 			return fail(err)
 		}
@@ -198,7 +246,7 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 		}
 		return protocol.Response{OK: true, Agents: agents}
 	case protocol.OpBoard:
-		agents, err := st.Board(req.Scope)
+		agents, err := st.Board(req.Scope, req.IncludeGone)
 		if err != nil {
 			return fail(err)
 		}
@@ -214,15 +262,44 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 		}
 		return protocol.Response{OK: true, Messages: msgs}
 	case protocol.OpPeek:
-		n, err := st.UnreadCount(req.Scope, req.From)
+		info, err := st.PeekMail(req.Scope, req.From, req.AfterID)
 		if err != nil {
 			return fail(err)
 		}
-		return protocol.Response{OK: true, Unread: n}
+		return protocol.Response{
+			OK: true, Unread: info.Unread, HighWater: info.HighWater,
+			PeekIDs: info.IDs, PeekFroms: info.Froms,
+		}
 	case protocol.OpBroadcast:
 		if err := st.Broadcast(req.Scope, req.From, req.Body); err != nil {
 			return fail(err)
 		}
+	case protocol.OpClaim:
+		res, err := st.Claim(req.Scope, req.From, req.Path, req.Note)
+		if err != nil {
+			return fail(err)
+		}
+		resp := protocol.Response{OK: true}
+		if res.Stolen {
+			resp.Notices = []string{fmt.Sprintf("takeover: previous holder %s was gone", res.PrevName)}
+		}
+		return resp
+	case protocol.OpRelease:
+		if err := st.Release(req.Scope, req.From, req.Path); err != nil {
+			return fail(err)
+		}
+	case protocol.OpClaims:
+		claims, err := st.ListClaims(req.Scope)
+		if err != nil {
+			return fail(err)
+		}
+		return protocol.Response{OK: true, Claims: claims}
+	case protocol.OpHistory:
+		hist, err := st.MessageHistory(req.Scope, req.From, req.Peer, req.Limit)
+		if err != nil {
+			return fail(err)
+		}
+		return protocol.Response{OK: true, History: hist}
 	default:
 		return fail(errors.New("unknown op " + req.Op))
 	}

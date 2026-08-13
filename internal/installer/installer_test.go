@@ -27,10 +27,14 @@ func TestMergePreservesExistingAndIsIdempotent(t *testing.T) {
 		t.Fatalf("changed=%v err=%v", changed, err)
 	}
 	s := string(out)
-	for _, want := range []string{"cbm-session-reminder", "agent-coordinator hook", "UserPromptSubmit", "PostToolUse", "SessionEnd", "Stop", `"effortLevel": "xhigh"`} {
+	for _, want := range []string{"cbm-session-reminder", "agent-coordinator hook", "UserPromptSubmit", "PreToolUse", "PostToolUse", "SubagentStart", "SubagentStop", "SessionEnd", "Stop", `"effortLevel": "xhigh"`} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("missing %q in:\n%s", want, s)
 		}
+	}
+	// Bare "Read" in the PreToolUse matcher would spawn the hook on every file read.
+	if !strings.Contains(s, `"mcp__agent-coordinator__read_messages|read_messages"`) || strings.Contains(s, "|Read|") {
+		t.Fatalf("PreToolUse matcher must target read_messages only, not bare Read:\n%s", s)
 	}
 	var m map[string]any
 	if err := json.Unmarshal(out, &m); err != nil {
@@ -93,6 +97,26 @@ func TestCodexHooksUseSupportedLifecycleEvents(t *testing.T) {
 	}
 	if !strings.Contains(s, `"description": "keep"`) {
 		t.Fatalf("foreign Codex hook metadata was not preserved:\n%s", s)
+	}
+}
+
+func TestGrokHooksInstallIdempotent(t *testing.T) {
+	out, changed, err := MergeGrokHooks([]byte("{}"), "/bin/ac")
+	if err != nil || !changed {
+		t.Fatalf("MergeGrokHooks: changed=%v err=%v", changed, err)
+	}
+	s := string(out)
+	for _, event := range []string{"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SubagentStart", "SubagentStop", "SessionEnd"} {
+		if !strings.Contains(s, `"`+event+`"`) {
+			t.Fatalf("missing Grok event %q in:\n%s", event, s)
+		}
+	}
+	if !strings.Contains(s, `"/bin/ac hook"`) {
+		t.Fatalf("missing hook command:\n%s", s)
+	}
+	again, changed, err := MergeGrokHooks(out, "/bin/ac")
+	if err != nil || changed || string(again) != string(out) {
+		t.Fatalf("Grok merge not idempotent: changed=%v err=%v", changed, err)
 	}
 }
 
@@ -221,10 +245,10 @@ func TestInstallUninstallRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := string(after)
-	if got := strings.Count(s, `"/bin/ac hook"`); got != 5 {
-		t.Fatalf("want 5 coordinator hook entries, got %d in:\n%s", got, s)
+	if got := strings.Count(s, `"/bin/ac hook"`); got != 8 {
+		t.Fatalf("want 8 coordinator hook entries, got %d in:\n%s", got, s)
 	}
-	for _, event := range []string{"SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd"} {
+	for _, event := range []string{"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SubagentStart", "SubagentStop", "SessionEnd"} {
 		if !strings.Contains(s, `"`+event+`"`) {
 			t.Fatalf("missing event %q in:\n%s", event, s)
 		}
@@ -248,6 +272,14 @@ func TestInstallUninstallRoundTrip(t *testing.T) {
 	}
 	if strings.Contains(string(codexHooks), `"SessionEnd"`) {
 		t.Fatalf("unsupported SessionEnd installed for Codex:\n%s", codexHooks)
+	}
+	grokHooksPath := filepath.Join(home, ".grok", "hooks", "agent-coordinator.json")
+	grokHooks, err := os.ReadFile(grokHooksPath)
+	if err != nil {
+		t.Fatalf("Grok hooks: %v", err)
+	}
+	if got := strings.Count(string(grokHooks), `"/bin/ac hook"`); got != 8 {
+		t.Fatalf("want 8 Grok hook entries, got %d in:\n%s", got, grokHooks)
 	}
 	openCodePath := filepath.Join(home, ".config", "opencode", "opencode.json")
 	openCode, err := os.ReadFile(openCodePath)
@@ -299,6 +331,12 @@ func TestInstallUninstallRoundTrip(t *testing.T) {
 	}
 	if strings.Contains(string(codexHooks), "/bin/ac hook") {
 		t.Fatalf("coordinator Codex hooks not removed:\n%s", codexHooks)
+	}
+	if _, err := os.Stat(grokHooksPath); !os.IsNotExist(err) {
+		// File may remain if non-empty foreign content; must not still list our hook.
+		if b, rerr := os.ReadFile(grokHooksPath); rerr == nil && strings.Contains(string(b), "/bin/ac hook") {
+			t.Fatalf("coordinator Grok hooks not removed:\n%s", b)
+		}
 	}
 	openCode, err = os.ReadFile(openCodePath)
 	if err != nil {
@@ -371,8 +409,8 @@ func TestInstallDegradesWithoutSystemctl(t *testing.T) {
 	if err != nil {
 		t.Fatalf("hooks not merged: %v", err)
 	}
-	if got := strings.Count(string(after), `"/bin/ac hook"`); got != 5 {
-		t.Fatalf("want 5 coordinator hook entries, got %d in:\n%s", got, after)
+	if got := strings.Count(string(after), `"/bin/ac hook"`); got != 8 {
+		t.Fatalf("want 8 coordinator hook entries, got %d in:\n%s", got, after)
 	}
 	if !hasCall(calls, []string{"claude", "mcp", "add", "--scope", "user", "--transport", "stdio", "agent-coordinator", "--", "/bin/ac", "mcp"}) {
 		t.Fatalf("MCP server not registered: %v", calls)
@@ -431,8 +469,8 @@ func TestInstallDegradeCleansEnablementOnTransientFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("hooks not merged: %v", err)
 	}
-	if got := strings.Count(string(after), `"/bin/ac hook"`); got != 5 {
-		t.Fatalf("want 5 coordinator hook entries, got %d in:\n%s", got, after)
+	if got := strings.Count(string(after), `"/bin/ac hook"`); got != 8 {
+		t.Fatalf("want 8 coordinator hook entries, got %d in:\n%s", got, after)
 	}
 	if !hasCall(calls, []string{"claude", "mcp", "add", "--scope", "user", "--transport", "stdio", "agent-coordinator", "--", "/bin/ac", "mcp"}) {
 		t.Fatalf("MCP server not registered: %v", calls)

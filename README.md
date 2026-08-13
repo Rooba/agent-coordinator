@@ -14,7 +14,9 @@ agent's context on its next tool call.
 
 ## Tell your agents to use it
 
-Paste the block below into your project's `CLAUDE.md` (or equivalent agent instructions file) so every agent that opens the repo knows to use the coordinator without being told:
+Paste the block below into your project's `CLAUDE.md` (or equivalent agent instructions file)
+so every agent that opens the repo knows to use the coordinator without being told. Keep it in
+sync with the root `CLAUDE.md` in this repo:
 
 ```markdown
 # Agent Coordinator - use it, actively
@@ -22,31 +24,35 @@ Paste the block below into your project's `CLAUDE.md` (or equivalent agent instr
 This workspace is served by the **agent-coordinator**: a lightweight presence + messaging mesh that
 lets multiple agents and sessions see each other and collaborate without colliding. When more than
 one agent or session may share a workspace, USING IT IS NOT OPTIONAL - it markedly improves speed and
-prevents duplicated or conflicting work. The six tools below are exposed via the `agent-coordinator`
+prevents duplicated or conflicting work. The tools below are exposed via the `agent-coordinator`
 MCP server; the `agent-coordinator` CLI provides the `wait` wake-lever.
 
 ## Your identity
 
 At SessionStart the coordinator hook injects your name:
 `[coordinator] you are '<name>' in this workspace` (an adjective-animal, e.g. `deft-pika`).
-If no SessionStart hook ran, call `register_agent` to get a name. Use that exact `<name>` as `from`,
-or omit `from` after registering and let the MCP session supply it. Do not grep the filesystem for it.
+If no SessionStart hook ran, call `register_agent` (or shell `agent-coordinator join`) to get a name.
+Use that exact `<name>` as `from`, or omit `from` after registering and let the MCP session supply
+it. Do not grep the filesystem for it.
 
-## The six tools
+## The tools
 
-- `register_agent` - fallback for a session with no hook-assigned identity; do not call when SessionStart assigned a name.
-- `status_board` - every agent with name, presence (active / idle / gone), current task, touched files, last activity.
+- `register_agent` - fallback only when no SessionStart name; call once.
+- `whoami` - this connection's identity (name, agent_id, scope, parent?).
+- `status_board` - full detail; hides gone by default (`include_gone=true` to list ghosts).
 - `list_agents` - who is active or idle right now (presence only).
-- `send_message(to, body, from?)` - direct message to one agent by name.
-- `read_messages(from?)` - read AND CLEAR your own unread messages.
-- `broadcast(body, from?)` - workspace-wide, need-to-know channel. Sparingly - it notifies everyone.
+- `send_message(to, body, from?)` - DM by name or agent_id; short bodies preferred.
+- `read_messages(from?)` - **DESTRUCTIVE**: read AND CLEAR unread. Subagents must pass
+  `from='<child name>'` so they do not drain the parent inbox.
+- `peek_messages(from?)` - non-destructive unread preview.
+- `broadcast(body, from?)` - one-shot to agents registered **now**; late joiners miss it.
 
 ## Wake pattern (be woken, do not busy-poll)
 
-Arm a background task: `agent-coordinator wait '<yourname>' -timeout <sec>` (default 570s). It exits
-the moment a DM arrives (or on timeout) and the harness re-invokes you. Treat it as a WAKE SIGNAL,
-then confirm with `read_messages` - it can return early on a residual notice, so it is not a precise
-timer.
+Arm a background task: `agent-coordinator wait '<yourname>' -timeout <sec>` (default 570s). It
+baselines on your current high-water message id at arm time and exits 0 only when **newer** mail
+arrives (stale backlog does not wake). On success stdout is `mail from=... count=N ids=...`; on
+timeout `timeout` (exit 1). Treat exit 0 as a WAKE SIGNAL, then confirm with `read_messages`.
 
 ## DO
 
@@ -68,17 +74,19 @@ timer.
 - Don't have N agents independently run the same expensive command (build / index / deploy) - coordinate one.
 - Don't reply-all storm; one hello per peer is enough.
 - Don't assume a broadcast reached later-spawned agents - broadcasts are one-shot; DM critical directives.
-- Don't launch a large recursive subagent fan-out on a quota-limited model without checking headroom.
+- Don't launch a large recursive subagent fan-out on a quota-limited model without checking headroom
+  (prefer higher-capacity models for big trees; Fable-class quotas can crash fan-outs mid-run).
 - Don't trust display-name self-identification under concurrent spawns; verify against `status_board`.
 
-## Subagent identity (current limitation - read if you spawn or are a subagent)
+## Subagent identity
 
-Agent-tool subagents inherit the parent session's id, so the SessionStart hook may NOT mint them a
-distinct coordinator name, and peer tools reject an unregistered `from` (`no agent X in this
-workspace`). If you are a subagent without a name: use any `you are '<name>'` line in your context;
-otherwise call `list_agents` and take the newest active entry that is unmistakably you. For
-multi-agent runs prefer a FRESH (non-resumed) session - a resumed session currently fails to register
-its subagents into the mesh.
+Subagent tool events register a **child** coordinator identity (parent linkage on the board).
+Child `read_messages` only clears the child inbox. A bare `read_messages` from a subagent is
+denied by PreToolUse with the child name to use as `from`. `whoami` is for parent sessions and
+foreign harnesses joining without a hook name; on the shared MCP connection it reports the
+PARENT identity, so subagents must not rely on it. Subagents get their child name from the
+PreToolUse deny reason (it states it) or their spawn context, and must pass `from=<child name>`
+on every coordinator call. Key durable artifacts by `agent_id`, not display name.
 ```
 
 The same guide lives at the repo root as `CLAUDE.md`, ready to copy as-is.
@@ -123,11 +131,14 @@ make install
 
 ### What `install` does
 
-- merges the five hooks (SessionStart, UserPromptSubmit, PostToolUse, Stop,
-  SessionEnd) into `~/.claude/settings.json` - existing hooks are preserved,
-  the merge is idempotent, and the write is atomic,
+- merges Claude lifecycle hooks into `~/.claude/settings.json` (SessionStart,
+  UserPromptSubmit, PreToolUse, PostToolUse, Stop, SubagentStart, SubagentStop,
+  SessionEnd) - existing hooks are preserved, the merge is idempotent, and the
+  write is atomic (PreToolUse guards subagent inbox drain once the handler lands),
 - merges the four lifecycle events currently supported by Codex (SessionStart,
   UserPromptSubmit, PostToolUse, Stop) into `~/.codex/hooks.json`,
+- writes Grok Build lifecycle hooks to `~/.grok/hooks/agent-coordinator.json`
+  (same set as Claude - dedicated file, not only Claude-compat import),
 - replaces stale `agent-coordinator` MCP registrations for Claude Code, Codex,
   and Grok Build, and merges the local server into OpenCode's global JSON config,
 - on Linux with systemd, additionally sets up socket activation
@@ -149,31 +160,40 @@ behind; delete it by hand for a clean slate.
 - Claude Code: MCP plus full five-hook lifecycle tracking.
 - Codex: MCP plus native hook tracking. Codex has no SessionEnd event, so stale
   presence is retired by the coordinator's freshness window.
-- Grok Build: MCP plus lifecycle tracking through its documented Claude Code
-  hook compatibility.
+- Grok Build: MCP registration plus dedicated hooks in
+  `~/.grok/hooks/agent-coordinator.json` (SessionStart name injection and the
+  same lifecycle events as Claude). The hook parser accepts both Claude
+  snake_case and Grok camelCase stdin envelopes.
 - OpenCode: MCP registration is installed. Automatic activity/file/task tracking
   still requires an OpenCode plugin adapter and is not yet claimed here.
 
 Codex requires new or changed non-managed hooks to be reviewed and trusted with
 `/hooks` before they execute.
 
-## The six tools
+## The MCP tools
 
 All under the MCP server `agent-coordinator`. Hook-enabled clients receive an
-agent name at session start. MCP-only clients call `register_agent`; after that,
-`from` is optional for messaging calls.
+agent name at session start. MCP-only clients call `register_agent` (or
+`agent-coordinator join`); after that, `from` is optional for messaging calls.
+When a SessionStart hook ran, the MCP process adopts that same identity via a
+bind file (one session = one inbox).
 
-- `register_agent` - register this MCP process only when no hook assigned an identity.
-- `status_board` - the full workspace board: every coordinated agent with
-  name, presence, current task, task counts, latest activity and files.
-- `list_agents` - live peers (active or idle) in this workspace.
-- `send_message` - direct message to one agent, by name or agent_id.
-- `read_messages` - read and clear your unread messages.
-- `broadcast` - message every live peer in the workspace at once.
+- `register_agent` - only when no SessionStart name was assigned; call once.
+- `whoami` - this connection's identity (`name`, `agent_id`, `scope`, `source`,
+  optional `parent` for subagents).
+- `status_board` - full detail (agent_id, name, presence, task, activity,
+  files). Hides `gone` by default; pass `include_gone=true` for all rows.
+- `list_agents` - live peers only (active or idle) for contact.
+- `send_message` - DM by name or agent_id; prefer short bodies (long content
+  -> file under `.ignore/coordination/` + one-line path pointer).
+- `read_messages` - **DESTRUCTIVE**: returns and **clears** unread. Subagents
+  must pass `from='<child name>'` so they never drain the parent inbox.
+- `peek_messages` - non-destructive unread preview (count, senders, ids).
+- `broadcast` - one-shot to agents registered **now**; late joiners miss it.
 
 ## How it works
 
-One binary, five subcommands:
+One binary, several subcommands:
 
 - `daemon` - owns the SQLite state, serves a line-JSON protocol on a unix
   socket. Started on demand by the other subcommands and exits after 10
@@ -183,10 +203,12 @@ One binary, five subcommands:
   the daemon and injects any response back into the session as additional
   context. Every error path is a silent no-op: a broken coordinator can
   never break the host agent session.
-- `mcp` - stdio MCP server exposing the six peer tools, backed by the
-  same socket.
-- `wait` - blocks until mail arrives for an agent, for the wake pattern
-  (see below).
+- `mcp` - stdio MCP server exposing the peer tools, backed by the same socket.
+- `wait` - blocks until **new** mail arrives for an agent (see wake pattern).
+- `join` - one-shot register + print the SessionStart injection line (for
+  harnesses without hooks, or manual bootstrap).
+- `board` - print the workspace board (`--live` active+idle only, `--all`
+  include gone, `--json` machine-readable).
 - `install` - registers all of the above (see Install above).
 
 ```
@@ -250,18 +272,33 @@ fires consumes it, the mail itself stays unread until `read_messages`):
 agent-coordinator wait <name> [-timeout <seconds>] [-interval <seconds>]
 ```
 
-`wait` resolves the workspace scope from its cwd and polls the daemon
-(read-only peek, default every 2s) until the named agent has unread mail.
-It exits 0 the moment mail arrives, 1 on timeout (default 570s, under
-common 600s background caps), 2 on usage error. Peeking never consumes the
-once-only notice nudge - the other levers still fire.
+`wait` resolves the workspace scope from its cwd, records the agent's
+**high-water** message id at arm time, then polls the daemon (read-only
+peek, default every 2s) until an unread message with id strictly greater
+than that baseline appears. Stale backlog that was already unread when
+`wait` started does **not** wake. Exit 0 prints
+`mail from=<names> count=N ids=...`; exit 1 on timeout prints `timeout`
+(default 570s, under common 600s background caps); exit 2 on usage error.
+Peeking never consumes mail or the once-only notice nudge.
 
 An agent blocked on a synchronous subagent has no harness touchpoint and
 cannot be woken. But an agent that arms `wait` as a BACKGROUND task before
 delegating or idling gets re-invoked by the harness the moment `wait`
-exits - i.e. the moment a DM arrives. Arm first, then delegate. The
-SessionStart injection teaches every agent this pattern with its own name
-filled in.
+exits - i.e. the moment **new** mail arrives. Arm first, then delegate. The
+SessionStart injection (or `agent-coordinator join`) teaches every agent
+this pattern with its own name filled in.
+
+### Bootstrap without hooks (`join`)
+
+```
+agent-coordinator join [-session-id <id>] [-source <label>]
+```
+
+Registers in the current workspace and prints the same
+`[coordinator] you are '<name>' ...` line the SessionStart hook emits.
+Session id resolution: `-session-id`, then `CLAUDE_CODE_SESSION_ID` /
+`GROK_SESSION_ID` / `CODEX_SESSION_ID` / `AC_SESSION_ID`, else an ephemeral
+id (name will not stick across restarts).
 
 ## Configuration
 
@@ -306,29 +343,38 @@ or messages.
 
 A single SQLite database at
 `~/.local/state/agent-coordinator/coordinator.db` (see `AC_DB`). The
-daemon is the only writer. Housekeeping prunes agents unseen for 7 days,
-and messages 7 days after every delivery is read (30 days
-unconditionally).
+daemon is the only writer. Housekeeping purges agents with `last_seen`
+older than 2 hours (keeps the board free of ghosts), messages 7 days after
+every delivery is read (30 days unconditionally), and other event rows on
+their own windows. Every bound MCP tool call heartbeats `last_seen` so
+MCP-only sessions stay `active` without hook traffic.
+
+## Model quota hazard (not a daemon bug)
+
+Large multi-agent trees on quota-limited models (e.g. Fable-class) can hit a
+usage wall mid-run and churn names/tasks without a clear "quota exhausted"
+signal. Prefer higher-capacity models (Sonnet/Opus class) for fan-outs of more
+than a handful of concurrent agents; reserve cheaper models for short tasks.
+This is operational guidance, not a coordinator defect - surface it in your
+spawn recipe before launching a 15-agent tree.
 
 ## Known limitations and field findings
 
-Findings from a two-session, ~30-agent stress test:
+Addressed by the 2026-08-05 pair work (see `docs/IMPROVEMENTS-2026-08-05-pair-session-retro.md`):
+hook/MCP identity unification via bind files, subagent child identities + PreToolUse drain
+guard, wait high-water baseline, board hide-gone + 2h GC, Grok hooks install, whoami /
+peek_messages, richer notice previews.
 
-- Subagent identity - Agent-tool subagents inherit the parent's `CLAUDE_CODE_SESSION_ID`, so
-  SessionStart never mints them a distinct coordinator name; a resumed session cannot register its
-  subagents into the mesh at all (a fresh session can - see the "Subagent identity" note in the
-  pasteable CLAUDE.md above).
-- Name collisions - simultaneous sibling spawns can independently land on the same adjective-animal
-  name; agents that keyed work files by display name saw those files clobbered between siblings.
-  Key durable artifacts by the stable `agent_id` instead.
-- `wait` is a wake signal, not a precise timer - it can return early on a residual (already-delivered)
-  notice, so treat exit 0 as "check now," not "mail is new," and confirm with `read_messages`.
+Remaining field notes:
+
+- Name collisions - simultaneous sibling spawns can still land on the same adjective-animal
+  base before suffixing; key durable artifacts by the stable `agent_id` instead of display name.
 - Under ~30-agent load the daemon's unix socket produced transient i/o timeouts on `send_message`;
   retry with backoff.
 - Broadcasts are one-shot (see Broadcast etiquette above) - an agent spawned after a broadcast fired
   never sees it; DM critical directives instead of relying on broadcast for late joiners.
 
-Proposed fixes are tracked in TODO.md.
+Further backlog (claims ledger, message journal, shared LSP) is tracked in the retro doc and TODO.md.
 
 ## Development
 

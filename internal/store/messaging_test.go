@@ -135,6 +135,113 @@ func TestUnreadCountIsReadOnly(t *testing.T) {
 	}
 }
 
+// Stale backlog must not count as "new mail" once wait arms on HighWater.
+func TestPeekMailAfterIDIgnoresStaleUnread(t *testing.T) {
+	s, nA, nB := twoAgents(t)
+	if err := s.Send("/r", nA, nB, "old-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Send("/r", nA, nB, "old-2"); err != nil {
+		t.Fatal(err)
+	}
+	base, err := s.PeekMail("/r", nB, 0)
+	if err != nil || base.Unread != 2 || base.HighWater == 0 {
+		t.Fatalf("baseline: %+v err=%v", base, err)
+	}
+	// Arming at HighWater: only messages with id > HighWater should appear.
+	stale, err := s.PeekMail("/r", nB, base.HighWater)
+	if err != nil || stale.Unread != 0 {
+		t.Fatalf("stale after high water must be empty: %+v err=%v", stale, err)
+	}
+	if err := s.Send("/r", nA, nB, "fresh"); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := s.PeekMail("/r", nB, base.HighWater)
+	if err != nil || fresh.Unread != 1 || len(fresh.IDs) != 1 {
+		t.Fatalf("want one fresh message: %+v err=%v", fresh, err)
+	}
+	if fresh.IDs[0] <= base.HighWater {
+		t.Fatalf("fresh id %d not above baseline %d", fresh.IDs[0], base.HighWater)
+	}
+	if len(fresh.Froms) != 1 || fresh.Froms[0] != nA {
+		t.Fatalf("want from %s, got %v", nA, fresh.Froms)
+	}
+	// HighWater advances after the new delivery.
+	if fresh.HighWater <= base.HighWater {
+		t.Fatalf("high water should advance: base=%d fresh=%d", base.HighWater, fresh.HighWater)
+	}
+}
+
+func TestNoticeCarriesIDAndPreview(t *testing.T) {
+	s, nA, nB := twoAgents(t)
+	long := "fix landed on main,\nplease rebase your branch " + strings.Repeat("x", 80)
+	if err := s.Send("/r", nA, nB, long); err != nil {
+		t.Fatal(err)
+	}
+	notices, err := s.PendingNotices("/r", "sess-b")
+	if err != nil || len(notices) != 1 {
+		t.Fatalf("notices: %v err=%v", notices, err)
+	}
+	n := notices[0]
+	var id int64
+	s.db.QueryRow(`SELECT MAX(id) FROM messages`).Scan(&id)
+	for _, want := range []string{nA, "1 new message", "(ids " + joinIDs([]int64{id}) + ")", `"fix landed on main, please rebase`, `..." - call read_messages`} {
+		if !strings.Contains(n, want) {
+			t.Fatalf("notice missing %q: %s", want, n)
+		}
+	}
+	if strings.Contains(n, "\n") {
+		t.Fatalf("newlines must be flattened: %q", n)
+	}
+	if strings.Contains(n, strings.Repeat("x", 80)) {
+		t.Fatalf("long body must be clipped to ~80 chars: %q", n)
+	}
+}
+
+func TestNoticeShortBodyUntruncated(t *testing.T) {
+	s, nA, nB := twoAgents(t)
+	if err := s.Send("/r", nA, nB, "short and sweet"); err != nil {
+		t.Fatal(err)
+	}
+	notices, _ := s.PendingNotices("/r", "sess-b")
+	if len(notices) != 1 || !strings.Contains(notices[0], `"short and sweet"`) || strings.Contains(notices[0], "...") {
+		t.Fatalf("short body must appear whole and unclipped: %v", notices)
+	}
+}
+
+func TestNoticeAggregatesIDsAndPreviewsNewest(t *testing.T) {
+	s, nA, nB := twoAgents(t)
+	if err := s.Send("/r", nA, nB, "older body"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Send("/r", nA, nB, "newest body"); err != nil {
+		t.Fatal(err)
+	}
+	notices, _ := s.PendingNotices("/r", "sess-b")
+	if len(notices) != 1 {
+		t.Fatalf("want one aggregated notice: %v", notices)
+	}
+	var lo, hi int64
+	s.db.QueryRow(`SELECT MIN(id), MAX(id) FROM messages`).Scan(&lo, &hi)
+	want := "(ids " + joinIDs([]int64{lo, hi}) + ")"
+	if !strings.Contains(notices[0], "2 new messages") || !strings.Contains(notices[0], want) ||
+		!strings.Contains(notices[0], `"newest body"`) {
+		t.Fatalf("aggregate notice wrong (want %s + newest preview): %v", want, notices)
+	}
+}
+
+func TestBroadcastNoticeCarriesPreview(t *testing.T) {
+	s, nA, _ := twoAgents(t)
+	if err := s.Broadcast("/r", nA, "release at noon"); err != nil {
+		t.Fatal(err)
+	}
+	notices, _ := s.PendingNotices("/r", "sess-b")
+	if len(notices) != 1 || !strings.Contains(notices[0], "broadcast from "+nA) ||
+		!strings.Contains(notices[0], `"release at noon"`) {
+		t.Fatalf("broadcast notice must carry the preview: %v", notices)
+	}
+}
+
 func TestSendToUnknownAgentFails(t *testing.T) {
 	s, nA, _ := twoAgents(t)
 	if err := s.Send("/r", nA, "nobody-here", "x"); err == nil {
@@ -205,5 +312,59 @@ func TestHousekeepPrunes(t *testing.T) {
 	s.db.QueryRow(`SELECT COUNT(*) FROM file_touches`).Scan(&n)
 	if n != 0 {
 		t.Fatalf("file_touches not pruned: %d", n)
+	}
+}
+
+// Mail from a purged sender must stay visible everywhere - peek, notices, and
+// read - labeled with the raw sender id once the name is gone.
+func TestMailFromPurgedSenderSurvives(t *testing.T) {
+	s, nA, nB := twoAgents(t)
+	if err := s.Send("/r", nA, nB, "still here"); err != nil {
+		t.Fatal(err)
+	}
+	senderID := agentID("sess-a")
+	if _, err := s.db.Exec(`DELETE FROM agents WHERE scope='/r' AND session_id='sess-a'`); err != nil {
+		t.Fatal(err)
+	}
+	peek, err := s.PeekMail("/r", nB, 0)
+	if err != nil || peek.Unread != 1 || len(peek.Froms) != 1 || peek.Froms[0] != senderID {
+		t.Fatalf("peek after sender purge: %+v err=%v", peek, err)
+	}
+	notices, err := s.PendingNotices("/r", "sess-b")
+	if err != nil || len(notices) != 1 || !strings.Contains(notices[0], senderID) {
+		t.Fatalf("notices after sender purge: %v err=%v", notices, err)
+	}
+	msgs, err := s.Read("/r", nB)
+	if err != nil || len(msgs) != 1 || msgs[0].Body != "still here" || msgs[0].From != senderID {
+		t.Fatalf("read after sender purge: %+v err=%v", msgs, err)
+	}
+}
+
+// Housekeep drops delivery rows whose recipient was purged, and only those.
+func TestHousekeepPurgesDeliveriesOfPurgedRecipients(t *testing.T) {
+	s, nA, nB := twoAgents(t)
+	if err := s.Send("/r", nA, nB, "to-b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Send("/r", nB, nA, "to-a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM agents WHERE scope='/r' AND session_id='sess-b'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Housekeep(); err != nil {
+		t.Fatal(err)
+	}
+	count := func(aid string) (n int) {
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM deliveries WHERE agent_id=?`, aid).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if n := count(agentID("sess-b")); n != 0 {
+		t.Fatalf("purged recipient keeps %d deliveries", n)
+	}
+	if n := count(agentID("sess-a")); n != 1 {
+		t.Fatalf("live recipient deliveries: %d", n)
 	}
 }

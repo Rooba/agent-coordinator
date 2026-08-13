@@ -21,12 +21,16 @@ func main() {
 		runMCP()
 	case "wait":
 		runWait(os.Args[2:])
+	case "join":
+		runJoin(os.Args[2:])
+	case "board":
+		runBoard(os.Args[2:])
 	case "install":
 		runInstall(os.Args[2:])
 	case "version":
 		fmt.Println(version)
 	default:
-		fmt.Fprintln(os.Stderr, "usage: agent-coordinator daemon|hook|mcp|wait <name>|install [--uninstall]|version")
+		fmt.Fprintln(os.Stderr, "usage: agent-coordinator daemon|hook|mcp|wait <name>|join|board|install [--uninstall]|version")
 		os.Exit(2)
 	}
 }

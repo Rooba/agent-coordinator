@@ -39,3 +39,4 @@ Thumbs.db
 /pkg/mod/
 
 /agent-coordinator
+/.ignore/

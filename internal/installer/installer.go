@@ -17,8 +17,13 @@ type hookEvent struct{ event, matcher string }
 var hookEvents = []hookEvent{
 	{"SessionStart", "startup|resume|clear|compact"},
 	{"UserPromptSubmit", ""},
+	// PreToolUse: subagent drain guard (blocks bare read_messages from
+	// subagents that share the parent session; fail-open otherwise).
+	{"PreToolUse", "mcp__agent-coordinator__read_messages|read_messages"},
 	{"PostToolUse", ""},
 	{"Stop", ""},
+	{"SubagentStart", ""},
+	{"SubagentStop", ""},
 	{"SessionEnd", ""},
 }
 
@@ -27,6 +32,24 @@ var codexHookEvents = []hookEvent{
 	{"UserPromptSubmit", ""},
 	{"PostToolUse", ""},
 	{"Stop", ""},
+}
+
+// grokHookEvents matches Claude's lifecycle set. Grok discovers hooks from
+// ~/.grok/hooks/*.json with the same JSON shape as Claude settings hooks.
+var grokHookEvents = []hookEvent{
+	{"SessionStart", "startup|resume|clear|compact"},
+	{"UserPromptSubmit", ""},
+	{"PreToolUse", "mcp__agent-coordinator__read_messages|use_tool|agent-coordinator__read_messages"},
+	{"PostToolUse", ""},
+	{"Stop", ""},
+	{"SubagentStart", ""},
+	{"SubagentStop", ""},
+	{"SessionEnd", ""},
+}
+
+// MergeGrokHooks merges coordinator hooks into a Grok ~/.grok/hooks/*.json file.
+func MergeGrokHooks(settings []byte, binPath string) ([]byte, bool, error) {
+	return mergeHooks(settings, binPath, grokHookEvents)
 }
 
 // hookCommand is the exact identity key for our entries in settings.json.
@@ -461,6 +484,11 @@ func Install(binPath, home string, run func(string, ...string) error) error {
 	if err := installHookConfig(filepath.Join(home, ".codex", "hooks.json"), binPath, MergeCodexHooks); err != nil {
 		return err
 	}
+	// Grok: dedicated hooks file (not only Claude-compat import). Field sessions
+	// that only had MCP registered never got SessionStart name injection.
+	if err := installHookConfig(filepath.Join(home, ".grok", "hooks", "agent-coordinator.json"), binPath, MergeGrokHooks); err != nil {
+		return err
+	}
 	if err := registerMCPClients(binPath, run); err != nil {
 		return err
 	}
@@ -483,6 +511,15 @@ func Uninstall(binPath, home string, run func(string, ...string) error) error {
 	}
 	uninstallHookConfig(filepath.Join(home, ".claude", "settings.json"), binPath)
 	uninstallHookConfig(filepath.Join(home, ".codex", "hooks.json"), binPath)
+	grokHooksPath := filepath.Join(home, ".grok", "hooks", "agent-coordinator.json")
+	uninstallHookConfig(grokHooksPath, binPath)
+	// Dedicated Grok hooks file is ours alone: remove it when empty after strip.
+	if b, err := os.ReadFile(grokHooksPath); err == nil {
+		trimmed := strings.TrimSpace(string(b))
+		if trimmed == "" || trimmed == "{}" || trimmed == `{"hooks": {}}` {
+			os.Remove(grokHooksPath)
+		}
+	}
 	unregisterMCPClients(run)
 	if err := uninstallOpenCode(binPath, home); err != nil {
 		fmt.Fprintln(os.Stderr, "note: OpenCode MCP config:", err)

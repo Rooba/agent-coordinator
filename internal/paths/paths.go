@@ -22,3 +22,14 @@ func DB() (string, error) {
 	}
 	return defaultDB()
 }
+
+// BindDir returns the directory of hook-to-MCP identity bind files, next to
+// the state database, creating it.
+func BindDir() (string, error) {
+	db, err := DB()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(filepath.Dir(db), "bind")
+	return dir, os.MkdirAll(dir, 0o700)
+}
