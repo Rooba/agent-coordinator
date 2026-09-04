@@ -237,8 +237,11 @@ func handle(conn net.Conn, st *store.Store, gate *relayGate) {
 	conn.Write(append(out, '\n'))
 }
 
+// fail is the one place a failure becomes a response, so every op answers an
+// error the same way.
+func fail(err error) protocol.Response { return protocol.Response{Error: err.Error()} }
+
 func dispatch(st *store.Store, req protocol.Request) protocol.Response {
-	fail := func(err error) protocol.Response { return protocol.Response{Error: err.Error()} }
 	// Requests carrying the subagent AgentID target the CHILD row derived from
 	// the parent SessionID: register/refresh it up front and retarget the op.
 	childSession := ""
@@ -355,25 +358,14 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 		if err != nil {
 			return fail(err)
 		}
-		launches, err := pendingLaunches(st, req)
-		if err != nil {
-			return fail(err)
-		}
-		return protocol.Response{OK: true, Messages: prependLaunches(launches, msgs)}
+		return withPending(st, req, protocol.Response{OK: true, Messages: msgs})
 	case protocol.OpPeek:
 		info, err := st.PeekMail(req.Scope, req.From, req.AfterID)
 		if err != nil {
 			return fail(err)
 		}
-		launches, err := pendingLaunches(st, req)
-		if err != nil {
-			return fail(err)
-		}
-		info = mergeLaunches(launches, info)
-		return protocol.Response{
-			OK: true, Unread: info.Unread, HighWater: info.HighWater,
-			PeekIDs: info.IDs, PeekFroms: info.Froms,
-		}
+		return withPending(st, req, protocol.Response{OK: true, Unread: info.Unread,
+			HighWater: info.HighWater, PeekIDs: info.IDs, PeekFroms: info.Froms})
 	case protocol.OpBroadcast:
 		if err := st.Broadcast(req.Scope, req.From, req.Body); err != nil {
 			return fail(err)

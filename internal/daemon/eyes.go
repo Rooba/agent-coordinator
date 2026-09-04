@@ -8,8 +8,9 @@ import (
 	"github.com/Rooba/agent-coordinator/internal/store"
 )
 
-// sendOps are the ops that carry a body, and so the ops a task report can
-// arrive on. A broker replies to a launch like it replies to anything else.
+// sendOps are the ops that carry a body: the ops a task report can arrive on,
+// and the ops whose task id the relay gate strips. A broker replies to a
+// launch like it replies to anything else.
 var sendOps = map[string]bool{
 	protocol.OpSend: true, protocol.OpBroadcast: true, protocol.OpSendWorkspace: true,
 }
@@ -29,7 +30,7 @@ func requestEyes(st *store.Store, req protocol.Request, actor protocol.AgentRef)
 	task, launcher, err := st.AssignEyesTask(store.EyesRequest{Requester: actor,
 		Runtime: req.Runtime, Brief: req.Brief, DeadlineS: req.DeadlineS})
 	if err != nil {
-		return protocol.Response{Error: err.Error()}
+		return fail(err)
 	}
 	return protocol.Response{OK: true, TaskID: task.TaskID, Launcher: &launcher}
 }
@@ -40,7 +41,7 @@ func requestEyes(st *store.Store, req protocol.Request, actor protocol.AgentRef)
 func cancelEyes(st *store.Store, req protocol.Request, actor protocol.AgentRef) protocol.Response {
 	task, err := st.CancelEyesTask(req.TaskID, actor)
 	if err != nil {
-		return protocol.Response{Error: err.Error()}
+		return fail(err)
 	}
 	return protocol.Response{OK: true, TaskID: task.TaskID}
 }
@@ -72,58 +73,70 @@ func taskReport(st *store.Store, req protocol.Request) (protocol.Response, bool)
 	return protocol.Response{OK: true, TaskID: body.TaskID}, true
 }
 
-// pendingLaunches are the launches this caller was handed and has not acked.
-// Redelivery is at-least-once on purpose: a broker that lost a poll must see
-// the work again, and dropping a duplicate by task id is its job.
-func pendingLaunches(st *store.Store, req protocol.Request) ([]protocol.Message, error) {
+// pendingTaskMail is what this broker still owes an answer for: launches it
+// has not acked, plus cancels it has not reported on. Redelivery is
+// at-least-once on purpose - a broker that lost a poll must see the work
+// again, and dropping a duplicate by task id is its job.
+func pendingTaskMail(st *store.Store, req protocol.Request) ([]protocol.Message, error) {
+	// The store scopes both queues to the tasks assigned to this session, so
+	// nobody else's work can appear here; the kind check is only a fast path
+	// that keeps an ordinary agent's poll out of the ledger.
 	if req.Kind != protocol.KindLauncher {
-		return nil, nil // only a proven launcher row has launches to redeliver
+		return nil, nil
 	}
-	return st.PendingLaunches(req.SessionID)
+	launches, err := st.PendingLaunches(req.SessionID)
+	if err != nil {
+		return nil, err
+	}
+	cancels, err := st.PendingCancels(req.SessionID)
+	if err != nil {
+		return nil, err
+	}
+	return append(launches, cancels...), nil
 }
 
-// prependLaunches puts the unacked launches first, without repeating one the
-// same poll already returned.
-func prependLaunches(launches, msgs []protocol.Message) []protocol.Message {
-	if len(launches) == 0 {
-		return msgs
+// withPending folds that redelivery queue into a read or a peek reply, ahead
+// of the fresh mail and never twice - whatever this same poll already carries
+// is dropped from it.
+func withPending(st *store.Store, req protocol.Request, resp protocol.Response) protocol.Response {
+	pending, err := pendingTaskMail(st, req)
+	if err != nil {
+		return fail(err)
 	}
-	fresh := make(map[int64]bool, len(msgs))
-	for _, m := range msgs {
-		fresh[m.ID] = true
+	if len(pending) == 0 {
+		return resp // the ordinary poll, untouched
 	}
-	out := make([]protocol.Message, 0, len(launches)+len(msgs))
-	for _, l := range launches {
-		if !fresh[l.ID] {
-			out = append(out, l)
+	seen := make(map[int64]bool, len(resp.Messages)+len(resp.PeekIDs))
+	for _, m := range resp.Messages {
+		seen[m.ID] = true
+	}
+	for _, id := range resp.PeekIDs {
+		seen[id] = true
+	}
+	owed := make([]protocol.Message, 0, len(pending))
+	for _, m := range pending {
+		if !seen[m.ID] {
+			seen[m.ID] = true
+			owed = append(owed, m)
 		}
 	}
-	return append(out, msgs...)
-}
-
-// mergeLaunches folds the unacked launches into a peek summary. They count as
-// unread on every poll, read or not, because a broker long-polls with peek and
-// must be woken about work it still owes an ack.
-func mergeLaunches(launches []protocol.Message, info store.PeekInfo) store.PeekInfo {
-	if len(launches) == 0 {
-		return info // the ordinary poll, untouched
+	if len(owed) == 0 {
+		return resp // this poll already carries all of it
 	}
-	out := store.PeekInfo{HighWater: info.HighWater}
-	for _, l := range launches {
-		if slices.Contains(info.IDs, l.ID) {
-			continue
-		}
-		out.IDs = append(out.IDs, l.ID)
-		if !slices.Contains(out.Froms, l.From) {
-			out.Froms = append(out.Froms, l.From)
+	if req.Op == protocol.OpRead {
+		resp.Messages = append(owed, resp.Messages...)
+		return resp
+	}
+	// Owed work counts as unread on every peek, read or not, because a broker
+	// long-polls with peek and must be woken about what it still owes.
+	ids := make([]int64, 0, len(owed)+len(resp.PeekIDs))
+	for _, m := range owed {
+		ids = append(ids, m.ID)
+		if !slices.Contains(resp.PeekFroms, m.From) {
+			resp.PeekFroms = append(resp.PeekFroms, m.From)
 		}
 	}
-	out.IDs = append(out.IDs, info.IDs...)
-	for _, from := range info.Froms {
-		if !slices.Contains(out.Froms, from) {
-			out.Froms = append(out.Froms, from)
-		}
-	}
-	out.Unread = len(out.IDs)
-	return out
+	resp.PeekIDs = append(ids, resp.PeekIDs...)
+	resp.Unread = len(resp.PeekIDs)
+	return resp
 }

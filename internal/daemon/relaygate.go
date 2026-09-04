@@ -108,8 +108,7 @@ func (g *relayGate) decide(req *protocol.Request) (protocol.Response, bool) {
 	req.Scope, req.From, req.Kind, req.AgentID = id.Scope, id.Name, id.Kind, ""
 	// A task id belongs to the eyes lifecycle, so ordinary mail never carries
 	// one a relay client chose.
-	switch req.Op {
-	case protocol.OpSend, protocol.OpBroadcast, protocol.OpSendWorkspace:
+	if sendOps[req.Op] {
 		req.TaskID = ""
 	}
 	return protocol.Response{}, false

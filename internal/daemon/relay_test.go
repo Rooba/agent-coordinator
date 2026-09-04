@@ -747,17 +747,19 @@ func tcpHangUp(t *testing.T, addr string, req protocol.Request) {
 	}
 }
 
-// awaitRow waits for a row a hung-up request wrote, so a retry never races
-// the handler that is still finishing the first call.
-func awaitRow(t *testing.T, st *store.Store, scope, session string) {
+// awaitRow waits for the row a hung-up request wrote and hands it back, so a
+// retry never races the handler still finishing the first call - and a test
+// can check the retry answers as the identity that lost response carried.
+func awaitRow(t *testing.T, st *store.Store, scope, session string) store.AgentIdentity {
 	t.Helper()
 	for i := 0; i < 200; i++ {
-		if _, err := st.Identity(scope, session); err == nil {
-			return
+		if id, err := st.Identity(scope, session); err == nil {
+			return id
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("no row for %s/%s", scope, session)
+	return store.AgentIdentity{}
 }
 
 // The whole happy path a requester sees: a task id, the broker that took it,
@@ -994,10 +996,10 @@ func TestRelayRegisterSurvivesALostResponse(t *testing.T) {
 		Kind: protocol.KindLauncher, Capabilities: []string{"browser.chrome", "provider.claude"},
 		Token: tok, SessionSecret: secret}
 	tcpHangUp(t, addr, launcher)
-	awaitRow(t, st, "host:BOX", "broker-1")
+	written := awaitRow(t, st, "host:BOX", "broker-1")
 	retry := tcpRoundTrip(t, addr, launcher)
-	if !retry.OK || !hex12(retry.AgentID) {
-		t.Fatalf("the exact retry must succeed: %+v", retry)
+	if !retry.OK || !hex12(retry.AgentID) || retry.Name != written.Name || retry.AgentID != written.AgentID {
+		t.Fatalf("the exact retry must answer as the row the lost call wrote %+v: %+v", written, retry)
 	}
 	a := registerUnix(t, sock, "/r", "s-a")
 	req := roundTrip(t, sock, protocol.Request{Op: protocol.OpRequestEyes, Scope: "/r",
@@ -1010,13 +1012,140 @@ func TestRelayRegisterSurvivesALostResponse(t *testing.T) {
 	tcpHangUp(t, addr, child)
 	awaitRow(t, st, "/r", "eyes-"+req.TaskID)
 	// The child's secret was lost with the response, so the retry mints
-	// another one - and that one is what drives the child.
-	reissued := tcpRoundTrip(t, addr, child)
-	if !reissued.OK || len(reissued.SessionSecret) != 64 {
-		t.Fatalf("the child must be re-minted: %+v", reissued)
+	// another one - and every reissue is the same child with a fresh
+	// credential, the newest of which is the only one that still works.
+	first := tcpRoundTrip(t, addr, child)
+	if !first.OK || len(first.SessionSecret) != 64 {
+		t.Fatalf("the child must be re-minted: %+v", first)
 	}
-	if r := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpPeek, SessionID: "eyes-" + req.TaskID,
-		Token: tok, SessionSecret: reissued.SessionSecret}); !r.OK {
-		t.Fatalf("the reissued secret must drive the child: %+v", r)
+	second := tcpRoundTrip(t, addr, child)
+	if !second.OK || second.Name != first.Name || second.AgentID != first.AgentID ||
+		second.SessionSecret == first.SessionSecret || len(second.SessionSecret) != 64 {
+		t.Fatalf("a second reissue must re-mint the same child: %+v", second)
+	}
+	peek := func(secret string) protocol.Response {
+		return tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpPeek,
+			SessionID: "eyes-" + req.TaskID, Token: tok, SessionSecret: secret})
+	}
+	if r := peek(first.SessionSecret); r.OK || r.Error != "unauthorized" {
+		t.Fatalf("a superseded secret must be dead: %+v", r)
+	}
+	if r := peek(second.SessionSecret); !r.OK {
+		t.Fatalf("the newest secret must drive the child: %+v", r)
+	}
+}
+
+// A cancel is redelivered until the broker reports the task settled: the
+// provider may still be running, so a lost poll must not lose the notice.
+// The terminal report is the acknowledgement - it stops the redelivery and
+// tells the requester nothing it does not already know.
+func TestLauncherPollRedeliversAnUnackedCancel(t *testing.T) {
+	sock, addr, tok := startRelayDaemon(t)
+	a := registerUnix(t, sock, "/r", "s-a")
+	_, secret := registerLauncher(t, addr, tok, "broker-1", "host:BOX")
+	req := roundTrip(t, sock, protocol.Request{Op: protocol.OpRequestEyes, Scope: "/r",
+		SessionID: "s-a", From: a.Name, Brief: "b"})
+	if !req.OK {
+		t.Fatalf("request_eyes: %+v", req)
+	}
+	poll := func(op string) protocol.Response {
+		return tcpRoundTrip(t, addr, protocol.Request{Op: op, SessionID: "broker-1",
+			Token: tok, SessionSecret: secret})
+	}
+	if r := poll(protocol.OpRead); len(r.Messages) != 1 {
+		t.Fatalf("the launch: %+v", r.Messages)
+	}
+	child := "eyes-" + req.TaskID
+	minted := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpRegister, Scope: "/r",
+		SessionID: child, Kind: protocol.KindEyes, Token: tok,
+		AuthSessionID: "broker-1", SessionSecret: secret})
+	if !minted.OK {
+		t.Fatalf("child register: %+v", minted)
+	}
+	accepted, err := json.Marshal(protocol.TaskAcceptedMsg{Type: protocol.TaskAccepted, TaskID: req.TaskID,
+		Child: &protocol.AgentRef{Name: minted.Name, AgentID: minted.AgentID, Scope: "/r"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpSendWorkspace, SessionID: "broker-1",
+		Token: tok, SessionSecret: secret, Body: string(accepted)}); !r.OK {
+		t.Fatalf("task.accepted: %+v", r)
+	}
+	if c := roundTrip(t, sock, protocol.Request{Op: protocol.OpCancelEyes, Scope: "/r",
+		SessionID: "s-a", From: a.Name, TaskID: req.TaskID}); !c.OK {
+		t.Fatalf("cancel_eyes: %+v", c)
+	}
+	first := poll(protocol.OpRead)
+	if len(first.Messages) != 1 || first.Messages[0].TaskID != req.TaskID {
+		t.Fatalf("the cancel reaches the broker exactly once: %+v", first.Messages)
+	}
+	again := poll(protocol.OpRead)
+	if len(again.Messages) != 1 || again.Messages[0].ID != first.Messages[0].ID {
+		t.Fatalf("an unanswered cancel must come back: %+v", again.Messages)
+	}
+	if p := poll(protocol.OpPeek); p.Unread != 1 || len(p.PeekIDs) != 1 || p.PeekIDs[0] != first.Messages[0].ID {
+		t.Fatalf("peek must show the unanswered cancel: %+v", p)
+	}
+	failed, err := json.Marshal(protocol.TaskFailedMsg{Type: protocol.TaskFailed,
+		TaskID: req.TaskID, Error: "cancelled"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpSendWorkspace, SessionID: child,
+		Token: tok, SessionSecret: minted.SessionSecret, Body: string(failed)}); !r.OK {
+		t.Fatalf("the child answers the cancel: %+v", r)
+	}
+	if done := poll(protocol.OpRead); len(done.Messages) != 0 {
+		t.Fatalf("an answered cancel must stop coming back: %+v", done.Messages)
+	}
+	if p := poll(protocol.OpPeek); p.Unread != 0 {
+		t.Fatalf("peek after the answer: %+v", p)
+	}
+	// The requester asked for the cancel, so the report that acknowledges it
+	// is not news: its inbox holds the ack it was already sent, and nothing
+	// the acknowledgement added.
+	read := roundTrip(t, sock, protocol.Request{Op: protocol.OpRead, Scope: "/r", From: a.Name})
+	if len(read.Messages) != 1 || read.Messages[0].Body != string(accepted) {
+		t.Fatalf("requester inbox: %+v", read.Messages)
+	}
+}
+
+// The task.* bodies are the lifecycle's, not mail's: an agent with no
+// standing in a task cannot move it and delivers nothing by trying, while
+// anything that is not a task body travels as the ordinary mail it is.
+func TestPlainMailCannotSpeakForATask(t *testing.T) {
+	sock, addr, tok := startRelayDaemon(t)
+	a := registerUnix(t, sock, "/r", "s-a")
+	b := registerUnix(t, sock, "/r", "s-b")
+	registerLauncher(t, addr, tok, "broker-1", "host:BOX")
+	req := roundTrip(t, sock, protocol.Request{Op: protocol.OpRequestEyes, Scope: "/r",
+		SessionID: "s-a", From: a.Name, Brief: "b"})
+	if !req.OK {
+		t.Fatalf("request_eyes: %+v", req)
+	}
+	send := func(body string) protocol.Response {
+		return roundTrip(t, sock, protocol.Request{Op: protocol.OpSend, Scope: "/r",
+			SessionID: "s-b", From: b.Name, To: a.Name, Body: body})
+	}
+	result, err := json.Marshal(protocol.TaskResultMsg{Type: protocol.TaskResult,
+		TaskID: req.TaskID, Status: "ok", Summary: "mine now"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := send(string(result)); r.OK || r.Error != "not your task" {
+		t.Fatalf("only the task's own child reports for it: %+v", r)
+	}
+	if r := send(`{"type":"task.result","task_id":"task-000000000000"}`); r.OK || r.Error != "unknown task" {
+		t.Fatalf("a task id nobody minted: %+v", r)
+	}
+	if r := send("just talking"); !r.OK {
+		t.Fatalf("plain mail: %+v", r)
+	}
+	if r := send(`{"type":"note","task_id":"task-000000000000"}`); !r.OK {
+		t.Fatalf("json that is not a task body: %+v", r)
+	}
+	read := roundTrip(t, sock, protocol.Request{Op: protocol.OpRead, Scope: "/r", From: a.Name})
+	if len(read.Messages) != 2 || read.Messages[0].Body != "just talking" {
+		t.Fatalf("a refused report must deliver nothing: %+v", read.Messages)
 	}
 }
