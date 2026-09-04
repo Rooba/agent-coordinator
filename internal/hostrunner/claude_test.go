@@ -69,6 +69,7 @@ func TestClaudeProviderParsesStructuredOutput(t *testing.T) {
 	stdout, err := json.Marshal(map[string]any{
 		"type":              "result",
 		"subtype":           "success",
+		"is_error":          false,
 		"structured_output": want,
 	})
 	if err != nil {
@@ -82,7 +83,10 @@ func TestClaudeProviderParsesStructuredOutput(t *testing.T) {
 	for _, invalid := range [][]byte{
 		[]byte(`{"type":"result"}`),
 		append(stdout, []byte(` {}`)...),
-		[]byte(`{"structured_output":{"status":"succeeded"}}`),
+		[]byte(`{"type":"result","subtype":"success","structured_output":{"status":"succeeded"}}`),
+		[]byte(`{"type":"assistant","subtype":"success","structured_output":{"status":"succeeded"}}`),
+		[]byte(`{"type":"result","subtype":"error","structured_output":{"status":"succeeded"}}`),
+		[]byte(`{"type":"result","subtype":"success","is_error":true,"structured_output":{"status":"succeeded"}}`),
 	} {
 		if _, err := parseClaudeReport(invalid); !errors.Is(err, ErrInvalidReport) {
 			t.Fatalf("invalid Claude output error = %v", err)

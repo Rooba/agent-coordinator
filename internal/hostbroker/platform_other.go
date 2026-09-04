@@ -12,6 +12,10 @@ func OpenPlatformCredentialStore() (CredentialStore, error) { return nil, ErrUns
 
 func OpenPlatformJournal() (Journal, error) { return nil, ErrUnsupported }
 
+func OpenPlatformConfigStore() (ConfigStore, error) { return nil, ErrUnsupported }
+
+func AcquirePlatformLock() (Unlock, error) { return nil, ErrUnsupported }
+
 func ManageAutostart(context.Context, ScheduleAction, string, bool) (SchedulePlan, error) {
 	return SchedulePlan{}, ErrUnsupported
 }

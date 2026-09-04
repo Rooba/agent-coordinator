@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"unicode"
 )
 
@@ -25,10 +26,11 @@ type Credential struct {
 
 type CredentialStore interface {
 	Load(context.Context) (Credential, error)
-	Save(context.Context, Credential) error
+	Update(context.Context, func(*Credential) error) error
 }
 
 type FileCredentialStore struct {
+	mu        sync.Mutex
 	path      string
 	protector Protector
 }
@@ -65,6 +67,25 @@ func (s *FileCredentialStore) Save(_ context.Context, credential Credential) err
 		return fmt.Errorf("seal host credential: %w", err)
 	}
 	return writeProtected(s.path, sealed)
+}
+
+func (s *FileCredentialStore) Update(ctx context.Context, update func(*Credential) error) error {
+	if update == nil {
+		return errors.New("credential update is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	credential, err := s.Load(ctx)
+	if errors.Is(err, ErrCredentialNotFound) {
+		credential, err = Credential{}, nil
+	}
+	if err == nil {
+		err = update(&credential)
+	}
+	if err != nil {
+		return err
+	}
+	return s.Save(ctx, credential)
 }
 
 func encodeCredential(credential Credential) ([]byte, error) {
@@ -112,18 +133,16 @@ func Pair(ctx context.Context, store CredentialStore, source io.Reader) error {
 	if err := validateToken(value); err != nil {
 		return err
 	}
-	credential, err := store.Load(ctx)
-	if err != nil && !errors.Is(err, ErrCredentialNotFound) {
-		return err
-	}
-	if credential.LauncherSession == "" {
-		credential.LauncherSession, err = newLauncherSession()
-		if err != nil {
-			return err
+	return store.Update(ctx, func(credential *Credential) error {
+		if credential.LauncherSession == "" {
+			credential.LauncherSession, err = newLauncherSession()
+			if err != nil {
+				return err
+			}
 		}
-	}
-	credential.Token = value
-	return store.Save(ctx, credential)
+		credential.Token = value
+		return credential.Validate()
+	})
 }
 
 var ErrCredentialNotFound = errors.New("host relay is not paired")

@@ -4,6 +4,7 @@ package hostbroker
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -20,10 +21,11 @@ type dpapiProtector struct {
 }
 
 const (
-	credentialTarget  = "Rooba_agent-coordinator_hostbroker_v1"
-	credTypeGeneric   = 1
-	credPersistLocal  = 2
-	credentialMaxBlob = 2560
+	credentialTarget   = "Rooba_agent-coordinator_hostbroker_v1"
+	credTypeGeneric    = 1
+	credPersistLocal   = 2
+	credentialMaxBlob  = 2560
+	taskNotRunningCode = 0x8004130b
 )
 
 var (
@@ -51,6 +53,7 @@ type credentialW struct {
 type windowsCredentialStore struct {
 	read  func() ([]byte, error)
 	write func([]byte) error
+	lock  func(context.Context) (Unlock, error)
 }
 
 func (s windowsCredentialStore) Load(context.Context) (Credential, error) {
@@ -85,12 +88,34 @@ func readCredentialBlob() ([]byte, error) {
 	return append([]byte(nil), unsafe.Slice(raw.CredentialBlob, int(raw.CredentialBlobSize))...), nil
 }
 
-func (s windowsCredentialStore) Save(_ context.Context, credential Credential) error {
+func (s windowsCredentialStore) save(credential Credential) error {
 	data, err := encodeCredential(credential)
 	if err != nil {
 		return err
 	}
 	return s.write(data)
+}
+
+func (s windowsCredentialStore) Update(ctx context.Context, update func(*Credential) error) error {
+	if update == nil {
+		return errors.New("credential update is required")
+	}
+	unlock, err := s.lock(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	credential, err := s.Load(ctx)
+	if errors.Is(err, ErrCredentialNotFound) {
+		credential, err = Credential{}, nil
+	}
+	if err == nil {
+		err = update(&credential)
+	}
+	if err != nil {
+		return err
+	}
+	return s.save(credential)
 }
 
 func writeCredentialBlob(data []byte) error {
@@ -161,21 +186,102 @@ func OpenPlatformState() (CredentialStore, Journal, error) {
 }
 
 func OpenPlatformCredentialStore() (CredentialStore, error) {
-	return windowsCredentialStore{read: readCredentialBlob, write: writeCredentialBlob}, nil
+	return windowsCredentialStore{read: readCredentialBlob, write: writeCredentialBlob, lock: acquireCredentialLock}, nil
+}
+
+func acquireCredentialLock(ctx context.Context) (Unlock, error) {
+	name, err := currentUserMutexName("credential")
+	if err != nil {
+		return nil, err
+	}
+	handle, err := windows.CreateMutex(nil, false, name)
+	if err != nil && !errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		return nil, err
+	}
+	for {
+		event, waitErr := windows.WaitForSingleObject(handle, 100)
+		switch event {
+		case windows.WAIT_OBJECT_0, windows.WAIT_ABANDONED:
+			return releaseMutex(handle), nil
+		case 258: // WAIT_TIMEOUT
+			if err := ctx.Err(); err != nil {
+				_ = windows.CloseHandle(handle)
+				return nil, err
+			}
+		default:
+			_ = windows.CloseHandle(handle)
+			return nil, waitErr
+		}
+	}
 }
 
 func OpenPlatformJournal() (Journal, error) {
+	return newPlatformJournal("host.journal")
+}
+
+func OpenPlatformConfigStore() (ConfigStore, error) {
+	return newPlatformConfigStore("host.config")
+}
+
+func newPlatformJournal(name string) (Journal, error) {
 	base, err := os.UserCacheDir()
 	if err != nil {
 		return nil, err
 	}
 	dir := filepath.Join(base, "agent-coordinator")
 	protector := dpapiProtector{protect: protectData}
-	journal, err := NewFileJournal(filepath.Join(dir, "host.journal"), protector)
+	journal, err := NewFileJournal(filepath.Join(dir, name), protector)
 	if err != nil {
 		return nil, err
 	}
 	return journal, nil
+}
+
+func newPlatformConfigStore(name string) (ConfigStore, error) {
+	base, err := os.UserCacheDir()
+	if err != nil {
+		return nil, err
+	}
+	return NewFileConfigStore(filepath.Join(base, "agent-coordinator", name), dpapiProtector{protect: protectData})
+}
+
+func AcquirePlatformLock() (Unlock, error) {
+	name, err := currentUserMutexName("instance")
+	if err != nil {
+		return nil, err
+	}
+	handle, err := windows.CreateMutex(nil, true, name)
+	if errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		_ = windows.CloseHandle(handle)
+		return nil, ErrBrokerAlreadyRunning
+	}
+	if err != nil {
+		if handle != 0 {
+			_ = windows.CloseHandle(handle)
+		}
+		return nil, err
+	}
+	return releaseMutex(handle), nil
+}
+
+func currentUserMutexName(purpose string) (*uint16, error) {
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		return nil, err
+	}
+	hash := sha256.Sum256([]byte(user.User.Sid.String()))
+	return windows.UTF16PtrFromString(fmt.Sprintf(`Global\Rooba_agent-coordinator_hostbroker_%s_%x`, purpose, hash[:8]))
+}
+
+func releaseMutex(handle windows.Handle) Unlock {
+	return func() error {
+		releaseErr := windows.ReleaseMutex(handle)
+		closeErr := windows.CloseHandle(handle)
+		if releaseErr != nil {
+			return releaseErr
+		}
+		return closeErr
+	}
 }
 
 func ManageAutostart(ctx context.Context, action ScheduleAction, executable string, dryRun bool) (SchedulePlan, error) {
@@ -194,6 +300,10 @@ func ManageAutostart(ctx context.Context, action ScheduleAction, executable stri
 		func(ctx context.Context, executable string, args ...string) error {
 			output, err := exec.CommandContext(ctx, executable, args...).CombinedOutput()
 			if err != nil {
+				var exit *exec.ExitError
+				if errors.As(err, &exit) && uint32(exit.ExitCode()) == taskNotRunningCode {
+					return errTaskNotRunning
+				}
 				return fmt.Errorf("Task Scheduler command failed: %w: %s", err, string(output))
 			}
 			return nil

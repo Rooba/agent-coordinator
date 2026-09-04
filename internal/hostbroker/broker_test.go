@@ -22,10 +22,11 @@ var (
 )
 
 type memoryCredentials struct {
-	mu        sync.Mutex
-	value     Credential
-	saves     int
-	failSaves int
+	mu             sync.Mutex
+	value          Credential
+	saves          int
+	failSaves      int
+	tokenOnFailure string
 }
 
 func (s *memoryCredentials) Load(context.Context) (Credential, error) {
@@ -34,24 +35,31 @@ func (s *memoryCredentials) Load(context.Context) (Credential, error) {
 	return s.value, nil
 }
 
-func (s *memoryCredentials) Save(_ context.Context, value Credential) error {
+func (s *memoryCredentials) Update(_ context.Context, update func(*Credential) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.saves++
 	if s.failSaves > 0 {
 		s.failSaves--
+		if s.tokenOnFailure != "" {
+			s.value.Token = s.tokenOnFailure
+		}
 		return errors.New("credential store unavailable")
 	}
-	s.value = value
-	return nil
+	return update(&s.value)
 }
 
 type memoryJournal struct {
-	mu      sync.Mutex
-	records map[string]TaskRecord
+	mu        sync.Mutex
+	records   map[string]TaskRecord
+	puts      map[string]int
+	failState string
+	failPuts  int
 }
 
-func newMemoryJournal() *memoryJournal { return &memoryJournal{records: make(map[string]TaskRecord)} }
+func newMemoryJournal() *memoryJournal {
+	return &memoryJournal{records: make(map[string]TaskRecord), puts: make(map[string]int)}
+}
 
 func (j *memoryJournal) Get(id string) (TaskRecord, bool) {
 	j.mu.Lock()
@@ -63,6 +71,11 @@ func (j *memoryJournal) Get(id string) (TaskRecord, bool) {
 func (j *memoryJournal) Put(record TaskRecord) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	j.puts[record.State]++
+	if record.State == j.failState && j.failPuts > 0 {
+		j.failPuts--
+		return errors.New("journal unavailable")
+	}
 	j.records[record.Launch.TaskID] = record
 	return nil
 }
@@ -119,6 +132,10 @@ func launchMessage(id string) protocol.TaskLaunchMsg {
 	}
 }
 
+func successReportForBroker() hostrunner.Report {
+	return hostrunner.Report{Status: hostrunner.ReportSucceeded, Summary: "done", Observations: []string{}, Actions: []string{}, Evidence: []string{}}
+}
+
 func messageBody(t *testing.T, value any) string {
 	t.Helper()
 	data, err := json.Marshal(value)
@@ -144,6 +161,9 @@ func testOptions() Options {
 		ComputerName: "TESTHOST", DefaultProvider: "claude", PollInterval: 100 * time.Millisecond,
 		BackoffMin: time.Millisecond, BackoffMax: 4 * time.Millisecond,
 		Jitter: func(time.Duration) time.Duration { return 0 },
+		AcquireLock: func() (Unlock, error) {
+			return func() error { return nil }, nil
+		},
 		Sleep: func(ctx context.Context, _ time.Duration) error {
 			runtime.Gosched()
 			select {
@@ -153,6 +173,49 @@ func testOptions() Options {
 				return nil
 			}
 		},
+	}
+}
+
+func TestBrokerRefusesSecondProcessBeforeRegistration(t *testing.T) {
+	calls := 0
+	opts := testOptions()
+	opts.AcquireLock = func() (Unlock, error) { return nil, ErrBrokerAlreadyRunning }
+	broker, err := New(relayFunc(func(context.Context, Session, protocol.Request) (protocol.Response, error) {
+		calls++
+		return protocol.Response{OK: true}, nil
+	}), &memoryCredentials{}, newMemoryJournal(), &fakeRunner{}, func(context.Context) ([]string, error) { return nil, nil }, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.Run(context.Background()); !errors.Is(err, ErrBrokerAlreadyRunning) {
+		t.Fatalf("Run error = %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("relay called %d times before lock", calls)
+	}
+}
+
+func TestBrokerReleasesInstanceLockAfterShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	releases := 0
+	opts := testOptions()
+	opts.AcquireLock = func() (Unlock, error) { return func() error { releases++; return nil }, nil }
+	relay := relayFunc(func(_ context.Context, _ Session, request protocol.Request) (protocol.Response, error) {
+		if request.Op == protocol.OpRegister {
+			return protocol.Response{OK: true, Name: "host"}, nil
+		}
+		if request.Op == protocol.OpRead {
+			cancel()
+		}
+		return protocol.Response{OK: true}, nil
+	})
+	broker, err := New(relay, &memoryCredentials{value: Credential{Token: testToken, LauncherSession: "launcher", SessionSecret: testLauncherSecret}},
+		newMemoryJournal(), &fakeRunner{}, func(context.Context) ([]string, error) { return nil, nil }, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.Run(ctx); !errors.Is(err, context.Canceled) || releases != 1 {
+		t.Fatalf("Run = %v, lock releases = %d", err, releases)
 	}
 }
 
@@ -173,12 +236,18 @@ func TestBrokerResultAndFailureUseOwnedIdentities(t *testing.T) {
 			launch := launchMessage("task-000000000001")
 			store := &memoryCredentials{value: Credential{Token: testToken, LauncherSession: "launcher-fixed"}}
 			journal, runner := newMemoryJournal(), &fakeRunner{result: test.result, err: test.err}
+			journal.failState = recordTerminal
+			if test.name == "invalid report" {
+				journal.failState = recordDelivered
+			}
+			journal.failPuts = 1
 			var mu sync.Mutex
 			var calls []struct {
 				session Session
 				request protocol.Request
 			}
 			var terminalBodies []string
+			rotatedToken := strings.Repeat("z", 64)
 			read := false
 			relay := relayFunc(func(_ context.Context, session Session, request protocol.Request) (protocol.Response, error) {
 				mu.Lock()
@@ -207,7 +276,16 @@ func TestBrokerResultAndFailureUseOwnedIdentities(t *testing.T) {
 					if header.Type == test.terminal {
 						terminalBodies = append(terminalBodies, request.Body)
 						if len(terminalBodies) == 1 {
+							if test.name == "result" {
+								store.mu.Lock()
+								store.value.Token = rotatedToken
+								store.mu.Unlock()
+								return protocol.Response{}, &RelayError{message: "transition temporarily unavailable"}
+							}
 							return protocol.Response{}, errors.New("ack lost")
+						}
+						if test.name == "result" && session.Token != rotatedToken {
+							t.Fatalf("terminal retry used stale token: %+v", session)
 						}
 						cancel()
 					}
@@ -267,6 +345,9 @@ func TestBrokerResultAndFailureUseOwnedIdentities(t *testing.T) {
 			if len(runner.runs) != 1 || runner.runs[0].Brief != launch.Brief {
 				t.Fatalf("runner tasks = %+v", runner.runs)
 			}
+			if journal.puts[journal.failState] < 2 {
+				t.Fatalf("%s journal attempts = %d", journal.failState, journal.puts[journal.failState])
+			}
 		})
 	}
 }
@@ -315,10 +396,55 @@ func TestBrokerReconnectsWithStableIdentity(t *testing.T) {
 	}
 }
 
+func TestBrokerReloadsRotatedTokenWhileRunning(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rotated := strings.Repeat("z", 64)
+	store := &memoryCredentials{value: Credential{Token: testToken, LauncherSession: "launcher-fixed", SessionSecret: testLauncherSecret}}
+	registrations := 0
+	relay := relayFunc(func(_ context.Context, session Session, request protocol.Request) (protocol.Response, error) {
+		switch request.Op {
+		case protocol.OpRegister:
+			registrations++
+			want := testToken
+			if registrations > 1 {
+				want = rotated
+			}
+			if session.Token != want || session.ID != "launcher-fixed" || session.Secret != testLauncherSecret {
+				t.Fatalf("registration %d identity = %+v", registrations, session)
+			}
+			return protocol.Response{OK: true, Name: "host"}, nil
+		case protocol.OpRead:
+			if session.Token == testToken {
+				if err := store.Update(context.Background(), func(credential *Credential) error {
+					credential.Token = rotated
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+				return protocol.Response{}, &RelayError{message: "unauthorized"}
+			}
+			cancel()
+		}
+		return protocol.Response{OK: true}, nil
+	})
+	broker, err := New(relay, store, newMemoryJournal(), &fakeRunner{}, func(context.Context) ([]string, error) { return nil, nil }, testOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v", err)
+	}
+	if registrations != 2 {
+		t.Fatalf("launcher registrations = %d", registrations)
+	}
+}
+
 func TestBrokerRetainsMintedSecretAcrossCredentialSaveRetry(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := &memoryCredentials{value: Credential{Token: testToken, LauncherSession: "launcher-fixed"}, failSaves: 1}
+	rotated := strings.Repeat("z", 64)
+	store := &memoryCredentials{value: Credential{Token: testToken, LauncherSession: "launcher-fixed"}, failSaves: 1, tokenOnFailure: rotated}
 	var registrations []Session
 	relay := relayFunc(func(_ context.Context, session Session, request protocol.Request) (protocol.Response, error) {
 		switch request.Op {
@@ -340,8 +466,8 @@ func TestBrokerRetainsMintedSecretAcrossCredentialSaveRetry(t *testing.T) {
 	if err := broker.Run(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run error = %v", err)
 	}
-	if len(registrations) != 2 || registrations[0].Secret != "" || registrations[1].Secret != testLauncherSecret ||
-		store.value.SessionSecret != testLauncherSecret {
+	if len(registrations) != 2 || registrations[0].Secret != "" || registrations[1].Secret != testLauncherSecret || registrations[1].Token != rotated ||
+		store.value.SessionSecret != testLauncherSecret || store.value.Token != rotated {
 		t.Fatalf("registrations=%+v stored=%+v", registrations, store.value)
 	}
 }
@@ -400,7 +526,7 @@ func TestBrokerStopsOnPermanentChildRegistrationRejection(t *testing.T) {
 	launch := launchMessage("task-000000000006")
 	journal, runner := newMemoryJournal(), &fakeRunner{}
 	ctx, cancel := context.WithCancel(context.Background())
-	read := false
+	read, childRegistrations := false, 0
 	relay := relayFunc(func(_ context.Context, session Session, request protocol.Request) (protocol.Response, error) {
 		switch {
 		case request.Op == protocol.OpRegister && request.Kind == protocol.KindLauncher:
@@ -409,6 +535,7 @@ func TestBrokerStopsOnPermanentChildRegistrationRejection(t *testing.T) {
 			read = true
 			return protocol.Response{OK: true, Messages: []protocol.Message{launchEnvelope(t, launch)}}, nil
 		case request.Op == protocol.OpRegister && request.Kind == protocol.KindEyes:
+			childRegistrations++
 			return protocol.Response{}, &RelayError{message: "task assignment rejected"}
 		case request.Op == protocol.OpSendWorkspace:
 			if session.ID != "launcher-fixed" || !strings.Contains(request.Body, protocol.TaskFailed) || !strings.Contains(request.Body, "task assignment rejected") {
@@ -430,8 +557,8 @@ func TestBrokerStopsOnPermanentChildRegistrationRejection(t *testing.T) {
 		t.Fatalf("Run error = %v", err)
 	}
 	record, exists := journal.Get(launch.TaskID)
-	if !exists || record.State != recordDelivered || len(runner.runs) != 0 {
-		t.Fatalf("record=%+v exists=%v runs=%d", record, exists, len(runner.runs))
+	if !exists || record.State != recordDelivered || len(runner.runs) != 0 || childRegistrations != 1 {
+		t.Fatalf("record=%+v exists=%v runs=%d child registrations=%d", record, exists, len(runner.runs), childRegistrations)
 	}
 }
 
@@ -494,6 +621,42 @@ func TestBrokerBusyCancellationAndDuplicate(t *testing.T) {
 	defer runner.mu.Unlock()
 	if len(runner.runs) != 1 || len(runner.cancels) == 0 || runner.cancels[0] != first.TaskID {
 		t.Fatalf("runs=%+v cancels=%+v", runner.runs, runner.cancels)
+	}
+}
+
+func TestBrokerShutdownLeavesOfflineTerminalDurableWithoutRerun(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	launch := launchMessage("task-000000000008")
+	journal, runner := newMemoryJournal(), &fakeRunner{result: hostrunner.Result{Report: successReportForBroker()}}
+	read, terminalAttempts := false, 0
+	relay := relayFunc(func(_ context.Context, session Session, request protocol.Request) (protocol.Response, error) {
+		switch {
+		case request.Op == protocol.OpRegister && request.Kind == protocol.KindLauncher:
+			return protocol.Response{OK: true, Name: "host"}, nil
+		case request.Op == protocol.OpRead && !read:
+			read = true
+			return protocol.Response{OK: true, Messages: []protocol.Message{launchEnvelope(t, launch)}}, nil
+		case request.Op == protocol.OpRegister && request.Kind == protocol.KindEyes:
+			return protocol.Response{OK: true, Name: session.ID, AgentID: "child", SessionSecret: testChildSecret}, nil
+		case request.Op == protocol.OpSendWorkspace && strings.Contains(request.Body, protocol.TaskResult):
+			terminalAttempts++
+			cancel()
+			return protocol.Response{}, errors.New("relay offline")
+		default:
+			return protocol.Response{OK: true}, nil
+		}
+	})
+	broker, err := New(relay, &memoryCredentials{value: Credential{Token: testToken, LauncherSession: "launcher", SessionSecret: testLauncherSecret}},
+		journal, runner, func(context.Context) ([]string, error) { return nil, nil }, testOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v", err)
+	}
+	record, _ := journal.Get(launch.TaskID)
+	if len(runner.runs) != 1 || terminalAttempts != 1 || record.State != recordTerminal || len(record.Terminal) == 0 {
+		t.Fatalf("runs=%d terminal attempts=%d record=%+v", len(runner.runs), terminalAttempts, record)
 	}
 }
 

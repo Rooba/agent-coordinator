@@ -51,8 +51,8 @@ func NewClient(addr string) (*Client, error) {
 		return nil, fmt.Errorf("invalid relay address: %w", err)
 	}
 	ip := net.ParseIP(strings.Trim(host, "[]"))
-	if !strings.EqualFold(host, "localhost") && (ip == nil || !ip.IsLoopback()) {
-		return nil, errors.New("relay address must be loopback")
+	if ip == nil || !ip.IsLoopback() {
+		return nil, errors.New("relay address must use a numeric loopback IP")
 	}
 	return &Client{addr: addr, limit: defaultWireLimit}, nil
 }

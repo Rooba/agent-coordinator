@@ -31,6 +31,9 @@ type Runner interface {
 }
 
 type Probe func(context.Context) ([]string, error)
+type Unlock func() error
+
+var ErrBrokerAlreadyRunning = errors.New("another host broker is already running for this user")
 
 type Options struct {
 	ComputerName    string
@@ -40,6 +43,7 @@ type Options struct {
 	BackoffMax      time.Duration
 	Sleep           func(context.Context, time.Duration) error
 	Jitter          func(time.Duration) time.Duration
+	AcquireLock     func() (Unlock, error)
 }
 
 type Broker struct {
@@ -94,15 +98,22 @@ func New(relay Relay, store CredentialStore, journal Journal, runner Runner, pro
 			return time.Duration(rand.Int64N(int64(max) + 1))
 		}
 	}
+	if opts.AcquireLock == nil {
+		return nil, errors.New("host broker requires a single-instance lock")
+	}
 	return &Broker{relay: relay, store: store, journal: journal, runner: runner, probe: probe, opts: opts}, nil
 }
 
 func (b *Broker) Run(ctx context.Context) error {
-	credential, err := b.store.Load(ctx)
+	unlock, err := b.opts.AcquireLock()
 	if err != nil {
-		return err
+		return fmt.Errorf("acquire host broker instance lock: %w", err)
 	}
-	if err := credential.Validate(); err != nil {
+	if unlock == nil {
+		return errors.New("acquire host broker instance lock: no release handle")
+	}
+	defer unlock()
+	if err := b.refreshCredential(ctx); err != nil {
 		return err
 	}
 	capabilities, err := b.probe(ctx)
@@ -113,7 +124,6 @@ func (b *Broker) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	b.credential = credential
 	if err := b.retry(ctx, b.registerLauncher); err != nil {
 		return err
 	}
@@ -146,15 +156,18 @@ func (b *Broker) Run(ctx context.Context) error {
 }
 
 func (b *Broker) registerLauncher(ctx context.Context) error {
-	if err := b.flushCredential(ctx); err != nil {
-		return err
-	}
-	current := b.launcherSession()
 	request := protocol.Request{
 		Op: protocol.OpRegister, Scope: b.hostScope(), Source: "hostbroker", Kind: protocol.KindLauncher,
 		Platform: "windows", Capabilities: append([]string(nil), b.capabilities...),
 	}
-	response, err := b.call(ctx, current, request)
+	var current Session
+	var response protocol.Response
+	err := b.retryFreshAuthorization(ctx, func() error {
+		current = b.launcherSession()
+		var err error
+		response, err = b.call(ctx, current, request)
+		return err
+	})
 	if err != nil {
 		return err
 	}
@@ -162,9 +175,8 @@ func (b *Broker) registerLauncher(ctx context.Context) error {
 		return errors.New("relay returned an incomplete launcher identity")
 	}
 	if response.SessionSecret != "" && response.SessionSecret != current.Secret {
-		updated := Credential{Token: current.Token, LauncherSession: current.ID, SessionSecret: response.SessionSecret}
 		b.mu.Lock()
-		b.credential = updated
+		b.credential.SessionSecret = response.SessionSecret
 		b.credentialDirty = true
 		b.mu.Unlock()
 		if err := b.flushCredential(ctx); err != nil {
@@ -225,7 +237,7 @@ func (b *Broker) handleLaunch(ctx context.Context, launch protocol.TaskLaunchMsg
 			return nil
 		}
 		if record.State == recordTerminal {
-			b.start(func() { _ = b.deliverTerminal(ctx, record) })
+			b.start(func() { _ = b.superviseTerminal(ctx, record) })
 		}
 		return nil
 	}
@@ -265,7 +277,7 @@ func (b *Broker) handleLaunch(ctx context.Context, launch protocol.TaskLaunchMsg
 	if err := b.journal.Put(record); err != nil {
 		b.deactivate(launch.TaskID)
 		cancel()
-		b.deregister(context.Background(), child.session, launch.Scope)
+		b.deregisterBounded(child.session, launch.Scope)
 		return err
 	}
 	b.start(func() {
@@ -286,7 +298,9 @@ func (b *Broker) execute(lifecycle, taskCtx context.Context, record TaskRecord, 
 	launch := record.Launch
 	accepted, _ := json.Marshal(protocol.TaskAcceptedMsg{Type: protocol.TaskAccepted, TaskID: launch.TaskID, Child: &child.ref})
 	if err := b.retry(taskCtx, func(ctx context.Context) error {
-		return b.send(ctx, b.launcherSession(), launch.ReplyTo, launch.TaskID, accepted)
+		return b.retryFreshAuthorization(ctx, func() error {
+			return b.send(ctx, b.launcherSession(), launch.ReplyTo, launch.TaskID, accepted)
+		})
 	}); err != nil {
 		record.State, record.Terminal = recordTerminal, failedBody(launch.TaskID, err)
 	} else {
@@ -297,9 +311,7 @@ func (b *Broker) execute(lifecycle, taskCtx context.Context, record TaskRecord, 
 			record.State, record.Terminal = recordTerminal, resultBody(launch.TaskID, result.Report)
 		}
 	}
-	if err := b.journal.Put(record); err == nil {
-		_ = b.deliverTerminal(lifecycle, record)
-	}
+	_ = b.superviseTerminal(lifecycle, record)
 }
 
 func (b *Broker) prepareTerminal(ctx context.Context, record TaskRecord) error {
@@ -312,10 +324,10 @@ func (b *Broker) prepareTerminal(ctx context.Context, record TaskRecord) error {
 	}
 	record.Child, record.ChildSession, record.ChildSecret = child.ref, child.session.ID, child.session.Secret
 	if err := b.journal.Put(record); err != nil {
-		b.deregister(context.Background(), child.session, record.Launch.Scope)
+		b.deregisterBounded(child.session, record.Launch.Scope)
 		return err
 	}
-	b.start(func() { _ = b.deliverTerminal(ctx, record) })
+	b.start(func() { _ = b.superviseTerminal(ctx, record) })
 	return nil
 }
 
@@ -323,10 +335,7 @@ func (b *Broker) failWithoutChild(ctx context.Context, record TaskRecord, failur
 	if len(record.Terminal) == 0 {
 		record.State, record.Terminal = recordTerminal, failedBody(record.Launch.TaskID, failure)
 	}
-	if err := b.journal.Put(record); err != nil {
-		return err
-	}
-	return b.deliverLauncherTerminal(ctx, record)
+	return b.superviseTerminal(ctx, record)
 }
 
 type childIdentity struct {
@@ -336,17 +345,20 @@ type childIdentity struct {
 
 func (b *Broker) registerChild(ctx context.Context, launch protocol.TaskLaunchMsg) (childIdentity, error) {
 	id := "eyes-" + launch.TaskID
-	launcher := b.launcherSession()
-	auth := Session{Token: launcher.Token, ID: id, Secret: launcher.Secret}
-	request := protocol.Request{
-		Op: protocol.OpRegister, Scope: launch.Scope, Source: "hostbroker", Kind: protocol.KindEyes,
-		AuthSessionID: launcher.ID, Platform: "windows", Capabilities: append([]string(nil), b.capabilities...),
-	}
+	var launcher Session
 	var response protocol.Response
 	err := b.retry(ctx, func(callCtx context.Context) error {
-		var err error
-		response, err = b.call(callCtx, auth, request)
-		return err
+		return b.retryFreshAuthorization(callCtx, func() error {
+			launcher = b.launcherSession()
+			auth := Session{Token: launcher.Token, ID: id, Secret: launcher.Secret}
+			request := protocol.Request{
+				Op: protocol.OpRegister, Scope: launch.Scope, Source: "hostbroker", Kind: protocol.KindEyes,
+				AuthSessionID: launcher.ID, Platform: "windows", Capabilities: append([]string(nil), b.capabilities...),
+			}
+			var err error
+			response, err = b.call(callCtx, auth, request)
+			return err
+		})
 	})
 	if err != nil {
 		return childIdentity{}, err
@@ -366,7 +378,7 @@ func (b *Broker) recover(ctx context.Context) error {
 			continue
 		}
 		if record.State == recordTerminal && record.ChildSession == "" {
-			if err := b.deliverLauncherTerminal(ctx, record); err != nil {
+			if err := b.superviseTerminal(ctx, record); err != nil {
 				return err
 			}
 			continue
@@ -391,37 +403,52 @@ func (b *Broker) recover(ctx context.Context) error {
 			}
 			record.State, record.Terminal = recordTerminal, failedBody(record.Launch.TaskID, failure)
 		}
-		if err := b.journal.Put(record); err != nil {
-			return err
-		}
-		if err := b.deliverTerminal(ctx, record); err != nil {
+		if err := b.superviseTerminal(ctx, record); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (b *Broker) deliverLauncherTerminal(ctx context.Context, record TaskRecord) error {
-	if err := b.retry(ctx, func(callCtx context.Context) error {
-		return b.send(callCtx, b.launcherSession(), record.Launch.ReplyTo, record.Launch.TaskID, record.Terminal)
+func (b *Broker) superviseTerminal(ctx context.Context, record TaskRecord) error {
+	durable := context.WithoutCancel(ctx)
+	if err := b.retryAll(durable, func(context.Context) error { return b.journal.Put(record) }); err != nil {
+		return err
+	}
+	if record.ChildSession == "" {
+		return b.deliverLauncherTerminal(ctx, durable, record)
+	}
+	return b.deliverTerminal(ctx, durable, record)
+}
+
+func (b *Broker) deliverLauncherTerminal(ctx, durable context.Context, record TaskRecord) error {
+	if err := b.retryAll(ctx, func(callCtx context.Context) error {
+		return b.withFreshToken(callCtx, func(session Session) error {
+			return b.send(callCtx, session, record.Launch.ReplyTo, record.Launch.TaskID, record.Terminal)
+		})
 	}); err != nil {
 		return err
 	}
-	return b.journal.Put(TaskRecord{Launch: record.Launch, State: recordDelivered})
+	return b.retryAll(durable, func(context.Context) error {
+		return b.journal.Put(TaskRecord{Launch: record.Launch, State: recordDelivered})
+	})
 }
 
-func (b *Broker) deliverTerminal(ctx context.Context, record TaskRecord) error {
-	session := Session{Token: b.launcherSession().Token, ID: record.ChildSession, Secret: record.ChildSecret}
-	if err := b.retry(ctx, func(callCtx context.Context) error {
-		return b.send(callCtx, session, record.Launch.ReplyTo, record.Launch.TaskID, record.Terminal)
+func (b *Broker) deliverTerminal(ctx, durable context.Context, record TaskRecord) error {
+	var session Session
+	if err := b.retryAll(ctx, func(callCtx context.Context) error {
+		return b.withFreshToken(callCtx, func(launcher Session) error {
+			session = Session{Token: launcher.Token, ID: record.ChildSession, Secret: record.ChildSecret}
+			return b.send(callCtx, session, record.Launch.ReplyTo, record.Launch.TaskID, record.Terminal)
+		})
 	}); err != nil {
 		return err
 	}
 	tombstone := TaskRecord{Launch: record.Launch, State: recordDelivered}
-	if err := b.journal.Put(tombstone); err != nil {
+	if err := b.retryAll(durable, func(context.Context) error { return b.journal.Put(tombstone) }); err != nil {
 		return err
 	}
-	b.deregister(context.Background(), session, record.Launch.Scope)
+	b.deregisterBounded(session, record.Launch.Scope)
 	return nil
 }
 
@@ -437,11 +464,19 @@ func (b *Broker) call(ctx context.Context, session Session, request protocol.Req
 }
 
 func (b *Broker) retry(ctx context.Context, operation func(context.Context) error) error {
+	return b.retryWhile(ctx, operation, retryable)
+}
+
+func (b *Broker) retryAll(ctx context.Context, operation func(context.Context) error) error {
+	return b.retryWhile(ctx, operation, func(error) bool { return true })
+}
+
+func (b *Broker) retryWhile(ctx context.Context, operation func(context.Context) error, shouldRetry func(error) bool) error {
 	delay := b.opts.BackoffMin
 	for {
 		if err := operation(ctx); err == nil {
 			return nil
-		} else if !retryable(err) {
+		} else if !shouldRetry(err) {
 			return err
 		}
 		wait := delay + b.opts.Jitter(delay/4)
@@ -459,6 +494,55 @@ func (b *Broker) retry(ctx context.Context, operation func(context.Context) erro
 	}
 }
 
+func (b *Broker) retryFreshAuthorization(ctx context.Context, operation func() error) error {
+	if err := b.refreshCredential(ctx); err != nil {
+		return err
+	}
+	token := b.launcherSession().Token
+	err := operation()
+	if retryable(err) {
+		return err
+	}
+	if refreshErr := b.refreshCredential(ctx); refreshErr != nil {
+		return refreshErr
+	}
+	if b.launcherSession().Token == token {
+		return err
+	}
+	return operation()
+}
+
+func (b *Broker) withFreshToken(ctx context.Context, operation func(Session) error) error {
+	if err := b.refreshCredential(ctx); err != nil {
+		return err
+	}
+	return operation(b.launcherSession())
+}
+
+func (b *Broker) refreshCredential(ctx context.Context) error {
+	if err := b.flushCredential(ctx); err != nil {
+		return err
+	}
+	stored, err := b.store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	if err := stored.Validate(); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.credential.LauncherSession == "" {
+		b.credential = stored
+		return nil
+	}
+	if stored.LauncherSession != b.credential.LauncherSession || stored.SessionSecret != b.credential.SessionSecret {
+		return errors.New("stored launcher identity changed while broker was running")
+	}
+	b.credential.Token = stored.Token
+	return nil
+}
+
 func (b *Broker) flushCredential(ctx context.Context) error {
 	b.mu.Lock()
 	credential, dirty := b.credential, b.credentialDirty
@@ -466,11 +550,20 @@ func (b *Broker) flushCredential(ctx context.Context) error {
 	if !dirty {
 		return nil
 	}
-	if err := b.store.Save(ctx, credential); err != nil {
+	err := b.store.Update(ctx, func(stored *Credential) error {
+		if stored.LauncherSession != credential.LauncherSession || stored.SessionSecret != "" && stored.SessionSecret != credential.SessionSecret {
+			return errors.New("stored launcher identity changed while broker was running")
+		}
+		credential.Token = stored.Token
+		*stored = credential
+		return stored.Validate()
+	})
+	if err != nil {
 		return fmt.Errorf("persist launcher credential: %w", err)
 	}
 	b.mu.Lock()
-	if b.credential == credential {
+	if b.credential.LauncherSession == credential.LauncherSession && b.credential.SessionSecret == credential.SessionSecret {
+		b.credential.Token = credential.Token
 		b.credentialDirty = false
 	}
 	b.mu.Unlock()
@@ -511,9 +604,11 @@ func (b *Broker) deactivate(taskID string) {
 
 func (b *Broker) cancel(taskID string) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.activeID == taskID && b.activeCancel != nil {
-		b.activeCancel()
+	cancel := b.activeCancel
+	active := b.activeID == taskID && cancel != nil
+	b.mu.Unlock()
+	if active {
+		cancel()
 		_ = b.runner.Cancel(taskID)
 	}
 }
@@ -534,19 +629,24 @@ func (b *Broker) start(work func()) {
 
 func (b *Broker) shutdown() {
 	b.mu.Lock()
-	if b.activeCancel != nil {
-		b.activeCancel()
-		_ = b.runner.Cancel(b.activeID)
-	}
+	cancel, taskID := b.activeCancel, b.activeID
 	b.mu.Unlock()
+	if cancel != nil {
+		cancel()
+		_ = b.runner.Cancel(taskID)
+	}
 	b.workers.Wait()
-	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
-	defer cancel()
-	b.deregister(ctx, b.launcherSession(), b.hostScope())
+	b.deregisterBounded(b.launcherSession(), b.hostScope())
 }
 
 func (b *Broker) deregister(ctx context.Context, session Session, scope string) {
 	_, _ = b.call(ctx, session, protocol.Request{Op: protocol.OpDeregister, Scope: scope})
+}
+
+func (b *Broker) deregisterBounded(session Session, scope string) {
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
+	b.deregister(ctx, session, scope)
 }
 
 func normalizeCapabilities(values []string) ([]string, error) {

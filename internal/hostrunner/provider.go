@@ -277,10 +277,16 @@ func parseClaudeReport(stdout []byte) (Report, error) {
 		return Report{}, fmt.Errorf("%w: empty or oversized Claude result", ErrInvalidReport)
 	}
 	var envelope struct {
+		Type             string          `json:"type"`
+		Subtype          string          `json:"subtype"`
+		IsError          *bool           `json:"is_error"`
 		StructuredOutput json.RawMessage `json:"structured_output"`
 	}
 	if err := json.Unmarshal(stdout, &envelope); err != nil {
 		return Report{}, fmt.Errorf("%w: decode Claude result: %v", ErrInvalidReport, err)
+	}
+	if envelope.Type != "result" || envelope.Subtype != "success" || envelope.IsError == nil || *envelope.IsError {
+		return Report{}, fmt.Errorf("%w: Claude result envelope is not successful", ErrInvalidReport)
 	}
 	if len(envelope.StructuredOutput) == 0 || bytes.Equal(envelope.StructuredOutput, []byte("null")) {
 		return Report{}, fmt.Errorf("%w: Claude result has no structured_output", ErrInvalidReport)

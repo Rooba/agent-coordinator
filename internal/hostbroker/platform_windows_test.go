@@ -16,9 +16,10 @@ func TestWindowsCredentialAndDPAPISeamsDoNotCallPlatform(t *testing.T) {
 			blob = append([]byte(nil), value...)
 			return nil
 		},
+		lock: func(context.Context) (Unlock, error) { return func() error { return nil }, nil },
 	}
 	want := Credential{Token: testToken, LauncherSession: "launcher-fixed", SessionSecret: testLauncherSecret}
-	if err := store.Save(context.Background(), want); err != nil {
+	if err := store.Update(context.Background(), func(credential *Credential) error { *credential = want; return nil }); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := store.Load(context.Background()); err != nil || got != want {

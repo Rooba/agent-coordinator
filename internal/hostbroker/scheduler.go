@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 type ScheduleAction string
@@ -27,6 +28,10 @@ type SchedulePlan struct {
 }
 
 type commandRunner func(context.Context, string, ...string) error
+
+var errTaskNotRunning = errors.New("scheduled host broker is not running")
+
+const schedulerCleanupTimeout = 5 * time.Second
 
 func applySchedule(ctx context.Context, action ScheduleAction, executable, sid, tool string, dryRun bool, run commandRunner) (SchedulePlan, error) {
 	if !filepath.IsAbs(executable) || strings.ContainsRune(executable, 0) {
@@ -68,15 +73,19 @@ func applySchedule(ctx context.Context, action ScheduleAction, executable, sid, 
 			return SchedulePlan{}, err
 		}
 		if err := run(ctx, tool, "/Run", "/TN", name); err != nil {
-			_ = run(context.Background(), tool, "/Delete", "/TN", name, "/F")
-			return SchedulePlan{}, err
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), schedulerCleanupTimeout)
+			cleanupErr := run(cleanupCtx, tool, "/Delete", "/TN", name, "/F")
+			cancel()
+			return SchedulePlan{}, errors.Join(err, cleanupErr)
 		}
 	case ScheduleUninstall:
 		plan.Steps = [][]string{{"/End", "/TN", name}, {"/Delete", "/TN", name, "/F"}}
 		if dryRun {
 			return plan, nil
 		}
-		_ = run(ctx, tool, plan.Steps[0]...)
+		if err := run(ctx, tool, plan.Steps[0]...); err != nil && !errors.Is(err, errTaskNotRunning) {
+			return SchedulePlan{}, err
+		}
 		if err := run(ctx, tool, plan.Steps[1]...); err != nil {
 			return SchedulePlan{}, err
 		}

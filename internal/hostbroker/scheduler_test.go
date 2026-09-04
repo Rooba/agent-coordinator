@@ -2,9 +2,11 @@ package hostbroker
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSchedulerDryRunUsesInteractiveLeastPrivilegeXML(t *testing.T) {
@@ -54,5 +56,59 @@ func TestSchedulerUninstallEndsThenDeletes(t *testing.T) {
 	}
 	if scheduleName("S-1") == scheduleName("S-2") {
 		t.Fatal("task names collide across users")
+	}
+}
+
+func TestSchedulerUninstallRequiresConfirmedStop(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		endError  error
+		wantCalls int
+		wantError bool
+	}{
+		{name: "not running", endError: errTaskNotRunning, wantCalls: 2},
+		{name: "stop failed", endError: context.DeadlineExceeded, wantCalls: 1, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			_, err := applySchedule(context.Background(), ScheduleUninstall, "/opt/ac.exe", "S-1-5-21-100", "/Windows/System32/schtasks.exe", false,
+				func(_ context.Context, _ string, _ ...string) error {
+					calls++
+					if calls == 1 {
+						return test.endError
+					}
+					return nil
+				})
+			if (err != nil) != test.wantError || calls != test.wantCalls {
+				t.Fatalf("uninstall = (err %v, calls %d)", err, calls)
+			}
+		})
+	}
+}
+
+func TestSchedulerRollbackUsesCallerContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := 0
+	_, err := applySchedule(ctx, ScheduleInstall, "/opt/ac.exe", "S-1-5-21-100", "/Windows/System32/schtasks.exe", false,
+		func(callCtx context.Context, _ string, args ...string) error {
+			calls++
+			if args[0] == "/Run" {
+				cancel()
+				return context.Canceled
+			}
+			if args[0] == "/Delete" {
+				if callCtx.Err() != nil {
+					t.Fatal("rollback inherited caller cancellation")
+				}
+				deadline, ok := callCtx.Deadline()
+				if !ok || time.Until(deadline) > schedulerCleanupTimeout {
+					t.Fatal("rollback cleanup was not time-bounded")
+				}
+				return errors.New("cleanup failed")
+			}
+			return nil
+		})
+	if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "cleanup failed") || calls != 3 {
+		t.Fatalf("install rollback = (err %v, calls %d)", err, calls)
 	}
 }

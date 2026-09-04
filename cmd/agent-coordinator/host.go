@@ -15,6 +15,10 @@ import (
 )
 
 var openHostCredentialStore = hostbroker.OpenPlatformCredentialStore
+var openHostConfigStore = hostbroker.OpenPlatformConfigStore
+var openHostState = hostbroker.OpenPlatformState
+var manageHostAutostart = hostbroker.ManageAutostart
+var currentExecutable = os.Executable
 
 func runHost(args []string) {
 	if err := hostCommand(context.Background(), args, os.Stdin, os.Stdout); err != nil {
@@ -31,9 +35,9 @@ func hostCommand(ctx context.Context, args []string, stdin io.Reader, stdout io.
 	case "pair":
 		return hostPair(ctx, args[1:], stdin)
 	case "install":
-		return hostSchedule(ctx, hostbroker.ScheduleInstall, args[1:], stdout)
+		return hostInstall(ctx, args[1:], stdout)
 	case "uninstall":
-		return hostSchedule(ctx, hostbroker.ScheduleUninstall, args[1:], stdout)
+		return hostUninstall(ctx, args[1:], stdout)
 	case "run":
 		return hostRun(ctx, args[1:])
 	default:
@@ -71,22 +75,65 @@ func hostPair(ctx context.Context, args []string, stdin io.Reader) error {
 	return hostbroker.Pair(ctx, store, input)
 }
 
-func hostSchedule(ctx context.Context, action hostbroker.ScheduleAction, args []string, stdout io.Writer) error {
-	fs := flag.NewFlagSet("host "+string(action), flag.ContinueOnError)
+func hostInstall(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("host install", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	dryRun := fs.Bool("dry-run", false, "print the Task Scheduler plan without changing it")
+	addr := fs.String("addr", hostbroker.DefaultAddr, "WSL relay numeric loopback address")
+	claudeExe := fs.String("claude-exe", "", "absolute Claude executable")
+	claudeDir := fs.String("claude-workdir", "", "absolute Claude working directory")
+	claudeConfig := fs.String("claude-config-dir", "", "isolated Claude config directory")
+	claudeReady := fs.Bool("claude-chrome-ready", false, "assert a manual Claude Chrome smoke probe passed")
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 {
+		return errors.New("usage: agent-coordinator host install --claude-exe PATH --claude-workdir PATH --claude-config-dir PATH --claude-chrome-ready [--addr IP:PORT] [--dry-run]")
+	}
+	if !*claudeReady {
+		return errors.New("install requires a completed manual Claude Chrome smoke probe")
+	}
+	config := hostbroker.HostConfig{Version: hostbroker.HostConfigVersion, Addr: *addr, Provider: "claude", Executable: *claudeExe,
+		WorkingDir: *claudeDir, ConfigDir: *claudeConfig, BrowserReady: true}
+	if err := config.Validate(); err != nil {
+		return err
+	}
+	store, err := openHostCredentialStore()
+	if err != nil {
+		return err
+	}
+	if _, err := store.Load(ctx); err != nil {
+		return fmt.Errorf("host must be paired before install: %w", err)
+	}
+	if !*dryRun {
+		configs, err := openHostConfigStore()
+		if err != nil {
+			return err
+		}
+		if err := configs.Save(ctx, config); err != nil {
+			return err
+		}
+	}
+	return scheduleHost(ctx, hostbroker.ScheduleInstall, *dryRun, stdout)
+}
+
+func hostUninstall(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("host uninstall", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	dryRun := fs.Bool("dry-run", false, "print the Task Scheduler plan without changing it")
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 {
-		return fmt.Errorf("usage: agent-coordinator host %s [--dry-run]", action)
+		return errors.New("usage: agent-coordinator host uninstall [--dry-run]")
 	}
-	executable, err := os.Executable()
+	return scheduleHost(ctx, hostbroker.ScheduleUninstall, *dryRun, stdout)
+}
+
+func scheduleHost(ctx context.Context, action hostbroker.ScheduleAction, dryRun bool, stdout io.Writer) error {
+	executable, err := currentExecutable()
 	if err != nil {
 		return err
 	}
-	plan, err := hostbroker.ManageAutostart(ctx, action, executable, *dryRun)
+	plan, err := manageHostAutostart(ctx, action, executable, dryRun)
 	if err != nil {
 		return err
 	}
-	if *dryRun {
+	if dryRun {
 		for _, step := range plan.Steps {
 			fmt.Fprintf(stdout, "%s %s\n", plan.Tool, strings.Join(step, " "))
 		}
@@ -95,48 +142,29 @@ func hostSchedule(ctx context.Context, action hostbroker.ScheduleAction, args []
 }
 
 func hostRun(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("host run", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	addr := fs.String("addr", envOr("AC_HOST_ADDR", hostbroker.DefaultAddr), "WSL relay loopback address")
-	claudeExe := fs.String("claude-exe", os.Getenv("AC_HOST_CLAUDE_EXE"), "absolute Claude executable")
-	claudeDir := fs.String("claude-workdir", os.Getenv("AC_HOST_CLAUDE_WORKDIR"), "absolute Claude working directory")
-	claudeConfig := fs.String("claude-config-dir", os.Getenv("AC_HOST_CLAUDE_CONFIG_DIR"), "isolated Claude config directory")
-	claudeReady := fs.Bool("claude-chrome-ready", os.Getenv("AC_HOST_CLAUDE_CHROME_READY") == "1", "assert a manual Claude Chrome smoke probe passed")
-	codexExe := fs.String("codex-exe", os.Getenv("AC_HOST_CODEX_EXE"), "absolute Codex executable")
-	codexDir := fs.String("codex-workdir", os.Getenv("AC_HOST_CODEX_WORKDIR"), "absolute Codex working directory")
-	codexConfig := fs.String("codex-config-dir", os.Getenv("AC_HOST_CODEX_CONFIG_DIR"), "isolated Codex config directory")
-	codexReady := fs.Bool("codex-browser-ready", os.Getenv("AC_HOST_CODEX_BROWSER_READY") == "1", "assert a manual Codex browser smoke probe passed")
-	if err := fs.Parse(args); err != nil || fs.NArg() != 0 {
-		return errors.New("usage: agent-coordinator host run [provider configuration flags]")
+	store, journal, err := openHostState()
+	if err != nil {
+		return err
 	}
-
-	providers := make([]hostrunner.Provider, 0, 2)
-	capabilities := make([]string, 0, 4)
-	defaultProvider := ""
-	if *claudeReady {
-		provider, err := hostrunner.NewClaudeProvider(hostrunner.ClaudeConfig{Executable: *claudeExe, WorkingDir: *claudeDir, ConfigDir: *claudeConfig})
-		if err != nil {
-			return err
-		}
-		providers = append(providers, provider)
-		capabilities = append(capabilities, "provider.claude", "browser.chrome")
-		defaultProvider = "claude"
+	configs, err := openHostConfigStore()
+	if err != nil {
+		return err
 	}
-	if *codexReady {
-		provider, err := hostrunner.NewCodexProvider(hostrunner.CodexConfig{Executable: *codexExe, WorkingDir: *codexDir, ConfigDir: *codexConfig})
-		if err != nil {
-			return err
-		}
-		providers = append(providers, provider)
-		capabilities = append(capabilities, "provider.codex", "browser.chrome")
-		if defaultProvider == "" {
-			defaultProvider = "codex"
-		}
+	config, err := configs.Load(ctx)
+	if err != nil {
+		return err
 	}
-	if len(providers) == 0 {
-		return errors.New("no readiness-gated provider configured; complete a manual browser smoke probe first")
+	config, err = parseHostRunConfig(args, config)
+	if err != nil {
+		return err
 	}
-	registry, err := hostrunner.NewRegistry(providers...)
+	provider, err := hostrunner.NewClaudeProvider(hostrunner.ClaudeConfig{
+		Executable: config.Executable, WorkingDir: config.WorkingDir, ConfigDir: config.ConfigDir,
+	})
+	if err != nil {
+		return err
+	}
+	registry, err := hostrunner.NewRegistry(provider)
 	if err != nil {
 		return err
 	}
@@ -144,18 +172,14 @@ func hostRun(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	relay, err := hostbroker.NewClient(*addr)
-	if err != nil {
-		return err
-	}
-	store, journal, err := hostbroker.OpenPlatformState()
+	relay, err := hostbroker.NewClient(config.Addr)
 	if err != nil {
 		return err
 	}
 	computer := strings.TrimSpace(os.Getenv("COMPUTERNAME"))
 	broker, err := hostbroker.New(relay, store, journal, runner,
-		func(context.Context) ([]string, error) { return capabilities, nil },
-		hostbroker.Options{ComputerName: computer, DefaultProvider: defaultProvider})
+		func(context.Context) ([]string, error) { return []string{"provider.claude", "browser.chrome"}, nil },
+		hostbroker.Options{ComputerName: computer, DefaultProvider: "claude", AcquireLock: hostbroker.AcquirePlatformLock})
 	if err != nil {
 		return err
 	}
@@ -168,9 +192,24 @@ func hostRun(ctx context.Context, args []string) error {
 	return err
 }
 
-func envOr(name, fallback string) string {
-	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
-		return value
+func parseHostRunConfig(args []string, config hostbroker.HostConfig) (hostbroker.HostConfig, error) {
+	fs := flag.NewFlagSet("host run", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	addr := fs.String("addr", config.Addr, "WSL relay numeric loopback address")
+	claudeExe := fs.String("claude-exe", config.Executable, "absolute Claude executable")
+	claudeDir := fs.String("claude-workdir", config.WorkingDir, "absolute Claude working directory")
+	claudeConfig := fs.String("claude-config-dir", config.ConfigDir, "isolated Claude config directory")
+	claudeReady := fs.Bool("claude-chrome-ready", config.BrowserReady, "assert a manual Claude Chrome smoke probe passed")
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 {
+		return hostbroker.HostConfig{}, errors.New("usage: agent-coordinator host run [Claude provider configuration flags]")
 	}
-	return fallback
+	if !*claudeReady {
+		return hostbroker.HostConfig{}, errors.New("no readiness-gated provider configured; complete a manual Claude Chrome smoke probe first")
+	}
+	config = hostbroker.HostConfig{Version: hostbroker.HostConfigVersion, Addr: *addr, Provider: "claude", Executable: *claudeExe,
+		WorkingDir: *claudeDir, ConfigDir: *claudeConfig, BrowserReady: *claudeReady}
+	if err := config.Validate(); err != nil {
+		return hostbroker.HostConfig{}, err
+	}
+	return config, nil
 }
