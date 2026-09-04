@@ -56,6 +56,15 @@ CREATE TABLE IF NOT EXISTS claims (
   note TEXT NOT NULL DEFAULT '', since INTEGER NOT NULL,
   PRIMARY KEY (scope, path)
 );
+CREATE TABLE IF NOT EXISTS eyes_tasks (
+  -- task_id is the primary key so a launch is durably at most once: a
+  -- repeated create finds the live row instead of starting a second run.
+  task_id TEXT PRIMARY KEY,
+  requester_scope TEXT NOT NULL, requester_agent_id TEXT NOT NULL,
+  launcher_session TEXT NOT NULL, runtime TEXT NOT NULL DEFAULT '',
+  state TEXT NOT NULL DEFAULT 'queued',
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
 `
 
 const (
@@ -84,6 +93,19 @@ func Open(path string) (*Store, error) {
 	for _, alter := range []string{
 		`ALTER TABLE agents ADD COLUMN source TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE agents ADD COLUMN parent_session_id TEXT NOT NULL DEFAULT ''`,
+		// Relay identity: what an agent is, where it came in from, and the
+		// sha256 of its per-session TCP secret (never the secret itself).
+		`ALTER TABLE agents ADD COLUMN kind TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE agents ADD COLUMN origin TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE agents ADD COLUMN platform TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE agents ADD COLUMN caps TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE agents ADD COLUMN relay_secret_hash TEXT NOT NULL DEFAULT ''`,
+		// Cross-workspace mail: where the sender lives, the return address,
+		// and the sender's kind denormalized at send time.
+		`ALTER TABLE messages ADD COLUMN from_scope TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE messages ADD COLUMN reply_to TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE messages ADD COLUMN task_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := db.Exec(alter); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
