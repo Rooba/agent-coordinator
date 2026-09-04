@@ -250,9 +250,11 @@ func (s *Store) RegisterIfNoLiveHook(scope, sessionID, source string) (string, e
 // hasLiveHookAgents reports whether the scope has any active or idle agent
 // that came from a session hook. Hook origin is identified by session id
 // shape - only self-minted MCP identities carry the mcp- prefix - which also
-// classifies legacy rows that predate the source column.
+// classifies legacy rows that predate the source column. A kind-bearing row
+// (a broker or an eyes child) is never a hook agent.
 func (s *Store) hasLiveHookAgents(scope string) (bool, error) {
-	rows, err := s.db.Query(`SELECT status, last_seen FROM agents WHERE scope=? AND session_id NOT LIKE 'mcp-%'`, scope)
+	rows, err := s.db.Query(`SELECT status, last_seen FROM agents
+		WHERE scope=? AND session_id NOT LIKE 'mcp-%' AND kind=''`, scope)
 	if err != nil {
 		return false, err
 	}
@@ -263,7 +265,7 @@ func (s *Store) hasLiveHookAgents(scope string) (bool, error) {
 		if err := rows.Scan(&explicit, &seen); err != nil {
 			return false, err
 		}
-		if st := s.freshStatus(explicit, seen); st == "active" || st == "idle" {
+		if s.live(explicit, seen) {
 			return true, nil
 		}
 	}
@@ -373,66 +375,103 @@ func (s *Store) resolveAgent(scope, nameOrID string) (aid, name string, err erro
 	return aid, name, err
 }
 
-func (s *Store) Send(scope, fromName, toName, body string) error {
-	fromID, _, err := s.resolveAgent(scope, fromName)
-	if err != nil {
-		return err
-	}
-	toID, _, err := s.resolveAgent(scope, toName)
-	if err != nil {
-		return err
-	}
-	now := s.Now().Unix()
-	res, err := s.db.Exec(`INSERT INTO messages (scope, from_agent, to_agent, body, created_at) VALUES (?,?,?,?,?)`,
-		scope, fromID, toID, body, now)
-	if err != nil {
-		return err
-	}
-	mid, _ := res.LastInsertId()
-	_, err = s.db.Exec(`INSERT INTO deliveries (message_id, agent_id) VALUES (?,?)`, mid, toID)
-	return err
+// Delivery is one message write. The daemon fills every field from the
+// authenticated sender; a client never gets to say who it is.
+type Delivery struct {
+	FromScope string // sender's workspace
+	FromName  string // sender's name or agent id in FromScope
+	ToScope   string // recipient workspace; empty means FromScope
+	ToName    string // recipient name or agent id; empty means everyone live there
+	Body      string
+	ReplyTo   *protocol.AgentRef // return address, stamped by the daemon
+	TaskID    string
 }
 
-func (s *Store) Broadcast(scope, fromName, body string) error {
-	fromID, _, err := s.resolveAgent(scope, fromName)
+// SendToScope is the one write path for mail: unicast when ToName is set,
+// otherwise a broadcast to everyone else live in the target scope. The row
+// lands in the RECIPIENT's scope, so peek, read, wait and history keep
+// working untouched, and from_scope appears only when the sender is
+// somewhere else.
+func (s *Store) SendToScope(d Delivery) error {
+	fromID, _, err := s.resolveAgent(d.FromScope, d.FromName)
 	if err != nil {
 		return err
 	}
-	now := s.Now().Unix()
-	res, err := s.db.Exec(`INSERT INTO messages (scope, from_agent, to_agent, body, created_at) VALUES (?,?,NULL,?,?)`,
-		scope, fromID, body, now)
+	var kind string
+	s.db.QueryRow(`SELECT kind FROM agents WHERE scope=? AND agent_id=?`, d.FromScope, fromID).Scan(&kind)
+	toScope, fromScope := d.ToScope, ""
+	if toScope == "" {
+		toScope = d.FromScope
+	}
+	if toScope != d.FromScope {
+		fromScope = d.FromScope
+	}
+	var toID any // NULL addresses everyone live in the scope
+	var targets []string
+	if d.ToName != "" {
+		id, _, err := s.resolveAgent(toScope, d.ToName)
+		if err != nil {
+			return err
+		}
+		toID, targets = id, []string{id}
+	} else if targets, err = s.liveAgents(toScope, fromID); err != nil {
+		return err
+	}
+	replyTo := ""
+	if d.ReplyTo != nil {
+		b, err := json.Marshal(d.ReplyTo)
+		if err != nil {
+			return err
+		}
+		replyTo = string(b)
+	}
+	res, err := s.db.Exec(`INSERT INTO messages
+		(scope, from_agent, to_agent, body, created_at, from_scope, reply_to, task_id, kind)
+		VALUES (?,?,?,?,?,?,?,?,?)`,
+		toScope, fromID, toID, d.Body, s.Now().Unix(), fromScope, replyTo, d.TaskID, kind)
 	if err != nil {
 		return err
 	}
 	mid, _ := res.LastInsertId()
-	// NOTE: with db.SetMaxOpenConns(1), never Exec while a rows cursor is open -
-	// collect first, Close, then write (same deadlock Task 5 hit in Board).
-	rows, err := s.db.Query(`SELECT agent_id, status, last_seen FROM agents WHERE scope=? AND agent_id != ?`, scope, fromID)
-	if err != nil {
-		return err
-	}
-	var targets []string
-	for rows.Next() {
-		var aid, explicit string
-		var seen int64
-		if err := rows.Scan(&aid, &explicit, &seen); err != nil {
-			rows.Close()
-			return err
-		}
-		if st := s.freshStatus(explicit, seen); st == "active" || st == "idle" {
-			targets = append(targets, aid)
-		}
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
 	for _, aid := range targets {
 		if _, err := s.db.Exec(`INSERT INTO deliveries (message_id, agent_id) VALUES (?,?)`, mid, aid); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// liveAgents lists the active or idle agent ids in a scope, minus the
+// sender. Collected before any write: with SetMaxOpenConns(1) an open cursor
+// holds the sole connection.
+func (s *Store) liveAgents(scope, exceptID string) ([]string, error) {
+	rows, err := s.db.Query(`SELECT agent_id, status, last_seen FROM agents WHERE scope=? AND agent_id != ?`, scope, exceptID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var aid, explicit string
+		var seen int64
+		if err := rows.Scan(&aid, &explicit, &seen); err != nil {
+			return nil, err
+		}
+		if s.live(explicit, seen) {
+			out = append(out, aid)
+		}
+	}
+	return out, rows.Err()
+}
+
+// Send is a unicast delivery inside one workspace.
+func (s *Store) Send(scope, fromName, toName, body string) error {
+	return s.SendToScope(Delivery{FromScope: scope, FromName: fromName, ToName: toName, Body: body})
+}
+
+// Broadcast reaches everyone else live in the workspace.
+func (s *Store) Broadcast(scope, fromName, body string) error {
+	return s.SendToScope(Delivery{FromScope: scope, FromName: fromName, Body: body})
 }
 
 func (s *Store) Read(scope, name string) ([]protocol.Message, error) {
@@ -448,13 +487,15 @@ func (s *Store) Read(scope, name string) ([]protocol.Message, error) {
 		return nil, err
 	}
 	defer tx.Rollback()
-	// LEFT JOIN: mail must stay readable after its sender is purged, falling
-	// back to the raw sender id as the label.
+	// LEFT JOIN on the sender's own scope: mail must stay readable after its
+	// sender is purged (falling back to the raw id) and must still show a
+	// name when the sender lives in another workspace.
 	rows, err := tx.Query(`
-		SELECT m.id, COALESCE(a.name, m.from_agent), m.body, m.created_at, m.to_agent IS NULL
+		SELECT m.id, COALESCE(a.name, m.from_agent), m.body, m.created_at, m.to_agent IS NULL,
+		       m.reply_to, m.from_scope, m.kind, m.task_id
 		FROM deliveries d
 		JOIN messages m ON m.id = d.message_id
-		LEFT JOIN agents a ON a.scope = m.scope AND a.agent_id = m.from_agent
+		LEFT JOIN agents a ON a.scope = COALESCE(NULLIF(m.from_scope, ''), m.scope) AND a.agent_id = m.from_agent
 		WHERE d.agent_id = ? AND m.scope = ? AND d.read_at IS NULL
 		ORDER BY m.created_at, m.id`, aid, scope)
 	if err != nil {
@@ -463,9 +504,17 @@ func (s *Store) Read(scope, name string) ([]protocol.Message, error) {
 	var out []protocol.Message
 	for rows.Next() {
 		var m protocol.Message
-		if err := rows.Scan(&m.ID, &m.From, &m.Body, &m.SentAt, &m.Broadcast); err != nil {
+		var replyTo string
+		if err := rows.Scan(&m.ID, &m.From, &m.Body, &m.SentAt, &m.Broadcast,
+			&replyTo, &m.FromScope, &m.Kind, &m.TaskID); err != nil {
 			rows.Close()
 			return nil, err
+		}
+		if replyTo != "" {
+			m.ReplyTo = &protocol.AgentRef{}
+			if json.Unmarshal([]byte(replyTo), m.ReplyTo) != nil {
+				m.ReplyTo = nil // a corrupt stamp must not swallow the message
+			}
 		}
 		out = append(out, m)
 	}
@@ -523,7 +572,7 @@ func (s *Store) PeekMail(scope, name string, afterID int64) (PeekInfo, error) {
 	rows, err := s.db.Query(`
 		SELECT m.id, COALESCE(a.name, m.from_agent) FROM deliveries d
 		JOIN messages m ON m.id = d.message_id
-		LEFT JOIN agents a ON a.scope = m.scope AND a.agent_id = m.from_agent
+		LEFT JOIN agents a ON a.scope = COALESCE(NULLIF(m.from_scope, ''), m.scope) AND a.agent_id = m.from_agent
 		WHERE d.agent_id = ? AND m.scope = ? AND d.read_at IS NULL AND m.id > ?
 		ORDER BY m.id`, aid, scope, afterID)
 	if err != nil {
@@ -576,7 +625,7 @@ func (s *Store) noticesFor(scope, aid string, writes []string) ([]string, error)
 		SELECT m.id, COALESCE(a.name, m.from_agent), m.body, m.to_agent IS NULL
 		FROM deliveries d
 		JOIN messages m ON m.id = d.message_id
-		LEFT JOIN agents a ON a.scope = m.scope AND a.agent_id = m.from_agent
+		LEFT JOIN agents a ON a.scope = COALESCE(NULLIF(m.from_scope, ''), m.scope) AND a.agent_id = m.from_agent
 		WHERE d.agent_id = ? AND m.scope = ? AND d.notice_sent_at IS NULL AND d.read_at IS NULL
 		ORDER BY m.created_at, m.id`, aid, scope)
 	if err != nil {
@@ -719,6 +768,9 @@ func (s *Store) Housekeep() error {
 			SELECT 1 FROM agents a WHERE a.scope = claims.scope AND a.agent_id = claims.agent_id
 			AND a.status != 'gone' AND a.last_seen >= ?)`, now.Add(-staleWindow).Unix()},
 		{`DELETE FROM tasks WHERE updated_at < ?`, now.Unix() - 7*day},
+		// An eyes task outlives its messages by a day, long enough to explain
+		// a late report and short enough to stay a ledger, not a log.
+		{`DELETE FROM eyes_tasks WHERE updated_at < ?`, now.Unix() - day},
 	}
 	for _, st := range stmts {
 		var err error
@@ -770,7 +822,7 @@ func (s *Store) Board(scope string, includeGone bool) ([]protocol.AgentInfo, err
 	// Read every agent row and close the cursor BEFORE per-agent enrichment:
 	// with SetMaxOpenConns(1) an open Rows holds the sole connection, so any
 	// QueryRow issued mid-iteration would deadlock waiting for that connection.
-	rows, err := s.db.Query(`SELECT session_id, agent_id, name, status, last_seen, parent_session_id FROM agents WHERE scope=? ORDER BY registered_at`, scope)
+	rows, err := s.db.Query(`SELECT session_id, agent_id, name, status, last_seen, parent_session_id, kind, origin, platform, caps FROM agents WHERE scope=? ORDER BY registered_at`, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -778,13 +830,15 @@ func (s *Store) Board(scope string, includeGone bool) ([]protocol.AgentInfo, err
 	var parentSessions []string
 	nameBySession := map[string]string{} // every row, so a hidden parent still names its children
 	for rows.Next() {
-		var sid, explicit, parentSession string
+		var sid, explicit, parentSession, capsJSON string
 		var a protocol.AgentInfo
-		if err := rows.Scan(&sid, &a.AgentID, &a.Name, &explicit, &a.LastSeen, &parentSession); err != nil {
+		if err := rows.Scan(&sid, &a.AgentID, &a.Name, &explicit, &a.LastSeen, &parentSession,
+			&a.Kind, &a.Origin, &a.Platform, &capsJSON); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		a.Status = s.freshStatus(explicit, a.LastSeen)
+		json.Unmarshal([]byte(capsJSON), &a.Capabilities)
 		nameBySession[sid] = a.Name
 		parentSessions = append(parentSessions, parentSession)
 		all = append(all, a)

@@ -34,7 +34,7 @@ func (s *Store) MessageHistory(scope, name, peer string, limit int) ([]protocol.
 		       m.body, m.created_at, COALESCE(d.read_at, 0), m.to_agent IS NULL
 		FROM messages m
 		JOIN deliveries d ON d.message_id = m.id
-		LEFT JOIN agents fa ON fa.scope = m.scope AND fa.agent_id = m.from_agent
+		LEFT JOIN agents fa ON fa.scope = COALESCE(NULLIF(m.from_scope, ''), m.scope) AND fa.agent_id = m.from_agent
 		LEFT JOIN agents ta ON ta.scope = m.scope AND ta.agent_id = d.agent_id
 		WHERE m.scope = ? AND `+cond+`
 		ORDER BY m.id DESC, d.agent_id LIMIT ?`, append(args, limit)...)
