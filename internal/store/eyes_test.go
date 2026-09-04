@@ -15,9 +15,15 @@ import (
 // are about the row, not about how it was created.
 func seedTask(t *testing.T, s *Store, taskID, launcherSession, state string, updatedAt int64) {
 	t.Helper()
+	seedTaskIn(t, s, "/r", taskID, launcherSession, state, updatedAt)
+}
+
+// seedTaskIn is the same for a requester in some other workspace.
+func seedTaskIn(t *testing.T, s *Store, scope, taskID, launcherSession, state string, updatedAt int64) {
+	t.Helper()
 	if _, err := s.db.Exec(`INSERT INTO eyes_tasks
 		(task_id, requester_scope, requester_agent_id, launcher_session, runtime, state, created_at, updated_at)
-		VALUES (?,?,?,?,'claude',?,?,?)`, taskID, "/r", "aid-a", launcherSession, state, updatedAt, updatedAt); err != nil {
+		VALUES (?,?,?,?,'claude',?,?,?)`, taskID, scope, "aid-a", launcherSession, state, updatedAt, updatedAt); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -63,14 +69,14 @@ func TestPickLauncherRequiresRelayOriginAndHostScope(t *testing.T) {
 		t.Fatalf("a local kind=launcher row must not be pickable, got %v", err)
 	}
 	if _, err := s.RegisterRelay(RelayRegistration{Scope: "/r", SessionID: "relay-1",
-		Kind: protocol.KindLauncher, Origin: "relay"}); err != nil {
+		Kind: protocol.KindLauncher, Origin: "relay", Secret: brokerSecret("relay-1")}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.PickLauncher(); !errors.Is(err, ErrNoLauncher) {
 		t.Fatalf("a launcher outside a host: scope must not be pickable, got %v", err)
 	}
 	if _, err := s.RegisterRelay(RelayRegistration{Scope: "Host:BOX", SessionID: "case-1",
-		Kind: protocol.KindLauncher, Origin: "relay"}); err != nil {
+		Kind: protocol.KindLauncher, Origin: "relay", Secret: brokerSecret("case-1")}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.PickLauncher(); !errors.Is(err, ErrNoLauncher) {
@@ -460,7 +466,7 @@ func TestAssignEyesTaskMatchesProvider(t *testing.T) {
 	}
 	if _, err := s.RegisterRelay(RelayRegistration{Scope: "host:BOX", SessionID: "broker-1",
 		Kind: protocol.KindLauncher, Origin: "relay", Platform: "windows",
-		Capabilities: []string{"browser.chrome", "provider.claude"}}); err != nil {
+		Secret: brokerSecret("broker-1"), Capabilities: []string{"browser.chrome", "provider.claude"}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := s.AssignEyesTask(EyesRequest{Requester: ref, Runtime: "codex", Brief: "b"}); !errors.Is(err, ErrNoProvider) {
@@ -478,7 +484,7 @@ func TestAssignEyesTaskMatchesProvider(t *testing.T) {
 	// ErrNoProvider even while a free broker is polling.
 	if _, err := s.RegisterRelay(RelayRegistration{Scope: "host:BOX", SessionID: "broker-2",
 		Kind: protocol.KindLauncher, Origin: "relay", Platform: "windows",
-		Capabilities: []string{"provider.codex"}}); err != nil {
+		Secret: brokerSecret("broker-2"), Capabilities: []string{"provider.codex"}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := s.AssignEyesTask(EyesRequest{Requester: ref, Runtime: "claude", Brief: "b"}); !errors.Is(err, ErrEyesBusy) {
@@ -516,6 +522,24 @@ func TestPendingLaunches(t *testing.T) {
 	if pending[0].From != requester.Name || pending[0].FromScope != "/r" || pending[0].ReplyTo == nil {
 		t.Fatalf("launch mail: %+v", pending[0])
 	}
+	// A launch is the only pending work: other mail carrying the same task id
+	// is not a brief to run.
+	if err := s.SendToScope(Delivery{FromScope: "/r", FromName: requester.Name, ToScope: "host:BOX",
+		ToName: broker.Name, Body: `{"type":"task.cancel","task_id":"` + task.TaskID + `"}`,
+		TaskID: task.TaskID}); err != nil {
+		t.Fatal(err)
+	}
+	if only, err := s.PendingLaunches("broker-1"); err != nil || len(only) != 1 || only[0].TaskID != task.TaskID {
+		t.Fatalf("only the launch is pending: %+v (%v)", only, err)
+	}
+	// One launcher session is one queue, even if a stray row wears its id.
+	if _, err := s.db.Exec(`INSERT INTO agents (scope, session_id, agent_id, name, status, registered_at, last_seen, source)
+		VALUES ('/other','broker-1','aid-dup','dup-broker','active',?,?,'relay')`, now.Unix()+5, now.Unix()+5); err != nil {
+		t.Fatal(err)
+	}
+	if only, err := s.PendingLaunches("broker-1"); err != nil || len(only) != 1 {
+		t.Fatalf("a duplicate session row must not fan the queue out: %+v (%v)", only, err)
+	}
 	// Reading the inbox must not consume it: re-delivery is the point.
 	if _, err := s.Read("host:BOX", broker.Name); err != nil {
 		t.Fatal(err)
@@ -543,5 +567,113 @@ func TestPendingLaunches(t *testing.T) {
 	pending, err = s.PendingLaunches("broker-1")
 	if err != nil || len(pending) != 1 || pending[0].TaskID != "task-old" {
 		t.Fatalf("an accepted task is no longer pending: %+v (%v)", pending, err)
+	}
+}
+
+// An unqualified brief still names a runtime: the first provider the chosen
+// broker advertises, in a fixed order so the same host always answers the
+// same way, recorded on the task and carried in the launch.
+func TestAssignEyesTaskChoosesADefaultProvider(t *testing.T) {
+	for _, c := range []struct {
+		caps []string
+		want string
+	}{
+		{[]string{"provider.grok"}, "grok"},
+		{[]string{"provider.codex", "provider.claude"}, "claude"},
+		{[]string{"provider.grok", "provider.codex"}, "codex"},
+	} {
+		s := open(t)
+		name, _ := s.Register("/r", "s-a", "hook")
+		ref := protocol.AgentRef{Name: name, AgentID: agentID("s-a"), Scope: "/r"}
+		broker, err := s.RegisterRelay(RelayRegistration{Scope: "host:BOX", SessionID: "broker-1",
+			Kind: protocol.KindLauncher, Origin: "relay", Secret: brokerSecret("broker-1"),
+			Capabilities: c.caps})
+		if err != nil {
+			t.Fatal(err)
+		}
+		task, _, err := s.AssignEyesTask(EyesRequest{Requester: ref, Brief: "b"})
+		if err != nil || task.Runtime != c.want {
+			t.Fatalf("caps %v must default to %q: %+v (%v)", c.caps, c.want, task, err)
+		}
+		if stored, err := s.EyesTask(task.TaskID); err != nil || stored.Runtime != c.want {
+			t.Fatalf("the ledger must record the runtime: %+v (%v)", stored, err)
+		}
+		msgs, _ := s.Read("host:BOX", broker.Name)
+		var body protocol.TaskLaunchMsg
+		if len(msgs) != 1 || json.Unmarshal([]byte(msgs[0].Body), &body) != nil || body.Runtime != c.want {
+			t.Fatalf("the launch must carry runtime %q: %+v", c.want, body)
+		}
+	}
+}
+
+// A broker advertising no provider at all cannot take a brief, even one that
+// named no runtime: there is nothing for it to run.
+func TestAssignEyesTaskWithoutAnyProvider(t *testing.T) {
+	s := open(t)
+	name, _ := s.Register("/r", "s-a", "hook")
+	ref := protocol.AgentRef{Name: name, AgentID: agentID("s-a"), Scope: "/r"}
+	if _, err := s.RegisterRelay(RelayRegistration{Scope: "host:BOX", SessionID: "broker-1",
+		Kind: protocol.KindLauncher, Origin: "relay", Secret: brokerSecret("broker-1"),
+		Capabilities: []string{"browser.chrome"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.AssignEyesTask(EyesRequest{Requester: ref, Brief: "b"}); !errors.Is(err, ErrNoProvider) {
+		t.Fatalf("a broker with no provider: %v", err)
+	}
+	if n := count(t, s, `SELECT COUNT(*) FROM eyes_tasks`); n != 0 {
+		t.Fatalf("nothing must be queued, got %d tasks", n)
+	}
+}
+
+// A runtime is a provider name, not free text: it reaches a capability match
+// and the task ledger, so its shape is checked before either.
+func TestAssignEyesTaskRejectsABadRuntime(t *testing.T) {
+	s := open(t)
+	name, _ := s.Register("/r", "s-a", "hook")
+	registerBroker(t, s, "host:BOX", "broker-1")
+	ref := protocol.AgentRef{Name: name, AgentID: agentID("s-a"), Scope: "/r"}
+	for _, bad := range []string{"Claude", "cl aude", `claude"`, "claude/../x", `"`, strings.Repeat("a", 33)} {
+		if _, _, err := s.AssignEyesTask(EyesRequest{Requester: ref, Runtime: bad, Brief: "b"}); !errors.Is(err, ErrBadRuntime) {
+			t.Fatalf("runtime %q must be ErrBadRuntime, got %v", bad, err)
+		}
+	}
+	if n := count(t, s, `SELECT COUNT(*) FROM eyes_tasks`); n != 0 {
+		t.Fatalf("a refused request must queue nothing, got %d tasks", n)
+	}
+	if _, _, err := s.AssignEyesTask(EyesRequest{Requester: ref, Runtime: "claude", Brief: "b"}); err != nil {
+		t.Fatalf("a provider name is fine: %v", err)
+	}
+}
+
+// An agent row is purged after two hours, a task lives for a day: cancelling
+// after the launcher is gone still settles the task, with nobody to tell.
+func TestCancelEyesTaskAfterTheLauncherIsPurged(t *testing.T) {
+	s := open(t)
+	requester, _, task, _ := liveTask(t, s)
+	if _, err := s.db.Exec(`DELETE FROM agents WHERE session_id='broker-1'`); err != nil {
+		t.Fatal(err)
+	}
+	before := count(t, s, `SELECT COUNT(*) FROM messages`)
+	cancelled, err := s.CancelEyesTask(task.TaskID, requester)
+	if err != nil || cancelled.State != "cancelled" {
+		t.Fatalf("cancel with no launcher row: %+v (%v)", cancelled, err)
+	}
+	if n := count(t, s, `SELECT COUNT(*) FROM messages`); n != before {
+		t.Fatalf("nobody is left to tell, got %d messages (was %d)", n, before)
+	}
+}
+
+// A reported task is settled: the requester cannot cancel it afterwards.
+func TestCancelEyesTaskAfterDoneIsRefused(t *testing.T) {
+	s := open(t)
+	requester, _, task, _ := liveTask(t, s)
+	if _, ok, err := s.TransitionEyesTask(task.TaskID, "broker-1", "accepted", "{}"); err != nil || !ok {
+		t.Fatalf("accept: ok=%v (%v)", ok, err)
+	}
+	if _, ok, err := s.TransitionEyesTask(task.TaskID, "eyes-"+task.TaskID, "done", "{}"); err != nil || !ok {
+		t.Fatalf("done: ok=%v (%v)", ok, err)
+	}
+	if _, err := s.CancelEyesTask(task.TaskID, requester); !errors.Is(err, ErrBadTransition) {
+		t.Fatalf("a done task must not be cancellable, got %v", err)
 	}
 }

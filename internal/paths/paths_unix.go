@@ -36,14 +36,15 @@ func defaultDB() (string, error) {
 	return filepath.Join(dir, "coordinator.db"), nil
 }
 
-// checkTokenPerm refuses a relay token any other local account can read. The
-// file is the whole relay's shared secret, so its mode is part of it.
+// checkTokenPerm refuses a relay token any other local account can reach. The
+// file is the whole relay's shared secret, so what the owner's own bits say
+// is their business - group and other access is what makes it not a secret.
 func checkTokenPerm(path string) error {
 	fi, err := os.Stat(path)
 	if err != nil {
 		return err
 	}
-	if perm := fi.Mode().Perm(); perm != 0o600 {
+	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
 		return fmt.Errorf("relay token file %s has mode %04o, want 0600: chmod 600 it or delete it", path, perm)
 	}
 	return nil

@@ -29,14 +29,29 @@ var (
 	ErrRelayAuth = errors.New("unauthorized")
 )
 
-// secretHex returns n CSPRNG bytes as hex - the shape used for per-session
-// relay secrets and for task ids.
+// secretHex returns n CSPRNG bytes as hex - the shape used for task ids and
+// for the one secret the store still mints, an eyes child's.
 func secretHex(n int) (string, error) {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// validSecret is the shape every relay credential has: 32 CSPRNG bytes as
+// lowercase hex. Clients mint their own before the first register, so the
+// store's job is to insist on the shape rather than trust the length.
+func validSecret(v string) bool {
+	if len(v) != 64 {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		if c := v[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // sha256Hex is the only form a secret is ever stored in.
@@ -60,18 +75,20 @@ type RelayRegistration struct {
 	Capabilities                                     []string
 }
 
-// RelayResult is the registered name plus the one-time TCP secret. Secret is
-// empty for a local registration and for a re-register: it is minted once,
-// when the relay row is created.
+// RelayResult is the registered name plus a minted secret. Only
+// ReissueEyesChild fills Secret in: a launcher brings its own, so a register
+// answers with the name alone.
 type RelayResult struct{ Name, Secret string }
 
 // RegisterRelay registers a kind-bearing agent. A relay session id names
 // exactly ONE row: scope, kind and origin are fixed when it is created, and a
 // re-register refreshes only platform and caps, so holding a secret can never
-// move or clone an identity. Row and metadata are written in one transaction
-// - a half-registered row could never be re-claimed. A row created over the
-// relay gets a secret whose sha256 is all the store keeps; re-registering it
-// means presenting that secret, which is how a restarted broker resumes.
+// move or clone an identity. The client mints its own secret before its first
+// register and presents that same one on every retry - the store keeps only
+// its sha256 - so a lost response costs a retry, never an identity. Eyes rows
+// are not born here at all: only the launcher holding the task may mint its
+// child, through ReissueEyesChild, so a new eyes register is refused as a
+// foreign session.
 func (s *Store) RegisterRelay(r RelayRegistration) (RelayResult, error) {
 	if r.Kind != protocol.KindEyes && r.Kind != protocol.KindLauncher {
 		return RelayResult{}, errors.New("register: kind must be eyes or launcher")
@@ -82,11 +99,16 @@ func (s *Store) RegisterRelay(r RelayRegistration) (RelayResult, error) {
 	}
 	defer tx.Rollback()
 	// Read the prior row inside the tx: with the checks and the write in one
-	// transaction, two racing registrations cannot both believe they minted
-	// this session's secret.
+	// transaction, two racing registrations cannot both create this session.
 	prior, err := s.agentBySession(tx, r.SessionID)
 	switch {
-	case errors.Is(err, ErrNoSession): // a brand new session needs no proof
+	case errors.Is(err, ErrNoSession):
+		if r.Kind == protocol.KindEyes {
+			return RelayResult{}, ErrForeignSession
+		}
+		if r.Origin == "relay" && !validSecret(r.Secret) {
+			return RelayResult{}, ErrRelayAuth
+		}
 	case err != nil:
 		return RelayResult{}, err
 	case prior.Scope != r.Scope, prior.Origin != r.Origin, prior.Kind != "" && prior.Kind != r.Kind:
@@ -104,12 +126,9 @@ func (s *Store) RegisterRelay(r RelayRegistration) (RelayResult, error) {
 	if err != nil {
 		return RelayResult{}, err
 	}
-	secret, hash := "", prior.secretHash
-	if r.Origin == "relay" && hash == "" {
-		if secret, err = secretHex(32); err != nil {
-			return RelayResult{}, err
-		}
-		hash = sha256Hex(secret)
+	hash := prior.secretHash
+	if hash == "" && r.Origin == "relay" {
+		hash = sha256Hex(r.Secret)
 	}
 	source := "join"
 	if r.Origin == "relay" {
@@ -127,7 +146,7 @@ func (s *Store) RegisterRelay(r RelayRegistration) (RelayResult, error) {
 	if err := tx.Commit(); err != nil {
 		return RelayResult{}, err
 	}
-	return RelayResult{Name: name, Secret: secret}, nil
+	return RelayResult{Name: name}, nil
 }
 
 // ReissueEyesChild re-mints the child session of a live task on its assigned
@@ -164,14 +183,17 @@ func (s *Store) ReissueEyesChild(taskID, launcherSession, launcherSecret string)
 		return RelayResult{}, ErrRelayAuth
 	}
 	session := "eyes-" + taskID
-	// The child belongs to the requester's workspace and nowhere else; a row
-	// for that session in another scope is somebody else's identity.
-	var scope string
-	switch err := tx.QueryRow(`SELECT scope FROM agents WHERE session_id=?`, session).Scan(&scope); {
-	case err == sql.ErrNoRows:
-	case err != nil:
+	// The child row is the task's own or it is not touched: any row wearing
+	// that session id which is not this relay's eyes row in the requester's
+	// workspace is somebody else's identity, and taking it over would also
+	// leave the session id naming two rows.
+	var foreign int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM agents WHERE session_id=?
+		AND NOT (scope=? AND origin='relay' AND kind=?)`,
+		session, t.RequesterScope, protocol.KindEyes).Scan(&foreign); err != nil {
 		return RelayResult{}, err
-	case scope != t.RequesterScope:
+	}
+	if foreign > 0 {
 		return RelayResult{}, ErrForeignSession
 	}
 	secret, err := secretHex(32)
@@ -199,17 +221,16 @@ type RelayIdentity struct {
 	secretHash                         string
 }
 
-// AgentBySession finds a row by session id across scopes - the relay's one
-// non-scoped identity read. A relay session id is minted per broker and per
-// child and cannot change scope, so it names exactly one row.
-func (s *Store) AgentBySession(sessionID string) (RelayIdentity, error) {
-	return s.agentBySession(s.db, sessionID)
-}
-
+// agentBySession finds a row by session id across scopes - the relay's one
+// non-scoped identity read, because the gate must authenticate a caller
+// before it knows which workspace answers for it. A relay session id names
+// exactly one row (RegisterRelay refuses a second scope for one, and
+// ReissueEyesChild refuses a child whose id is already taken), and the order
+// is fixed anyway so a squatted id resolves the same way every time.
 func (s *Store) agentBySession(q execQuerier, sessionID string) (RelayIdentity, error) {
 	var id RelayIdentity
 	err := q.QueryRow(`SELECT scope, name, agent_id, kind, origin, relay_secret_hash FROM agents
-		WHERE session_id=? ORDER BY registered_at LIMIT 1`, sessionID).
+		WHERE session_id=? ORDER BY registered_at, scope LIMIT 1`, sessionID).
 		Scan(&id.Scope, &id.Name, &id.AgentID, &id.Kind, &id.Origin, &id.secretHash)
 	if err == sql.ErrNoRows {
 		return RelayIdentity{}, ErrNoSession
@@ -218,10 +239,12 @@ func (s *Store) agentBySession(q execQuerier, sessionID string) (RelayIdentity, 
 }
 
 // VerifyRelaySecret authenticates a relay session: the row must exist, must
-// have been created over the relay, and must match the presented secret.
-// The compare is constant time so a wrong secret leaks no prefix.
+// have been created over the relay, and must match the presented secret. The
+// gate calls this before it knows the caller's workspace, which is sound
+// because one relay session id names one row (see agentBySession). The
+// compare is constant time so a wrong secret leaks no prefix.
 func (s *Store) VerifyRelaySecret(sessionID, secret string) (RelayIdentity, error) {
-	id, err := s.AgentBySession(sessionID)
+	id, err := s.agentBySession(s.db, sessionID)
 	if err != nil {
 		return RelayIdentity{}, err
 	}

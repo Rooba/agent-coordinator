@@ -214,11 +214,21 @@ func TestRelayTokenRejectsLooseFileMode(t *testing.T) {
 	if !strings.Contains(err.Error(), "0600") {
 		t.Fatalf("the error must say what is wrong: %v", err)
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
+	if err := os.Chmod(path, 0o604); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := RelayToken(); err != nil || got != hexToken {
-		t.Fatalf("a 0600 hex token file reads back: %q (%v)", got, err)
+	if got, err := RelayToken(); err == nil {
+		t.Fatalf("a token others may read must be refused, got %q", got)
+	}
+	// What matters is that nobody else can reach it, not the owner's own
+	// bits: a read-only 0400 token is still the owner's secret.
+	for _, mode := range []os.FileMode{0o600, 0o400} {
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := RelayToken(); err != nil || got != hexToken {
+			t.Fatalf("a %04o hex token file reads back: %q (%v)", mode, got, err)
+		}
 	}
 }
 

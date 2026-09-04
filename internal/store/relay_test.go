@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/Rooba/agent-coordinator/internal/protocol"
@@ -48,18 +49,25 @@ func count(t *testing.T, s *Store, query string, args ...any) int {
 	return n
 }
 
-// registerBroker registers a host broker the way the relay gate will, caps
-// included: a broker earns runtime-qualified briefs by advertising providers.
+// registerBroker registers a host broker the way the relay gate will: caps
+// included, because a broker earns runtime-qualified briefs by advertising
+// providers, and holding the secret it minted for itself. The store answers a
+// register with no secret, so the helper hands back the one the broker kept.
 func registerBroker(t *testing.T, s *Store, scope, session string) RelayResult {
 	t.Helper()
 	r, err := s.RegisterRelay(RelayRegistration{Scope: scope, SessionID: session,
 		Kind: protocol.KindLauncher, Origin: "relay", Platform: "windows",
-		Capabilities: []string{"browser.chrome", "provider.claude"}})
+		Secret: brokerSecret(session), Capabilities: []string{"browser.chrome", "provider.claude"}})
 	if err != nil {
 		t.Fatal(err)
 	}
+	r.Secret = brokerSecret(session)
 	return r
 }
+
+// brokerSecret is a test client's preminted credential: 64 lowercase hex,
+// stable per session so a retry presents the same one.
+func brokerSecret(session string) string { return sha256Hex("secret:" + session) }
 
 // A database written before the relay columns existed must migrate in place:
 // old rows survive on the new defaults and every column is present.
@@ -154,9 +162,9 @@ func TestListWorkspacesCountsByKindAndHidesHostScopes(t *testing.T) {
 	s.Register("/repo-a", "s-a1", "hook")
 	s.Register("/repo-a", "s-a2", "hook")
 	s.Register("/repo-b", "s-b1", "hook")
-	registerBroker(t, s, "host:BOX", "broker-1")
-	if _, err := s.RegisterRelay(RelayRegistration{Scope: "/repo-a", SessionID: "eyes-task-1",
-		Kind: protocol.KindEyes, Origin: "relay"}); err != nil {
+	broker := registerBroker(t, s, "host:BOX", "broker-1")
+	seedTaskIn(t, s, "/repo-a", "task-1", "broker-1", "queued", s.Now().Unix())
+	if _, err := s.ReissueEyesChild("task-1", "broker-1", broker.Secret); err != nil {
 		t.Fatal(err)
 	}
 	ws, err := s.ListWorkspaces()
@@ -185,11 +193,11 @@ func TestListEyesCrossesScopes(t *testing.T) {
 	s.Register("/repo-a", "s-a1", "hook")
 	if _, err := s.RegisterRelay(RelayRegistration{Scope: "host:BOX", SessionID: "broker-1",
 		Kind: protocol.KindLauncher, Origin: "relay", Platform: "windows",
-		Capabilities: []string{"browser.chrome"}}); err != nil {
+		Secret: brokerSecret("broker-1"), Capabilities: []string{"browser.chrome"}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.RegisterRelay(RelayRegistration{Scope: "/repo-a", SessionID: "eyes-task-1",
-		Kind: protocol.KindEyes, Origin: "relay"}); err != nil {
+	seedTaskIn(t, s, "/repo-a", "task-1", "broker-1", "queued", s.Now().Unix())
+	if _, err := s.ReissueEyesChild("task-1", "broker-1", brokerSecret("broker-1")); err != nil {
 		t.Fatal(err)
 	}
 	eyes, err := s.ListEyes()
@@ -274,8 +282,9 @@ func TestSendToScopeIsOneTransaction(t *testing.T) {
 func TestSendStampsSenderKindAndTaskID(t *testing.T) {
 	s := open(t)
 	nA, _ := s.Register("/r", "s-a", "hook")
-	child, err := s.RegisterRelay(RelayRegistration{Scope: "/r", SessionID: "eyes-task-9",
-		Kind: protocol.KindEyes, Origin: "relay"})
+	broker := registerBroker(t, s, "host:BOX", "broker-1")
+	seedTask(t, s, "task-9", "broker-1", "queued", s.Now().Unix())
+	child, err := s.ReissueEyesChild("task-9", "broker-1", broker.Secret)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,28 +298,30 @@ func TestSendStampsSenderKindAndTaskID(t *testing.T) {
 	}
 }
 
-// The secret is minted once, only for relay-origin rows, and only its sha256
-// is stored. Verification is by secret, not by session id alone.
-func TestRegisterRelayMintsSecretOnceAndBindsIt(t *testing.T) {
+// The client mints its own secret before the first register; the store keeps
+// only its sha256 and answers with nothing but the name. Verification is by
+// secret, not by session id alone.
+func TestRegisterRelayBindsThePremintedSecret(t *testing.T) {
 	s := open(t)
+	secret := brokerSecret("broker-1")
 	first, err := s.RegisterRelay(RelayRegistration{Scope: "host:BOX", SessionID: "broker-1",
-		Kind: protocol.KindLauncher, Origin: "relay"})
-	if err != nil || len(first.Secret) != 64 {
-		t.Fatalf("first register must mint 32 hex-encoded bytes: %+v (%v)", first, err)
+		Kind: protocol.KindLauncher, Origin: "relay", Secret: secret})
+	if err != nil || first.Name == "" || first.Secret != "" {
+		t.Fatalf("register must name the row and mint nothing: %+v (%v)", first, err)
 	}
 	again, err := s.RegisterRelay(RelayRegistration{Scope: "host:BOX", SessionID: "broker-1",
-		Kind: protocol.KindLauncher, Origin: "relay", Secret: first.Secret})
+		Kind: protocol.KindLauncher, Origin: "relay", Secret: secret})
 	if err != nil || again.Name != first.Name || again.Secret != "" {
-		t.Fatalf("re-register must be idempotent and mint nothing: %+v (%v)", again, err)
+		t.Fatalf("an exact retry must return the same identity: %+v (%v)", again, err)
 	}
 	var stored string
 	if err := s.db.QueryRow(`SELECT relay_secret_hash FROM agents WHERE session_id='broker-1'`).Scan(&stored); err != nil {
 		t.Fatal(err)
 	}
-	if stored == first.Secret || len(stored) != 64 {
+	if stored != sha256Hex(secret) {
 		t.Fatalf("the store must keep only the hash, got %q", stored)
 	}
-	id, err := s.VerifyRelaySecret("broker-1", first.Secret)
+	id, err := s.VerifyRelaySecret("broker-1", secret)
 	if err != nil || id.Name != first.Name || id.Scope != "host:BOX" || id.Kind != protocol.KindLauncher {
 		t.Fatalf("verify: %+v (%v)", id, err)
 	}
@@ -326,12 +337,68 @@ func TestRegisterRelayMintsSecretOnceAndBindsIt(t *testing.T) {
 	}
 }
 
+// A relay row is created only on a credential the client already holds, in
+// the one shape the wire fixes: 32 CSPRNG bytes as lowercase hex.
+func TestRegisterRelayRequiresPremintedSecret(t *testing.T) {
+	s := open(t)
+	for _, bad := range []string{"", "wrong", strings.Repeat("a", 63), strings.Repeat("a", 65),
+		strings.ToUpper(brokerSecret("broker-1")), strings.Repeat("g", 64)} {
+		if _, err := s.RegisterRelay(RelayRegistration{Scope: "host:BOX", SessionID: "broker-1",
+			Kind: protocol.KindLauncher, Origin: "relay", Secret: bad}); !errors.Is(err, ErrRelayAuth) {
+			t.Fatalf("secret %q must be ErrRelayAuth, got %v", bad, err)
+		}
+	}
+	if n := count(t, s, `SELECT COUNT(*) FROM agents`); n != 0 {
+		t.Fatalf("a refused registration must leave no row, got %d", n)
+	}
+	// A local kind-bearing row carries no secret at all: the socket
+	// directory's permissions are its trust boundary.
+	if _, err := s.RegisterRelay(RelayRegistration{Scope: "/r", SessionID: "local-1",
+		Kind: protocol.KindLauncher}); err != nil {
+		t.Fatalf("a local launcher needs no secret: %v", err)
+	}
+}
+
+// An eyes child is minted by the launcher holding its task, never by a
+// register: the shared token alone must not be able to create one.
+func TestRegisterRelayRefusesANewEyesRow(t *testing.T) {
+	s := open(t)
+	for _, origin := range []string{"relay", ""} {
+		if _, err := s.RegisterRelay(RelayRegistration{Scope: "/r", SessionID: "eyes-task-1",
+			Kind: protocol.KindEyes, Origin: origin, Secret: brokerSecret("eyes-task-1")}); !errors.Is(err, ErrForeignSession) {
+			t.Fatalf("a new eyes row with origin %q must be ErrForeignSession, got %v", origin, err)
+		}
+	}
+	if n := count(t, s, `SELECT COUNT(*) FROM agents`); n != 0 {
+		t.Fatalf("a refused eyes register must leave no row, got %d", n)
+	}
+}
+
+// A relay session id names one row in one workspace, which is what lets the
+// gate authenticate a session before it knows its scope: the right secret
+// does not buy the same id in a second scope.
+func TestRelaySessionIDIsUniqueAcrossScopes(t *testing.T) {
+	s := open(t)
+	broker := registerBroker(t, s, "host:BOX", "broker-1")
+	if _, err := s.RegisterRelay(RelayRegistration{Scope: "/repo-a", SessionID: "broker-1",
+		Kind: protocol.KindLauncher, Origin: "relay", Secret: broker.Secret}); !errors.Is(err, ErrForeignSession) {
+		t.Fatalf("a second scope must be ErrForeignSession even with the right secret, got %v", err)
+	}
+	if n := count(t, s, `SELECT COUNT(*) FROM agents WHERE session_id='broker-1'`); n != 1 {
+		t.Fatalf("a relay session must own exactly one row, got %d", n)
+	}
+	if id, err := s.VerifyRelaySecret("broker-1", broker.Secret); err != nil || id.Scope != "host:BOX" {
+		t.Fatalf("the original row still answers: %+v (%v)", id, err)
+	}
+}
+
 // A launcher keeps one session across reconnects, so re-registering it means
 // proving the minted secret; a session created locally is never claimable.
 func TestRegisterRelayReRegisterNeedsTheSecret(t *testing.T) {
 	s := open(t)
 	first, err := s.RegisterRelay(RelayRegistration{Scope: "host:BOX", SessionID: "broker-1",
-		Kind: protocol.KindLauncher, Origin: "relay", Platform: "windows"})
+		Kind: protocol.KindLauncher, Origin: "relay", Platform: "windows",
+		Secret: brokerSecret("broker-1")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,7 +409,7 @@ func TestRegisterRelayReRegisterNeedsTheSecret(t *testing.T) {
 		}
 	}
 	again, err := s.RegisterRelay(RelayRegistration{Scope: "host:BOX", SessionID: "broker-1",
-		Kind: protocol.KindLauncher, Origin: "relay", Secret: first.Secret,
+		Kind: protocol.KindLauncher, Origin: "relay", Secret: brokerSecret("broker-1"),
 		Platform: "windows-11", Capabilities: []string{"browser.chrome"}})
 	if err != nil || again.Name != first.Name || again.Secret != "" {
 		t.Fatalf("re-register with the secret: %+v (%v)", again, err)
@@ -353,7 +420,7 @@ func TestRegisterRelayReRegisterNeedsTheSecret(t *testing.T) {
 	}
 	s.Register("/r", "hook-session", "hook")
 	if _, err := s.RegisterRelay(RelayRegistration{Scope: "/r", SessionID: "hook-session",
-		Kind: protocol.KindEyes, Origin: "relay"}); !errors.Is(err, ErrForeignSession) {
+		Kind: protocol.KindLauncher, Origin: "relay", Secret: brokerSecret("hook-session")}); !errors.Is(err, ErrForeignSession) {
 		t.Fatalf("a relay caller must not claim a local session, got %v", err)
 	}
 }
@@ -399,7 +466,7 @@ func TestRegisterRelayIsOneTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := s.RegisterRelay(RelayRegistration{Scope: "host:BOX", SessionID: "broker-1",
-		Kind: protocol.KindLauncher, Origin: "relay"}); err == nil {
+		Kind: protocol.KindLauncher, Origin: "relay", Secret: brokerSecret("broker-1")}); err == nil {
 		t.Fatal("a failing metadata write must fail the registration")
 	}
 	if n := count(t, s, `SELECT COUNT(*) FROM agents WHERE session_id='broker-1'`); n != 0 {
@@ -409,8 +476,8 @@ func TestRegisterRelayIsOneTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	r, err := s.RegisterRelay(RelayRegistration{Scope: "host:BOX", SessionID: "broker-1",
-		Kind: protocol.KindLauncher, Origin: "relay"})
-	if err != nil || len(r.Secret) != 64 {
+		Kind: protocol.KindLauncher, Origin: "relay", Secret: brokerSecret("broker-1")})
+	if err != nil || r.Name == "" {
 		t.Fatalf("the retry must register cleanly: %+v (%v)", r, err)
 	}
 }
@@ -452,14 +519,9 @@ func TestReissueEyesChild(t *testing.T) {
 		}
 	}
 	// A relay row that is not a launcher cannot mint a child even holding its
-	// own valid secret.
-	imposter, err := s.RegisterRelay(RelayRegistration{Scope: "/r", SessionID: "imposter-1",
-		Kind: protocol.KindEyes, Origin: "relay"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	seedTask(t, s, "task-5", "imposter-1", "queued", s.Now().Unix())
-	if _, err := s.ReissueEyesChild("task-5", "imposter-1", imposter.Secret); !errors.Is(err, ErrForeignSession) {
+	// own valid secret - the task's own child included.
+	seedTask(t, s, "task-5", "eyes-task-1", "queued", s.Now().Unix())
+	if _, err := s.ReissueEyesChild("task-5", "eyes-task-1", again.Secret); !errors.Is(err, ErrForeignSession) {
 		t.Fatalf("a non-launcher row must not mint a child, got %v", err)
 	}
 
@@ -480,12 +542,46 @@ func TestReissueEyesChild(t *testing.T) {
 	}
 }
 
+// The child row is the task's own or it is not touched: a session id that
+// already belongs to a local agent, or to a row in another workspace, is
+// somebody else's identity.
+func TestReissueEyesChildRefusesAForeignRow(t *testing.T) {
+	s := open(t)
+	broker := registerBroker(t, s, "host:BOX", "broker-1")
+
+	// A local agent squatting the child's session id.
+	seedTask(t, s, "task-1", "broker-1", "queued", s.Now().Unix())
+	s.Register("/r", "eyes-task-1", "hook")
+	if _, err := s.ReissueEyesChild("task-1", "broker-1", broker.Secret); !errors.Is(err, ErrForeignSession) {
+		t.Fatalf("a local row must not be taken over, got %v", err)
+	}
+	var kind, origin, hash string
+	if err := s.db.QueryRow(`SELECT kind, origin, relay_secret_hash FROM agents WHERE session_id='eyes-task-1'`).
+		Scan(&kind, &origin, &hash); err != nil {
+		t.Fatal(err)
+	}
+	if kind != "" || origin != "" || hash != "" {
+		t.Fatalf("the local row must be untouched: kind=%q origin=%q hash=%q", kind, origin, hash)
+	}
+
+	// A relay row wearing the child's session id in another workspace.
+	registerBroker(t, s, "host:BOX", "eyes-task-2")
+	seedTask(t, s, "task-2", "broker-1", "queued", s.Now().Unix())
+	if _, err := s.ReissueEyesChild("task-2", "broker-1", broker.Secret); !errors.Is(err, ErrForeignSession) {
+		t.Fatalf("another scope's row must not be cloned, got %v", err)
+	}
+	if n := count(t, s, `SELECT COUNT(*) FROM agents WHERE session_id='eyes-task-2'`); n != 1 {
+		t.Fatalf("the reissue must not add a second row, got %d", n)
+	}
+}
+
 // A live eyes child must not make the workspace look hook-occupied: an MCP
 // client that self-mints while a child runs would otherwise be refused.
 func TestRelayAgentDoesNotBlockSelfMintedIdentity(t *testing.T) {
 	s := open(t)
-	if _, err := s.RegisterRelay(RelayRegistration{Scope: "/r", SessionID: "eyes-task-1",
-		Kind: protocol.KindEyes, Origin: "relay"}); err != nil {
+	broker := registerBroker(t, s, "host:BOX", "broker-1")
+	seedTask(t, s, "task-1", "broker-1", "queued", s.Now().Unix())
+	if _, err := s.ReissueEyesChild("task-1", "broker-1", broker.Secret); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.RegisterIfNoLiveHook("/r", "mcp-abc", "mcp"); err != nil {
