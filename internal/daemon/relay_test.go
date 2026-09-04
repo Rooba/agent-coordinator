@@ -538,3 +538,177 @@ func TestRelayInsecureSkipsOnlyTheToken(t *testing.T) {
 		t.Fatalf("the allowlist still holds: %+v", r)
 	}
 }
+
+// registerUnix registers a hook session over the unix socket and returns its
+// full ref: only whoami reports the agent id a cross-scope target addresses.
+func registerUnix(t *testing.T, sock, scope, session string) protocol.AgentRef {
+	t.Helper()
+	if r := roundTrip(t, sock, protocol.Request{Op: protocol.OpRegister, Scope: scope,
+		SessionID: session, Source: "hook"}); !r.OK || r.Name == "" {
+		t.Fatalf("register %s/%s: %+v", scope, session, r)
+	}
+	who := roundTrip(t, sock, protocol.Request{Op: protocol.OpWhoami, Scope: scope, SessionID: session})
+	if !who.OK {
+		t.Fatalf("whoami %s/%s: %+v", scope, session, who)
+	}
+	return protocol.AgentRef{Name: who.Name, AgentID: who.AgentID, Scope: scope}
+}
+
+// The workspace directory and the eyes listing are cross-scope reads that need
+// no from, and the reserved host: scope stays out of the directory - it is
+// broker plumbing, which list_eyes is where it belongs.
+func TestListWorkspacesAndListEyes(t *testing.T) {
+	sock, addr, tok := startRelayDaemon(t)
+	registerUnix(t, sock, "/repo-a", "s-a")
+	registerUnix(t, sock, "/repo-b", "s-b")
+	launcher, secret := registerLauncher(t, addr, tok, "broker-1", "host:BOX")
+
+	ws := roundTrip(t, sock, protocol.Request{Op: protocol.OpListWorkspaces})
+	if !ws.OK || len(ws.Workspaces) != 2 {
+		t.Fatalf("want two workspaces, got %+v", ws)
+	}
+	for _, w := range ws.Workspaces {
+		if strings.HasPrefix(w.Scope, "host:") {
+			t.Fatalf("a host: scope must not be listed as a workspace: %+v", ws.Workspaces)
+		}
+		if w.LiveAgents != 1 {
+			t.Fatalf("occupancy: %+v", w)
+		}
+	}
+	eyes := roundTrip(t, sock, protocol.Request{Op: protocol.OpListEyes})
+	if !eyes.OK || len(eyes.Agents) != 1 {
+		t.Fatalf("want the launcher, got %+v", eyes)
+	}
+	if a := eyes.Agents[0]; a.Name != launcher.Name || a.Kind != protocol.KindLauncher ||
+		a.Scope != "host:BOX" || a.Origin != relayOrigin || a.Platform != "windows" ||
+		len(a.Capabilities) != 2 {
+		t.Fatalf("launcher row: %+v", a)
+	}
+	// In-scope the board answers for one workspace, so it carries the relay
+	// fields but no scope of its own.
+	board := roundTrip(t, sock, protocol.Request{Op: protocol.OpBoard, Scope: "host:BOX"})
+	if !board.OK || len(board.Agents) != 1 {
+		t.Fatalf("host board: %+v", board)
+	}
+	if a := board.Agents[0]; a.Kind != protocol.KindLauncher || a.Origin != relayOrigin ||
+		a.Platform != "windows" || len(a.Capabilities) != 2 || a.Scope != "" {
+		t.Fatalf("board row: %+v", a)
+	}
+	// The broker reads the same directory over the relay.
+	over := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpListWorkspaces,
+		SessionID: "broker-1", Token: tok, SessionSecret: secret})
+	if !over.OK || len(over.Workspaces) != 2 {
+		t.Fatalf("relay list_workspaces: %+v", over)
+	}
+}
+
+// send_workspace delivers into another scope, and the daemon - not the caller -
+// stamps who it is from: a client-supplied reply_to is ignored.
+func TestSendWorkspaceStampsSenderAndIgnoresClientReplyTo(t *testing.T) {
+	sock, _, _ := startRelayDaemon(t)
+	a := registerUnix(t, sock, "/repo-a", "s-a")
+	b := registerUnix(t, sock, "/repo-b", "s-b")
+	r := roundTrip(t, sock, protocol.Request{Op: protocol.OpSendWorkspace, Scope: "/repo-a", SessionID: "s-a",
+		From: a.Name, Body: "hello over there",
+		Target:  &protocol.AgentRef{Scope: "/repo-b", Name: b.Name},
+		ReplyTo: &protocol.AgentRef{Name: "impostor", AgentID: "deadbeef1234", Scope: "/elsewhere"}})
+	if !r.OK {
+		t.Fatalf("send_workspace: %+v", r)
+	}
+	// An agent id beats a name: names are per-scope labels, ids are stable.
+	if byID := roundTrip(t, sock, protocol.Request{Op: protocol.OpSendWorkspace, Scope: "/repo-a",
+		SessionID: "s-a", Body: "by id",
+		Target: &protocol.AgentRef{Scope: "/repo-b", Name: "no-such-agent", AgentID: b.AgentID}}); !byID.OK {
+		t.Fatalf("target by agent id: %+v", byID)
+	}
+	// An unknown target is the store's own refusal, not a silent drop.
+	for _, target := range []*protocol.AgentRef{{Scope: "/repo-b", Name: "ghost"}, {Scope: "/nowhere", Name: b.Name}} {
+		bad := roundTrip(t, sock, protocol.Request{Op: protocol.OpSendWorkspace, Scope: "/repo-a",
+			SessionID: "s-a", Body: "nobody home", Target: target})
+		if bad.OK || !strings.Contains(bad.Error, "no agent") {
+			t.Fatalf("target %+v: %+v", target, bad)
+		}
+	}
+	read := roundTrip(t, sock, protocol.Request{Op: protocol.OpRead, Scope: "/repo-b", From: b.Name})
+	if !read.OK || len(read.Messages) != 2 {
+		t.Fatalf("recipient inbox: %+v", read)
+	}
+	m := read.Messages[0]
+	if m.From != a.Name || m.FromScope != "/repo-a" || m.Body != "hello over there" || m.Broadcast {
+		t.Fatalf("delivered message: %+v", m)
+	}
+	if m.ReplyTo == nil || *m.ReplyTo != a {
+		t.Fatalf("reply_to must be the authenticated sender %+v, got %+v", a, m.ReplyTo)
+	}
+	// The sender's own workspace saw nothing.
+	if own := roundTrip(t, sock, protocol.Request{Op: protocol.OpRead, Scope: "/repo-a", From: a.Name}); len(own.Messages) != 0 {
+		t.Fatalf("the message must not land in the sender's scope: %+v", own.Messages)
+	}
+}
+
+// No target name means a scoped broadcast: everyone live in that workspace.
+func TestSendWorkspaceWithoutNameReachesEveryone(t *testing.T) {
+	sock, _, _ := startRelayDaemon(t)
+	a := registerUnix(t, sock, "/repo-a", "s-a")
+	b1 := registerUnix(t, sock, "/repo-b", "s-b1")
+	b2 := registerUnix(t, sock, "/repo-b", "s-b2")
+	r := roundTrip(t, sock, protocol.Request{Op: protocol.OpSendWorkspace, Scope: "/repo-a", SessionID: "s-a",
+		From: a.Name, Body: "heads up", Target: &protocol.AgentRef{Scope: "/repo-b"}})
+	if !r.OK {
+		t.Fatalf("scoped broadcast: %+v", r)
+	}
+	for _, ref := range []protocol.AgentRef{b1, b2} {
+		read := roundTrip(t, sock, protocol.Request{Op: protocol.OpRead, Scope: "/repo-b", From: ref.Name})
+		if len(read.Messages) != 1 || !read.Messages[0].Broadcast || read.Messages[0].FromScope != "/repo-a" {
+			t.Fatalf("%s inbox: %+v", ref.Name, read.Messages)
+		}
+	}
+}
+
+// A relay client's identity is the row it proved it owns: the return address
+// is stamped from that row, and the task id it chose is dropped.
+func TestRelaySendWorkspaceStampsTheLauncher(t *testing.T) {
+	sock, addr, tok := startRelayDaemon(t)
+	b := registerUnix(t, sock, "/repo-b", "s-b")
+	launcher, secret := registerLauncher(t, addr, tok, "broker-1", "host:BOX")
+	r := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpSendWorkspace, SessionID: "broker-1",
+		Token: tok, SessionSecret: secret, Scope: "/elsewhere", From: "impostor",
+		Body: "chrome is up", TaskID: "task-000000000000",
+		Target:  &protocol.AgentRef{Scope: "/repo-b", Name: b.Name},
+		ReplyTo: &protocol.AgentRef{Name: "impostor", AgentID: "deadbeef1234", Scope: "/elsewhere"}})
+	if !r.OK {
+		t.Fatalf("relay send_workspace: %+v", r)
+	}
+	read := roundTrip(t, sock, protocol.Request{Op: protocol.OpRead, Scope: "/repo-b", From: b.Name})
+	if !read.OK || len(read.Messages) != 1 {
+		t.Fatalf("recipient inbox: %+v", read)
+	}
+	m := read.Messages[0]
+	if m.From != launcher.Name || m.FromScope != "host:BOX" || m.Kind != protocol.KindLauncher {
+		t.Fatalf("delivered message: %+v", m)
+	}
+	want := protocol.AgentRef{Name: launcher.Name, AgentID: launcher.AgentID, Scope: "host:BOX"}
+	if m.ReplyTo == nil || *m.ReplyTo != want {
+		t.Fatalf("reply_to must be the proven row %+v, got %+v", want, m.ReplyTo)
+	}
+	if m.TaskID != "" {
+		t.Fatalf("a task id is the daemon's to stamp: %+v", m)
+	}
+}
+
+// Every identified call is a heartbeat, the new ops included: a listing lifts
+// a sticky idle back to active.
+func TestNewOpsRefreshTheCaller(t *testing.T) {
+	sock, _, _ := startRelayDaemon(t)
+	a := registerUnix(t, sock, "/r", "s-a")
+	roundTrip(t, sock, protocol.Request{Op: protocol.OpIdle, Scope: "/r", SessionID: "s-a"})
+	board := roundTrip(t, sock, protocol.Request{Op: protocol.OpBoard, Scope: "/r", IncludeGone: true})
+	if len(board.Agents) != 1 || board.Agents[0].Status != "idle" {
+		t.Fatalf("precondition - the agent must be idle: %+v", board.Agents)
+	}
+	roundTrip(t, sock, protocol.Request{Op: protocol.OpListWorkspaces, Scope: "/r", SessionID: "s-a"})
+	board = roundTrip(t, sock, protocol.Request{Op: protocol.OpBoard, Scope: "/r", IncludeGone: true})
+	if len(board.Agents) != 1 || board.Agents[0].Status != "active" || board.Agents[0].Name != a.Name {
+		t.Fatalf("list_workspaces must count as a heartbeat: %+v", board.Agents)
+	}
+}

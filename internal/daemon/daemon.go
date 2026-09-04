@@ -83,7 +83,8 @@ func dialable(sock string) bool {
 var fromOps = map[string]bool{
 	protocol.OpSend: true, protocol.OpBroadcast: true, protocol.OpRead: true,
 	protocol.OpPeek: true, protocol.OpClaim: true, protocol.OpRelease: true,
-	protocol.OpHistory: true,
+	protocol.OpHistory: true, protocol.OpSendWorkspace: true,
+	protocol.OpRequestEyes: true, protocol.OpCancelEyes: true,
 }
 
 // relayReady is a test seam: a test binds 127.0.0.1:0 and needs the port the
@@ -256,25 +257,29 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 			}
 		}
 	}
-	// MCP heartbeat: any tool call that names its bound session keeps that row
-	// fresh (and lifts sticky idle); Touch never resurrects a gone row.
-	if req.SessionID != "" {
-		switch req.Op {
-		case protocol.OpBoard, protocol.OpAgents, protocol.OpSend, protocol.OpRead, protocol.OpPeek, protocol.OpBroadcast,
-			protocol.OpClaim, protocol.OpRelease, protocol.OpClaims, protocol.OpHistory:
-			if err := st.Touch(req.Scope, req.SessionID); err != nil {
-				return fail(err)
-			}
-		}
-	}
-	// One identity for the whole request: an explicit from must belong to
-	// the calling session, so the cases below can trust req.From.
+	// One identity for the whole request: an explicit from must belong to the
+	// calling session, so the cases below can trust req.From - and the ops that
+	// stamp a return address use this ref, never a client's.
+	var actor protocol.AgentRef
 	if fromOps[req.Op] {
 		id, err := st.ResolveActor(req.Scope, req.SessionID, req.From)
 		if err != nil {
 			return fail(err)
 		}
 		req.From = id.Name
+		actor = protocol.AgentRef{Name: id.Name, AgentID: id.AgentID, Scope: req.Scope}
+	}
+	// Any identified call is a heartbeat that keeps the row fresh and lifts
+	// sticky idle. The exceptions set their own freshness (register, event,
+	// idle, deregister) or must not resurrect a retired row (whoami).
+	if req.SessionID != "" {
+		switch req.Op {
+		case protocol.OpRegister, protocol.OpDeregister, protocol.OpIdle, protocol.OpEvent, protocol.OpWhoami:
+		default:
+			if err := st.Touch(req.Scope, req.SessionID); err != nil {
+				return fail(err)
+			}
+		}
 	}
 	switch req.Op {
 	case protocol.OpRegister:
@@ -336,7 +341,8 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 		}
 		return protocol.Response{OK: true, Agents: agents}
 	case protocol.OpSend:
-		if err := st.Send(req.Scope, req.From, req.To, req.Body); err != nil {
+		if err := st.SendToScope(store.Delivery{FromScope: req.Scope, FromName: req.From,
+			ToName: req.To, Body: req.Body, TaskID: req.TaskID}); err != nil {
 			return fail(err)
 		}
 	case protocol.OpRead:
@@ -384,6 +390,31 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 			return fail(err)
 		}
 		return protocol.Response{OK: true, History: hist}
+	case protocol.OpListWorkspaces:
+		ws, err := st.ListWorkspaces()
+		if err != nil {
+			return fail(err)
+		}
+		return protocol.Response{OK: true, Workspaces: ws}
+	case protocol.OpListEyes:
+		eyes, err := st.ListEyes()
+		if err != nil {
+			return fail(err)
+		}
+		return protocol.Response{OK: true, Agents: eyes}
+	case protocol.OpSendWorkspace:
+		// The sender and the return address are the actor resolved above, so a
+		// reply can never be redirected by whatever the caller put in reply_to.
+		d := store.Delivery{FromScope: req.Scope, FromName: actor.Name, Body: req.Body, ReplyTo: &actor}
+		if t := req.Target; t != nil {
+			d.ToScope, d.ToName = t.Scope, t.Name
+			if t.AgentID != "" {
+				d.ToName = t.AgentID // an id beats a name: names are per-scope labels
+			}
+		}
+		if err := st.SendToScope(d); err != nil {
+			return fail(err)
+		}
 	default:
 		return fail(errors.New("unknown op " + req.Op))
 	}
