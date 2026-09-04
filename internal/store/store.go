@@ -117,6 +117,9 @@ func Open(path string) (*Store, error) {
 		`ALTER TABLE messages ADD COLUMN reply_to TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE messages ADD COLUMN task_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT ''`,
+		// A task carries the deadline it was created with, so expiring it is a
+		// property of the row rather than of whoever happens to sweep.
+		`ALTER TABLE eyes_tasks ADD COLUMN deadline_s INTEGER NOT NULL DEFAULT 300`,
 	} {
 		if _, err := db.Exec(alter); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
@@ -816,6 +819,12 @@ func age(secs int64) string {
 
 func (s *Store) Housekeep() error {
 	now := s.Now()
+	// Fail what ran out of time before anything is purged: a deadline is at
+	// most 30 minutes, well inside the two hours an agent row survives, so
+	// the requester is still there to be told.
+	if _, err := s.ExpireEyesTasks(now); err != nil {
+		return err
+	}
 	day := int64(86400)
 	stmts := []struct {
 		q   string

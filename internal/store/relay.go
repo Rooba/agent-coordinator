@@ -80,17 +80,20 @@ type RelayRegistration struct {
 // answers with the name alone.
 type RelayResult struct{ Name, Secret string }
 
-// RegisterRelay registers a kind-bearing agent. A relay session id names
-// exactly ONE row: scope, kind and origin are fixed when it is created, and a
-// re-register refreshes only platform and caps, so holding a secret can never
-// move or clone an identity. The client mints its own secret before its first
+// RegisterRelay registers a launcher. A relay session id names exactly ONE
+// row: scope, kind and origin are fixed when it is created, and a re-register
+// refreshes only platform and caps, so holding a secret can never move or
+// clone an identity. The client mints its own secret before its first
 // register and presents that same one on every retry - the store keeps only
 // its sha256 - so a lost response costs a retry, never an identity. Eyes rows
-// are not born here at all: only the launcher holding the task may mint its
-// child, through ReissueEyesChild, so a new eyes register is refused as a
-// foreign session.
+// never pass through here at all: ReissueEyesChild is the only thing that
+// creates or refreshes one, on the authority of the launcher holding its task.
 func (s *Store) RegisterRelay(r RelayRegistration) (RelayResult, error) {
-	if r.Kind != protocol.KindEyes && r.Kind != protocol.KindLauncher {
+	switch r.Kind {
+	case protocol.KindEyes:
+		return RelayResult{}, ErrForeignSession
+	case protocol.KindLauncher:
+	default:
 		return RelayResult{}, errors.New("register: kind must be eyes or launcher")
 	}
 	tx, err := s.db.Begin()
@@ -103,9 +106,6 @@ func (s *Store) RegisterRelay(r RelayRegistration) (RelayResult, error) {
 	prior, err := s.agentBySession(tx, r.SessionID)
 	switch {
 	case errors.Is(err, ErrNoSession):
-		if r.Kind == protocol.KindEyes {
-			return RelayResult{}, ErrForeignSession
-		}
 		if r.Origin == "relay" && !validSecret(r.Secret) {
 			return RelayResult{}, ErrRelayAuth
 		}

@@ -360,8 +360,9 @@ func TestRegisterRelayRequiresPremintedSecret(t *testing.T) {
 }
 
 // An eyes child is minted by the launcher holding its task, never by a
-// register: the shared token alone must not be able to create one.
-func TestRegisterRelayRefusesANewEyesRow(t *testing.T) {
+// register: the shared token alone must not be able to create one, and a
+// register must not touch one that already exists either.
+func TestRegisterRelayNeverTouchesAnEyesRow(t *testing.T) {
 	s := open(t)
 	for _, origin := range []string{"relay", ""} {
 		if _, err := s.RegisterRelay(RelayRegistration{Scope: "/r", SessionID: "eyes-task-1",
@@ -371,6 +372,28 @@ func TestRegisterRelayRefusesANewEyesRow(t *testing.T) {
 	}
 	if n := count(t, s, `SELECT COUNT(*) FROM agents`); n != 0 {
 		t.Fatalf("a refused eyes register must leave no row, got %d", n)
+	}
+	broker := registerBroker(t, s, "host:BOX", "broker-1")
+	seedTask(t, s, "task-1", "broker-1", "queued", s.Now().Unix())
+	child, err := s.ReissueEyesChild("task-1", "broker-1", broker.Secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RegisterRelay(RelayRegistration{Scope: "/r", SessionID: "eyes-task-1",
+		Kind: protocol.KindEyes, Origin: "relay", Secret: child.Secret,
+		Platform: "windows", Capabilities: []string{"browser.chrome"}}); !errors.Is(err, ErrForeignSession) {
+		t.Fatalf("re-registering an eyes row must be ErrForeignSession, got %v", err)
+	}
+	var platform, caps string
+	if err := s.db.QueryRow(`SELECT platform, caps FROM agents WHERE session_id='eyes-task-1'`).
+		Scan(&platform, &caps); err != nil {
+		t.Fatal(err)
+	}
+	if platform != "" || caps != "[]" {
+		t.Fatalf("the refused register must refresh nothing: platform=%q caps=%q", platform, caps)
+	}
+	if _, err := s.VerifyRelaySecret("eyes-task-1", child.Secret); err != nil {
+		t.Fatalf("the reissued child must keep its credential: %v", err)
 	}
 }
 

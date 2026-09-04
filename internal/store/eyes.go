@@ -17,10 +17,6 @@ const (
 	// task. A healthy launcher polls its inbox at least every 5s, so 30s
 	// means "still polling" - much tighter than the 2 minute presence window.
 	launcherWindow = 30 * time.Second
-	// staleTaskWindow is how long an unfinished task keeps its launcher
-	// reserved. Past it the broker has died or lost the job, and the ledger
-	// row must not hold the host out of service until the 24h purge.
-	staleTaskWindow = 30 * time.Minute
 	// The requester's bound on one host job, applied where the launch body is
 	// built so every caller gets the same rule.
 	eyesDeadlineDefault = 300
@@ -61,6 +57,10 @@ var providerOrder = []string{"claude", "codex", "grok"}
 // whole JSON array element rather than a prefix of one.
 func providerCap(runtime string) string { return `"provider.` + runtime + `"` }
 
+// browserCap is what makes a broker eyes rather than just a shell: a brief is
+// browser work, so a host that cannot drive Chrome takes none of it.
+const browserCap = `"browser.chrome"`
+
 // defaultProvider is the runtime an unqualified brief runs on: the first
 // provider this broker advertises, in providerOrder.
 func defaultProvider(caps string) string {
@@ -97,8 +97,9 @@ func (s *Store) PickLauncher() (LauncherRef, error) {
 
 // pickLauncher takes the best live broker for a runtime, and its three
 // outcomes are three different answers for the requester: nobody is polling,
-// nobody runs that provider, or everyone who does is busy. One query decides
-// all three because the rows sort provider-match first, then free first.
+// nobody can run that brief, or everyone who can is busy. One query decides
+// all three because the rows sort match first, then free first. A match is
+// Chrome AND the provider - eyes without a browser is not eyes.
 func (s *Store) pickLauncher(q execQuerier, runtime string) (LauncherRef, error) {
 	var l LauncherRef
 	var matches, busy bool
@@ -110,17 +111,17 @@ func (s *Store) pickLauncher(q execQuerier, runtime string) (LauncherRef, error)
 	if runtime != "" {
 		needle = providerCap(runtime)
 	}
-	// A task nobody has advanced for staleTaskWindow is abandoned, not in
-	// flight, and stops reserving its launcher. substr rather than LIKE keeps
-	// host: one case-sensitive rule, the same one ListWorkspaces hides by.
+	// Any live task reserves its broker; ExpireEyesTasks is what hands one
+	// back when nobody reports. substr rather than LIKE keeps host: one
+	// case-sensitive rule, the same one ListWorkspaces hides by.
 	err := q.QueryRow(`SELECT a.session_id, a.scope, a.name, a.agent_id, a.caps,
-		instr(a.caps, ?) > 0 AS matches,
+		instr(a.caps, ?) > 0 AND instr(a.caps, ?) > 0 AS matches,
 		EXISTS(SELECT 1 FROM eyes_tasks t WHERE t.launcher_session = a.session_id
-		       AND t.state IN ('queued','accepted') AND t.updated_at >= ?) AS busy
+		       AND t.state IN ('queued','accepted')) AS busy
 		FROM agents a WHERE a.kind=? AND a.origin='relay' AND substr(a.scope,1,?)=?
 		AND a.status != 'gone' AND a.last_seen >= ?
 		ORDER BY matches DESC, busy, a.last_seen DESC LIMIT 1`,
-		needle, now.Add(-staleTaskWindow).Unix(), protocol.KindLauncher,
+		needle, browserCap, protocol.KindLauncher,
 		len(hostScopePrefix), hostScopePrefix, now.Add(-launcherWindow).Unix()).
 		Scan(&l.SessionID, &l.Scope, &l.Name, &l.AgentID, &l.caps, &matches, &busy)
 	switch {
@@ -158,7 +159,8 @@ type EyesRequest struct {
 // starts it. The task id is minted here, so there is no id a caller could
 // replay: every accepted call is a new task by construction. A brief that
 // named no runtime gets the broker's first advertised provider, recorded on
-// the task so nothing downstream has to guess.
+// the task along with its bounded deadline so nothing downstream - the sweep
+// that fails an abandoned task included - has to guess either.
 func (s *Store) AssignEyesTask(req EyesRequest) (EyesTask, protocol.AgentRef, error) {
 	if !validRuntime(req.Runtime) {
 		return EyesTask{}, protocol.AgentRef{}, fmt.Errorf("%w: %q", ErrBadRuntime, req.Runtime)
@@ -184,19 +186,19 @@ func (s *Store) AssignEyesTask(req EyesRequest) (EyesTask, protocol.AgentRef, er
 			return EyesTask{}, protocol.AgentRef{}, ErrNoProvider
 		}
 	}
-	now := s.Now().Unix()
+	now, deadline := s.Now().Unix(), eyesDeadline(req.DeadlineS)
 	t := EyesTask{TaskID: "task-" + suffix, RequesterScope: req.Requester.Scope,
 		RequesterAgentID: req.Requester.AgentID, LauncherSession: l.SessionID,
 		Runtime: runtime, State: "queued", CreatedAt: now, UpdatedAt: now}
 	if _, err := tx.Exec(`INSERT INTO eyes_tasks
-		(task_id, requester_scope, requester_agent_id, launcher_session, runtime, state, created_at, updated_at)
-		VALUES (?,?,?,?,?,'queued',?,?)`,
-		t.TaskID, t.RequesterScope, t.RequesterAgentID, t.LauncherSession, t.Runtime, now, now); err != nil {
+		(task_id, requester_scope, requester_agent_id, launcher_session, runtime, state, deadline_s, created_at, updated_at)
+		VALUES (?,?,?,?,?,'queued',?,?,?)`,
+		t.TaskID, t.RequesterScope, t.RequesterAgentID, t.LauncherSession, t.Runtime, deadline, now, now); err != nil {
 		return EyesTask{}, protocol.AgentRef{}, err
 	}
 	body, err := json.Marshal(protocol.TaskLaunchMsg{Type: protocol.TaskLaunch, TaskID: t.TaskID,
 		Runtime: runtime, Scope: req.Requester.Scope, Brief: req.Brief,
-		ReplyTo: req.Requester, DeadlineS: eyesDeadline(req.DeadlineS)})
+		ReplyTo: req.Requester, DeadlineS: deadline})
 	if err != nil {
 		return EyesTask{}, protocol.AgentRef{}, err
 	}
@@ -291,26 +293,32 @@ const (
 	roleLauncher  eyesRole = "launcher"
 	roleChild     eyesRole = "child"
 	roleRequester eyesRole = "requester"
+	roleSystem    eyesRole = "system"
 )
 
 // eyesEdges is the whole task lifecycle in one table: per target state, which
 // role may ask for it and from which states. The launcher acks a brief and
 // may give up on one it never accepted; once it has accepted, its child owns
 // the outcome; the requester's side may call the whole thing off while it is
-// still live. Anything absent here is not a transition.
+// still live; and the deadline sweep may fail anything still live, because a
+// task nobody reports on must not run out the ledger. Anything absent here is
+// not a transition.
 var eyesEdges = map[string]map[eyesRole][]string{
-	"accepted":  {roleLauncher: {"queued"}},
-	"done":      {roleChild: {"accepted"}},
-	"failed":    {roleChild: {"queued", "accepted"}, roleLauncher: {"queued"}},
+	"accepted": {roleLauncher: {"queued"}},
+	"done":     {roleChild: {"accepted"}},
+	"failed": {roleChild: {"queued", "accepted"}, roleLauncher: {"queued"},
+		roleSystem: {"queued", "accepted"}},
 	"cancelled": {roleRequester: {"queued", "accepted"}},
 }
 
 // eyesActor is how a caller proves which side it is: a relay session id (the
-// assigned launcher, or the task's child) or a local agent ref (the requester
-// or one of its bound children).
+// assigned launcher, or the task's child), a local agent ref (the requester
+// or one of its bound children), or System for the deadline sweep, which
+// speaks for nobody.
 type eyesActor struct {
 	Session string
 	Ref     protocol.AgentRef
+	System  bool
 }
 
 // TransitionEyesTask applies one lifecycle move made by a relay session - the
@@ -380,6 +388,8 @@ func (s *Store) moveEyesTask(taskID, to string, a eyesActor, msg string) (EyesTa
 // no standing in it.
 func (s *Store) eyesRole(q execQuerier, t EyesTask, a eyesActor) eyesRole {
 	switch {
+	case a.System:
+		return roleSystem
 	case a.Session == "":
 		if s.actsFor(q, t.RequesterScope, a.Ref.AgentID, t.RequesterAgentID) {
 			return roleRequester
@@ -393,10 +403,11 @@ func (s *Store) eyesRole(q execQuerier, t EyesTask, a eyesActor) eyesRole {
 }
 
 // eyesMail addresses the message a move implies: a cancel goes to the broker
-// holding the job and carries its own task.cancel body, while an ack or a
-// report goes back to the requester carrying what the actor sent. It reports
-// false when there is nobody left to tell - an agent row is purged hours
-// before its task is, and that must not block the move.
+// holding the job and carries its own task.cancel body, while an ack, a
+// report or a deadline failure goes back to the requester carrying what the
+// actor sent. It reports false when there is nobody left to speak or to tell
+// - an agent row is purged hours before its task is, and that must not block
+// the move.
 func (s *Store) eyesMail(q execQuerier, t EyesTask, role eyesRole, a eyesActor, msg string) (Delivery, bool, error) {
 	if role == roleRequester {
 		l, err := s.agentBySession(q, t.LauncherSession)
@@ -416,13 +427,80 @@ func (s *Store) eyesMail(q execQuerier, t EyesTask, role eyesRole, a eyesActor, 
 		return Delivery{FromScope: t.RequesterScope, FromName: senderKey(ref), ToScope: l.Scope,
 			ToName: l.AgentID, Body: string(cancel), ReplyTo: &ref, TaskID: t.TaskID}, true, nil
 	}
-	actor, err := s.agentBySession(q, a.Session)
+	actor, err := s.taskVoice(q, t, a.Session)
+	if errors.Is(err, ErrNoSession) {
+		return Delivery{}, false, nil // nobody is left to speak for the task
+	}
 	if err != nil {
 		return Delivery{}, false, err
 	}
 	ref := protocol.AgentRef{Name: actor.Name, AgentID: actor.AgentID, Scope: actor.Scope}
 	return Delivery{FromScope: actor.Scope, FromName: senderKey(ref), ToScope: t.RequesterScope,
 		ToName: t.RequesterAgentID, Body: msg, ReplyTo: &ref, TaskID: t.TaskID}, true, nil
+}
+
+// taskVoice is the identity a report leaves under: the actor's own session,
+// or - when the deadline sweep settles a task with no caller at all - the
+// task's child, falling back to the broker that was holding it.
+func (s *Store) taskVoice(q execQuerier, t EyesTask, session string) (RelayIdentity, error) {
+	if session != "" {
+		return s.agentBySession(q, session)
+	}
+	id, err := s.agentBySession(q, "eyes-"+t.TaskID)
+	if errors.Is(err, ErrNoSession) {
+		return s.agentBySession(q, t.LauncherSession)
+	}
+	return id, err
+}
+
+// ExpireEyesTasks fails every live task whose deadline has passed and tells
+// its requester, so a broker that died mid-job neither strands the requester
+// nor holds its launcher out of service. It returns how many it settled, and
+// goes through the same transition path as any other move, so an expiry is a
+// state change with its mail and nothing else.
+func (s *Store) ExpireEyesTasks(now time.Time) (int, error) {
+	ids, err := s.expiredTasks(now)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, id := range ids {
+		body, err := json.Marshal(protocol.TaskFailedMsg{Type: protocol.TaskFailed,
+			TaskID: id, Error: "deadline exceeded"})
+		if err != nil {
+			return n, err
+		}
+		_, moved, err := s.moveEyesTask(id, "failed", eyesActor{System: true}, string(body))
+		if err != nil {
+			return n, err
+		}
+		if moved {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// expiredTasks names the live tasks past their deadline, oldest first. Its
+// cursor closes before any of them is settled: one connection serves the
+// whole store, so a read still open would block every write.
+func (s *Store) expiredTasks(now time.Time) ([]string, error) {
+	rows, err := s.db.Query(`SELECT task_id FROM eyes_tasks
+		WHERE state IN ('queued','accepted') AND created_at + deadline_s < ?
+		ORDER BY created_at`, now.Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // actsFor reports whether agentID is the owner or one of the owner's bound

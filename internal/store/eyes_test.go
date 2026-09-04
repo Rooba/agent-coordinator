@@ -114,22 +114,30 @@ func TestPickLauncherSkipsBusyLauncher(t *testing.T) {
 	}
 }
 
-// A task nobody has advanced for half an hour is abandoned, not in flight: it
-// must not pin its launcher out of service for the 24h ledger retention.
-func TestPickLauncherIgnoresStaleTasks(t *testing.T) {
+// Eyes work means driving a browser, so a broker that runs a provider but
+// cannot reach Chrome takes no brief at all - it is "no matching provider",
+// not a launcher that happens to be free.
+func TestPickLauncherRequiresTheBrowserCap(t *testing.T) {
 	s := open(t)
 	now := time.Unix(4000000, 0)
 	s.Now = func() time.Time { return now }
-	registerBroker(t, s, "host:BOX", "broker-1")
-	seedTask(t, s, "task-fresh", "broker-1", "accepted", now.Unix()-1799)
-	if _, err := s.PickLauncher(); !errors.Is(err, ErrEyesBusy) {
-		t.Fatalf("a task touched within 1800s still holds its launcher, got %v", err)
-	}
-	if _, err := s.db.Exec(`UPDATE eyes_tasks SET updated_at=? WHERE task_id='task-fresh'`, now.Unix()-1801); err != nil {
+	if _, err := s.RegisterRelay(RelayRegistration{Scope: "host:BOX", SessionID: "browserless",
+		Kind: protocol.KindLauncher, Origin: "relay", Secret: brokerSecret("browserless"),
+		Capabilities: []string{"provider.claude"}}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := s.PickLauncher(); !errors.Is(err, ErrNoProvider) {
+		t.Fatalf("a broker without browser.chrome must be ErrNoProvider, got %v", err)
+	}
+	registerBroker(t, s, "host:BOX", "broker-1")
 	if l, err := s.PickLauncher(); err != nil || l.SessionID != "broker-1" {
-		t.Fatalf("a stale task must not block the launcher: %+v (%v)", l, err)
+		t.Fatalf("the broker that can drive Chrome: %+v (%v)", l, err)
+	}
+	// Precedence still runs match, then busy: the browserless row cannot stand
+	// in for the one broker that could have taken the job.
+	seedTask(t, s, "task-1", "broker-1", "accepted", now.Unix())
+	if _, err := s.PickLauncher(); !errors.Is(err, ErrEyesBusy) {
+		t.Fatalf("the only capable broker is busy, got %v", err)
 	}
 }
 
@@ -484,7 +492,7 @@ func TestAssignEyesTaskMatchesProvider(t *testing.T) {
 	// ErrNoProvider even while a free broker is polling.
 	if _, err := s.RegisterRelay(RelayRegistration{Scope: "host:BOX", SessionID: "broker-2",
 		Kind: protocol.KindLauncher, Origin: "relay", Platform: "windows",
-		Secret: brokerSecret("broker-2"), Capabilities: []string{"provider.codex"}}); err != nil {
+		Secret: brokerSecret("broker-2"), Capabilities: []string{"browser.chrome", "provider.codex"}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := s.AssignEyesTask(EyesRequest{Requester: ref, Runtime: "claude", Brief: "b"}); !errors.Is(err, ErrEyesBusy) {
@@ -587,7 +595,7 @@ func TestAssignEyesTaskChoosesADefaultProvider(t *testing.T) {
 		ref := protocol.AgentRef{Name: name, AgentID: agentID("s-a"), Scope: "/r"}
 		broker, err := s.RegisterRelay(RelayRegistration{Scope: "host:BOX", SessionID: "broker-1",
 			Kind: protocol.KindLauncher, Origin: "relay", Secret: brokerSecret("broker-1"),
-			Capabilities: c.caps})
+			Capabilities: append([]string{"browser.chrome"}, c.caps...)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -660,6 +668,91 @@ func TestCancelEyesTaskAfterTheLauncherIsPurged(t *testing.T) {
 	}
 	if n := count(t, s, `SELECT COUNT(*) FROM messages`); n != before {
 		t.Fatalf("nobody is left to tell, got %d messages (was %d)", n, before)
+	}
+}
+
+// A task past its deadline is failed by the ledger itself: the requester is
+// told once, as the child, and the broker is free again - expiry is what
+// hands a launcher back when nobody reports.
+func TestExpireEyesTasks(t *testing.T) {
+	s := open(t)
+	now := time.Unix(7000000, 0)
+	s.Now = func() time.Time { return now }
+	requester, _, task, child := liveTask(t, s)
+
+	if n, err := s.ExpireEyesTasks(now); err != nil || n != 0 {
+		t.Fatalf("a task inside its deadline must not expire: %d (%v)", n, err)
+	}
+	if _, err := s.db.Exec(`UPDATE eyes_tasks SET created_at=? WHERE task_id=?`,
+		now.Unix()-301, task.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PickLauncher(); !errors.Is(err, ErrEyesBusy) {
+		t.Fatalf("an unexpired task still holds its launcher, got %v", err)
+	}
+	n, err := s.ExpireEyesTasks(now)
+	if err != nil || n != 1 {
+		t.Fatalf("the deadline must fail the task: %d (%v)", n, err)
+	}
+	got, err := s.EyesTask(task.TaskID)
+	if err != nil || got.State != "failed" || got.UpdatedAt != now.Unix() {
+		t.Fatalf("expired task: %+v (%v)", got, err)
+	}
+	msgs, err := s.Read("/r", requester.Name)
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("requester mail: %d (%v)", len(msgs), err)
+	}
+	var body protocol.TaskFailedMsg
+	if err := json.Unmarshal([]byte(msgs[0].Body), &body); err != nil {
+		t.Fatalf("failure body %q: %v", msgs[0].Body, err)
+	}
+	if body.Type != protocol.TaskFailed || body.TaskID != task.TaskID || body.Error != "deadline exceeded" ||
+		msgs[0].From != child.Name || msgs[0].Kind != protocol.KindEyes || msgs[0].TaskID != task.TaskID {
+		t.Fatalf("failure mail: %+v body %+v", msgs[0], body)
+	}
+	if l, err := s.PickLauncher(); err != nil || l.SessionID != "broker-1" {
+		t.Fatalf("an expired task frees its launcher: %+v (%v)", l, err)
+	}
+	if pending, err := s.PendingLaunches("broker-1"); err != nil || len(pending) != 0 {
+		t.Fatalf("an expired task is no longer work to run: %+v (%v)", pending, err)
+	}
+	if n, err := s.ExpireEyesTasks(now); err != nil || n != 0 {
+		t.Fatalf("a settled task expires once: %d (%v)", n, err)
+	}
+	if n := count(t, s, `SELECT COUNT(*) FROM messages WHERE task_id=?`, task.TaskID); n != 2 {
+		t.Fatalf("a second pass must send nothing: %d task messages", n)
+	}
+}
+
+// The bound the requester asked for is the one the sweep enforces, so the
+// deadline is stored on the task, and Housekeep is what runs the sweep.
+func TestExpireEyesTasksUsesTheStoredDeadline(t *testing.T) {
+	s := open(t)
+	now := time.Unix(7100000, 0)
+	s.Now = func() time.Time { return now }
+	name, _ := s.Register("/r", "s-a", "hook")
+	registerBroker(t, s, "host:BOX", "broker-1")
+	ref := protocol.AgentRef{Name: name, AgentID: agentID("s-a"), Scope: "/r"}
+	task, _, err := s.AssignEyesTask(EyesRequest{Requester: ref, Brief: "b", DeadlineS: 9999})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := count(t, s, `SELECT deadline_s FROM eyes_tasks WHERE task_id=?`, task.TaskID); d != 1800 {
+		t.Fatalf("the ledger must record the capped deadline, got %d", d)
+	}
+	now = now.Add(1799 * time.Second)
+	if n, err := s.ExpireEyesTasks(now); err != nil || n != 0 {
+		t.Fatalf("inside the deadline: %d (%v)", n, err)
+	}
+	now = now.Add(2 * time.Second)
+	if err := s.Housekeep(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.EyesTask(task.TaskID); err != nil || got.State != "failed" {
+		t.Fatalf("Housekeep must fail a task past its deadline: %+v (%v)", got, err)
+	}
+	if n, _ := s.UnreadCount("/r", name); n != 1 {
+		t.Fatalf("the requester must hear about the deadline, unread=%d", n)
 	}
 }
 
