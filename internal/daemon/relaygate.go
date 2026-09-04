@@ -139,27 +139,45 @@ func (g *relayGate) register(req *protocol.Request) (protocol.Response, bool) {
 	case protocol.KindEyes:
 		// Only the launcher already holding this task's launch may spin its
 		// child up: the session id names the task, auth_session_id and the
-		// secret name the launcher, and the store proves the pairing.
+		// secret name the launcher, and the store proves the pairing. All
+		// ownership, existence and state failures share one answer so this gate
+		// is not a task-discovery oracle.
 		taskID, named := strings.CutPrefix(req.SessionID, eyesSessionPrefix)
 		if !named || req.AuthSessionID == "" {
 			return refuse("unauthorized")
 		}
+		launcher, err := g.st.VerifyRelaySecret(req.AuthSessionID, req.SessionSecret)
+		if err != nil || launcher.Kind != protocol.KindLauncher {
+			return refuse("unauthorized")
+		}
 		task, err := g.st.EyesTask(taskID)
 		if err != nil {
-			return refuse(relayError(err))
+			return refuse(childRegisterError(err))
 		}
 		// The child lives in the requesting workspace, not one the caller
 		// picks, so a broker asking for any other scope is refused outright.
 		if task.RequesterScope != req.Scope {
-			return refuse("foreign session")
+			return refuse("unauthorized")
 		}
 		reg, err := g.st.ReissueEyesChild(taskID, req.AuthSessionID, req.SessionSecret)
 		if err != nil {
-			return refuse(relayError(err))
+			return refuse(childRegisterError(err))
 		}
 		return g.registered(task.RequesterScope, req.SessionID, reg.Secret)
 	}
 	return refuse("op not allowed on relay")
+}
+
+// childRegisterError hides every expected property of an eyes task. A real
+// storage failure still follows the relay's generic internal-error path.
+func childRegisterError(err error) string {
+	for _, hidden := range []error{store.ErrUnknownTask, store.ErrNotYourTask, store.ErrTaskNotLive,
+		store.ErrForeignSession, store.ErrRelayAuth, store.ErrNoSession} {
+		if errors.Is(err, hidden) {
+			return "unauthorized"
+		}
+	}
+	return relayError(err)
 }
 
 // registered answers a register with the row that was actually written. The

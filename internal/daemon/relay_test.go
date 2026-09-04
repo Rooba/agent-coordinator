@@ -254,7 +254,7 @@ func TestRelayEyesChildNeedsItsLaunchersAuthority(t *testing.T) {
 	elsewhere := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpRegister, Scope: "/other",
 		SessionID: child, Kind: protocol.KindEyes, Token: tok,
 		AuthSessionID: "broker-1", SessionSecret: brokerSecret})
-	if elsewhere.OK || elsewhere.Error != "foreign session" {
+	if elsewhere.OK || elsewhere.Error != "unauthorized" {
 		t.Fatalf("eyes child in a foreign scope: %+v", elsewhere)
 	}
 	// Another broker holds a valid secret, but not this task.
@@ -262,7 +262,7 @@ func TestRelayEyesChildNeedsItsLaunchersAuthority(t *testing.T) {
 	poached := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpRegister, Scope: "/r",
 		SessionID: child, Kind: protocol.KindEyes, Token: tok,
 		AuthSessionID: "broker-2", SessionSecret: otherSecret})
-	if poached.OK || poached.Error != "not your task" {
+	if poached.OK || poached.Error != "unauthorized" {
 		t.Fatalf("only the assigned launcher mints the child: %+v", poached)
 	}
 
@@ -293,6 +293,28 @@ func TestRelayEyesChildNeedsItsLaunchersAuthority(t *testing.T) {
 	}
 	if kinds[minted.Name] != protocol.KindEyes {
 		t.Fatalf("child on the requester board: %+v", board.Agents)
+	}
+	unknown := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpRegister, Scope: "/r",
+		SessionID: "eyes-task-000000000000", Kind: protocol.KindEyes, Token: tok,
+		AuthSessionID: "broker-1", SessionSecret: brokerSecret})
+	if unknown.OK || unknown.Error != "unauthorized" {
+		t.Fatalf("an unknown task must reveal no lifecycle detail: %+v", unknown)
+	}
+	if _, ok, err := st.TransitionEyesTask(task.TaskID,
+		store.EyesActor{Scope: "host:BOX", SessionID: "broker-1", Origin: store.RelayOrigin},
+		"accepted", `{}`); err != nil || !ok {
+		t.Fatalf("settled-state setup accept: ok=%v (%v)", ok, err)
+	}
+	if _, ok, err := st.TransitionEyesTask(task.TaskID,
+		store.EyesActor{Scope: "/r", SessionID: child, Origin: store.RelayOrigin},
+		"failed", `{}`); err != nil || !ok {
+		t.Fatalf("settled-state setup fail: ok=%v (%v)", ok, err)
+	}
+	settled := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpRegister, Scope: "/r",
+		SessionID: child, Kind: protocol.KindEyes, Token: tok,
+		AuthSessionID: "broker-1", SessionSecret: brokerSecret})
+	if settled.OK || settled.Error != "unauthorized" {
+		t.Fatalf("a settled task must reveal no lifecycle detail: %+v", settled)
 	}
 }
 
@@ -389,6 +411,36 @@ func TestUnixRequestsNeedNoToken(t *testing.T) {
 	}
 	if w := roundTrip(t, sock, protocol.Request{Op: protocol.OpWhoami, Scope: "/r", SessionID: "s-a"}); !w.OK {
 		t.Fatalf("whoami stays a unix op: %+v", w)
+	}
+}
+
+// Kind is a client claim on the unix socket, not authority to poll a broker's
+// durable queue. Only the authenticated relay launcher's stored provenance and
+// role may suppress ledger rows and add pending work.
+func TestUnixKindCannotSelectBrokerPolling(t *testing.T) {
+	sock, addr, tok := startRelayDaemon(t)
+	requester := registerUnix(t, sock, "/r", "s-a")
+	_, secret := registerLauncher(t, addr, tok, "broker-1", "host:BOX")
+	local := registerUnix(t, sock, "/r", "broker-1")
+	ordinary := `{"note":{"type":"task.launch","task_id":"quoted-only"}}`
+	if r := roundTrip(t, sock, protocol.Request{Op: protocol.OpSend, Scope: "/r",
+		SessionID: "s-a", From: requester.Name, To: local.Name, Body: ordinary}); !r.OK {
+		t.Fatalf("ordinary mail: %+v", r)
+	}
+	task := roundTrip(t, sock, protocol.Request{Op: protocol.OpRequestEyes, Scope: "/r",
+		SessionID: "s-a", From: requester.Name, Brief: "look"})
+	if !task.OK {
+		t.Fatalf("request_eyes: %+v", task)
+	}
+	forged := roundTrip(t, sock, protocol.Request{Op: protocol.OpRead, Scope: "/r",
+		SessionID: "broker-1", From: local.Name, Kind: protocol.KindLauncher})
+	if !forged.OK || len(forged.Messages) != 1 || forged.Messages[0].Body != ordinary || forged.Messages[0].TaskID != "" {
+		t.Fatalf("unix kind claim must be an ordinary own-scope read: %+v", forged)
+	}
+	real := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpRead, SessionID: "broker-1",
+		Kind: protocol.KindEyes, Token: tok, SessionSecret: secret})
+	if !real.OK || len(real.Messages) != 1 || real.Messages[0].TaskID != task.TaskID {
+		t.Fatalf("stored relay launcher role must receive the durable launch: %+v", real)
 	}
 }
 
@@ -909,7 +961,7 @@ func TestEyesTaskRoundTrip(t *testing.T) {
 	}
 	// The broker replies to the address the launch carried, exactly as it
 	// would for any other mail.
-	target := &protocol.AgentRef{Scope: launch.ReplyTo.Scope, Name: launch.ReplyTo.Name}
+	target := &launch.ReplyTo
 	accepted, err := json.Marshal(protocol.TaskAcceptedMsg{Type: protocol.TaskAccepted, TaskID: launch.TaskID,
 		Child: &protocol.AgentRef{Name: minted.Name, AgentID: minted.AgentID, Scope: launch.Scope}})
 	if err != nil {
@@ -920,7 +972,8 @@ func TestEyesTaskRoundTrip(t *testing.T) {
 		t.Fatalf("task.accepted: %+v", r)
 	}
 	result, err := json.Marshal(protocol.TaskResultMsg{Type: protocol.TaskResult, TaskID: launch.TaskID,
-		Status: "ok", Summary: "the login page renders"})
+		Status: "succeeded", Summary: "the login page renders",
+		Observations: []string{}, Actions: []string{}, Evidence: []string{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -983,7 +1036,7 @@ func TestLauncherPollRedeliversAQueuedLaunch(t *testing.T) {
 		t.Fatal(err)
 	}
 	if r := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpSendWorkspace, SessionID: "broker-1",
-		Token: tok, SessionSecret: secret, Body: string(accepted)}); !r.OK {
+		Token: tok, SessionSecret: secret, Body: string(accepted), Target: &a}); !r.OK {
 		t.Fatalf("task.accepted: %+v", r)
 	}
 	if done := poll(protocol.OpRead); len(done.Messages) != 0 {
@@ -1076,7 +1129,7 @@ func TestLauncherPollRedeliversAnUnackedCancel(t *testing.T) {
 		t.Fatal(err)
 	}
 	if r := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpSendWorkspace, SessionID: "broker-1",
-		Token: tok, SessionSecret: secret, Body: string(accepted)}); !r.OK {
+		Token: tok, SessionSecret: secret, Body: string(accepted), Target: &a}); !r.OK {
 		t.Fatalf("task.accepted: %+v", r)
 	}
 	if c := roundTrip(t, sock, protocol.Request{Op: protocol.OpCancelEyes, Scope: "/r",
@@ -1100,7 +1153,7 @@ func TestLauncherPollRedeliversAnUnackedCancel(t *testing.T) {
 		t.Fatal(err)
 	}
 	if r := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpSendWorkspace, SessionID: child,
-		Token: tok, SessionSecret: minted.SessionSecret, Body: string(failed)}); !r.OK {
+		Token: tok, SessionSecret: minted.SessionSecret, Body: string(failed), Target: &a}); !r.OK {
 		t.Fatalf("the child answers the cancel: %+v", r)
 	}
 	if done := poll(protocol.OpRead); len(done.Messages) != 0 {
@@ -1132,18 +1185,19 @@ func TestPlainMailCannotSpeakForATask(t *testing.T) {
 		t.Fatalf("request_eyes: %+v", req)
 	}
 	send := func(body string) protocol.Response {
-		return roundTrip(t, sock, protocol.Request{Op: protocol.OpSend, Scope: "/r",
-			SessionID: "s-b", From: b.Name, To: a.Name, Body: body})
+		return roundTrip(t, sock, protocol.Request{Op: protocol.OpSendWorkspace, Scope: "/r",
+			SessionID: "s-b", From: b.Name, Target: &a, Body: body})
 	}
 	result, err := json.Marshal(protocol.TaskResultMsg{Type: protocol.TaskResult,
-		TaskID: req.TaskID, Status: "ok", Summary: "mine now"})
+		TaskID: req.TaskID, Status: "succeeded", Summary: "mine now",
+		Observations: []string{}, Actions: []string{}, Evidence: []string{}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if r := send(string(result)); r.OK || r.Error != "not your task" {
 		t.Fatalf("only the task's own child reports for it: %+v", r)
 	}
-	if r := send(`{"type":"task.result","task_id":"task-000000000000"}`); r.OK || r.Error != "unknown task" {
+	if r := send(`{"type":"task.failed","task_id":"task-000000000000","error":"failed"}`); r.OK || r.Error != "unknown task" {
 		t.Fatalf("a task id nobody minted: %+v", r)
 	}
 	if r := send("just talking"); !r.OK {
@@ -1247,23 +1301,102 @@ func TestOnlyARelayRowSpeaksForATask(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The broker's own session id, presented over the unix socket.
-	if r := roundTrip(t, sock, protocol.Request{Op: protocol.OpSend, Scope: "host:BOX",
-		SessionID: "broker-1", From: launcher.Name, To: launcher.Name,
+	if r := roundTrip(t, sock, protocol.Request{Op: protocol.OpSendWorkspace, Scope: "host:BOX",
+		SessionID: "broker-1", From: launcher.Name, Target: &a,
 		Body: string(accepted)}); r.OK || r.Error != "not your task" {
 		t.Fatalf("a unix caller has no standing in the ledger: %+v", r)
 	}
 	// A second broker registering under the child's session id: its row lives
 	// in its own host scope, so it is not the requester's child.
-	other, otherSecret := registerLauncher(t, addr, tok, "eyes-"+req.TaskID, "host:BOX2")
+	_, otherSecret := registerLauncher(t, addr, tok, "eyes-"+req.TaskID, "host:BOX2")
 	result, err := json.Marshal(protocol.TaskResultMsg{Type: protocol.TaskResult,
-		TaskID: req.TaskID, Status: "ok"})
+		TaskID: req.TaskID, Status: "succeeded", Summary: "done",
+		Observations: []string{}, Actions: []string{}, Evidence: []string{}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpSend, SessionID: "eyes-" + req.TaskID,
-		Token: tok, SessionSecret: otherSecret, To: other.Name,
+	if r := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpSendWorkspace, SessionID: "eyes-" + req.TaskID,
+		Token: tok, SessionSecret: otherSecret, Target: &a,
 		Body: string(result)}); r.OK || r.Error != "not your task" {
 		t.Fatalf("a launcher row must not report as the child: %+v", r)
+	}
+}
+
+// Lifecycle frames are a strict typed protocol: malformed fields, trailing
+// JSON and a non-canonical return address cannot become transitions or mail.
+func TestTaskReportsRequireStrictEnvelopeAndCanonicalTarget(t *testing.T) {
+	sock, addr, tok, st := relayDaemon(t)
+	requester := registerUnix(t, sock, "/r", "s-a")
+	_, launcherSecret := registerLauncher(t, addr, tok, "broker-1", "host:BOX")
+	req := roundTrip(t, sock, protocol.Request{Op: protocol.OpRequestEyes, Scope: "/r",
+		SessionID: "s-a", From: requester.Name, Brief: "look"})
+	if !req.OK {
+		t.Fatalf("request_eyes: %+v", req)
+	}
+	childSession := "eyes-" + req.TaskID
+	child := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpRegister, Scope: "/r",
+		SessionID: childSession, Kind: protocol.KindEyes, Token: tok,
+		AuthSessionID: "broker-1", SessionSecret: launcherSecret})
+	if !child.OK {
+		t.Fatalf("child register: %+v", child)
+	}
+	accepted, err := json.Marshal(protocol.TaskAcceptedMsg{Type: protocol.TaskAccepted, TaskID: req.TaskID,
+		Child: &protocol.AgentRef{Name: child.Name, AgentID: child.AgentID, Scope: "/r"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	badTarget := requester
+	badTarget.AgentID = "deadbeef1234"
+	for name, call := range map[string]protocol.Request{
+		"missing target": {Op: protocol.OpSendWorkspace, Body: string(accepted)},
+		"wrong target":   {Op: protocol.OpSendWorkspace, Body: string(accepted), Target: &badTarget},
+		"wrong op":       {Op: protocol.OpSend, Body: string(accepted), To: requester.Name},
+		"unknown field":  {Op: protocol.OpSendWorkspace, Body: strings.TrimSuffix(string(accepted), "}") + `,"extra":true}`, Target: &requester},
+		"trailing json":  {Op: protocol.OpSendWorkspace, Body: string(accepted) + `{}`, Target: &requester},
+		"truncated json": {Op: protocol.OpSendWorkspace,
+			Body: `{"type":"task.accepted","task_id":"` + req.TaskID + `"`, Target: &requester},
+		"duplicate type": {Op: protocol.OpSendWorkspace,
+			Body: `{"type":"note","type":"task.accepted","task_id":"` + req.TaskID + `"}`, Target: &requester},
+		"wrong field type": {Op: protocol.OpSendWorkspace,
+			Body: `{"type":"task.accepted","task_id":"` + req.TaskID + `","child":"not-a-ref"}`, Target: &requester},
+	} {
+		call.SessionID, call.Token, call.SessionSecret = "broker-1", tok, launcherSecret
+		if r := tcpRoundTrip(t, addr, call); r.OK || r.Error != "reserved task message" {
+			t.Fatalf("%s must be refused: %+v", name, r)
+		}
+		if task, err := st.EyesTask(req.TaskID); err != nil || task.State != "queued" {
+			t.Fatalf("%s moved the task: %+v (%v)", name, task, err)
+		}
+	}
+	if r := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpSendWorkspace,
+		SessionID: "broker-1", Token: tok, SessionSecret: launcherSecret,
+		Body: string(accepted), Target: &requester}); !r.OK {
+		t.Fatalf("valid accepted: %+v", r)
+	}
+	for name, body := range map[string]string{
+		"missing arrays":       `{"type":"task.result","task_id":"` + req.TaskID + `","status":"succeeded","summary":"done"}`,
+		"failed missing error": `{"type":"task.failed","task_id":"` + req.TaskID + `"}`,
+		"unknown field": `{"type":"task.result","task_id":"` + req.TaskID +
+			`","status":"succeeded","summary":"done","observations":[],"actions":[],"evidence":[],"extra":true}`,
+		"bad status": `{"type":"task.result","task_id":"` + req.TaskID +
+			`","status":"ok","summary":"done","observations":[],"actions":[],"evidence":[]}`,
+	} {
+		r := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpSendWorkspace,
+			SessionID: childSession, Token: tok, SessionSecret: child.SessionSecret,
+			Body: body, Target: &requester})
+		if r.OK || r.Error != "reserved task message" {
+			t.Fatalf("%s must be refused: %+v", name, r)
+		}
+	}
+	valid, err := json.Marshal(protocol.TaskResultMsg{Type: protocol.TaskResult, TaskID: req.TaskID,
+		Status: "succeeded", Summary: "done", Observations: []string{}, Actions: []string{}, Evidence: []string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpSendWorkspace,
+		SessionID: childSession, Token: tok, SessionSecret: child.SessionSecret,
+		Body: string(valid), Target: &requester}); !r.OK {
+		t.Fatalf("valid result: %+v", r)
 	}
 }
 

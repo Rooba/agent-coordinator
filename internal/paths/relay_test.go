@@ -71,6 +71,9 @@ func TestRelayTokenCreateThenReuse(t *testing.T) {
 	if perm := fi.Mode().Perm(); perm != 0o600 && perm != 0o666 { // windows reports 0666
 		t.Fatalf("token file mode %v, want 0600", perm)
 	}
+	if body, err := os.ReadFile(path); err != nil || string(body) != first {
+		t.Fatalf("token file must contain exactly the token: %q (%v)", body, err)
+	}
 	again, err := RelayToken()
 	if err != nil || again != first {
 		t.Fatalf("token must be stable: %q then %q (%v)", first, again, err)
@@ -172,7 +175,7 @@ const hexToken = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd
 // reported, never repaired: a short or hand-typed secret guards the whole
 // relay, and silently replacing it would break the paired broker instead.
 func TestRelayTokenRejectsMalformedFile(t *testing.T) {
-	for _, body := range []string{"hunter2\n", hexToken[:63] + "\n", hexToken + "extra\n",
+	for _, body := range []string{"hunter2\n", hexToken[:63], hexToken + "\n", hexToken + "extra\n",
 		strings.ToUpper(hexToken) + "\n", "zzzz56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01\n"} {
 		dir := t.TempDir()
 		t.Setenv("AC_DB", filepath.Join(dir, "coordinator.db"))
@@ -204,7 +207,7 @@ func TestRelayTokenRejectsLooseFileMode(t *testing.T) {
 	t.Setenv("AC_DB", filepath.Join(dir, "coordinator.db"))
 	t.Setenv("AC_TOKEN", "")
 	path := filepath.Join(dir, "relay.token")
-	if err := os.WriteFile(path, []byte(hexToken+"\n"), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(hexToken), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	got, err := RelayToken()
@@ -241,11 +244,12 @@ func TestRelayTokenEnvOverrideMustBeMinted(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "relay.token"), []byte("junk\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("AC_TOKEN", "  "+hexToken+"  ")
+	t.Setenv("AC_TOKEN", hexToken)
 	if got, err := RelayToken(); err != nil || got != hexToken {
 		t.Fatalf("a minted AC_TOKEN must win over the file: %q (%v)", got, err)
 	}
-	for _, bad := range []string{"paired-by-hand", hexToken[:63], hexToken + "0", strings.ToUpper(hexToken)} {
+	for _, bad := range []string{"paired-by-hand", hexToken[:63], hexToken + "0", strings.ToUpper(hexToken),
+		"  " + hexToken + "  ", hexToken + "\n"} {
 		t.Setenv("AC_TOKEN", bad)
 		got, err := RelayToken()
 		if err == nil {
@@ -254,5 +258,39 @@ func TestRelayTokenEnvOverrideMustBeMinted(t *testing.T) {
 		if !strings.Contains(err.Error(), "AC_TOKEN") {
 			t.Fatalf("the error must name the variable: %v", err)
 		}
+	}
+}
+
+// A token is a tiny owner-only regular file, never a link or an unbounded
+// stream. Rejecting these shapes before decoding avoids following a replaced
+// path or reading attacker-controlled input into memory.
+func TestRelayTokenRejectsUnsafeFiles(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink and unix mode semantics are covered on unix")
+	}
+	for name, setup := range map[string]func(string) error{
+		"directory": func(path string) error { return os.Mkdir(path, 0o700) },
+		"oversized": func(path string) error {
+			return os.WriteFile(path, []byte(strings.Repeat("a", 1024)), 0o600)
+		},
+		"symlink": func(path string) error {
+			target := path + ".target"
+			if err := os.WriteFile(target, []byte(hexToken), 0o600); err != nil {
+				return err
+			}
+			return os.Symlink(target, path)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Setenv("AC_DB", filepath.Join(dir, "coordinator.db"))
+			t.Setenv("AC_TOKEN", "")
+			if err := setup(filepath.Join(dir, "relay.token")); err != nil {
+				t.Fatal(err)
+			}
+			if token, err := RelayToken(); err == nil {
+				t.Fatalf("unsafe token file must be refused, got %q", token)
+			}
+		})
 	}
 }

@@ -1252,7 +1252,7 @@ func TestPickLauncherMatchesOnlyKnownProviders(t *testing.T) {
 	}
 }
 
-// The redelivery queue matches the body's type wherever it sits, so
+// The redelivery queue uses the daemon's task stamp and ledger order, so
 // reordering the launch struct's fields cannot silently empty it.
 func TestPendingTaskMailMatchesAnyFieldOrder(t *testing.T) {
 	s := open(t)
@@ -1295,18 +1295,23 @@ func TestLedgerBodiesAreNotABrokersOrdinaryMail(t *testing.T) {
 	if _, err := s.CancelEyesTask(task.TaskID, localActor(requester)); err != nil {
 		t.Fatal(err)
 	}
+	ordinary := `{"note":{"type":"task.launch","task_id":"quoted-only"}}`
+	if err := s.SendToScope(Delivery{FromScope: "/r", FromName: requester.Name,
+		ToScope: "host:BOX", ToName: broker.Name, Body: ordinary}); err != nil {
+		t.Fatal(err)
+	}
 	// The rows are real mail - they are what the ledger redelivers - but a
 	// broker's own poll never sees them raw.
-	if info, err := s.PeekMail("host:BOX", broker.Name, 0); err != nil || info.Unread != 2 {
-		t.Fatalf("the launch and the cancel are still delivered rows: %+v (%v)", info, err)
+	if info, err := s.PeekMail("host:BOX", broker.Name, 0); err != nil || info.Unread != 3 {
+		t.Fatalf("the launch, cancel and ordinary mail are delivered rows: %+v (%v)", info, err)
 	}
 	info, err := s.PeekBrokerMail("host:BOX", broker.Name, 0)
-	if err != nil || info.Unread != 0 {
-		t.Fatalf("neither body is unread mail for a broker: %+v (%v)", info, err)
+	if err != nil || info.Unread != 1 {
+		t.Fatalf("only ordinary nested JSON is unread mail for a broker: %+v (%v)", info, err)
 	}
 	msgs, err := s.ReadBroker("host:BOX", broker.Name)
-	if err != nil || len(msgs) != 0 {
-		t.Fatalf("neither body is ordinary mail for a broker: %+v (%v)", msgs, err)
+	if err != nil || len(msgs) != 1 || msgs[0].Body != ordinary {
+		t.Fatalf("nested task text must stay ordinary broker mail: %+v (%v)", msgs, err)
 	}
 	if n := count(t, s, `SELECT COUNT(*) FROM deliveries WHERE read_at IS NULL`); n != 0 {
 		t.Fatalf("a read still consumes them: %d unread deliveries left", n)

@@ -39,11 +39,7 @@ func defaultDB() (string, error) {
 // checkTokenPerm refuses a relay token any other local account can reach. The
 // file is the whole relay's shared secret, so what the owner's own bits say
 // is their business - group and other access is what makes it not a secret.
-func checkTokenPerm(path string) error {
-	fi, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
+func checkTokenPerm(path string, fi os.FileInfo) error {
 	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
 		return fmt.Errorf("relay token file %s has mode %04o: it must not be readable by group or other - chmod 600 it or delete it", path, perm)
 	}

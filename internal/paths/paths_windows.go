@@ -37,4 +37,4 @@ func defaultDB() (string, error) {
 
 // checkTokenPerm is a no-op on Windows: the permission bits reported here are
 // synthesized, and the ACL is what actually guards the file.
-func checkTokenPerm(string) error { return nil }
+func checkTokenPerm(string, os.FileInfo) error { return nil }

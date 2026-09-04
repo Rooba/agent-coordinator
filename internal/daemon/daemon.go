@@ -278,11 +278,13 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 	// calling session, so the cases below can trust req.From - and the ops that
 	// stamp a return address use this ref, never a client's.
 	var actor protocol.AgentRef
+	var actorID store.AgentIdentity
 	if fromOps[req.Op] {
 		id, err := st.ResolveActor(req.Scope, req.SessionID, req.From)
 		if err != nil {
 			return fail(err)
 		}
+		actorID = id
 		req.From = id.Name
 		actor = protocol.AgentRef{Name: id.Name, AgentID: id.AgentID, Scope: req.Scope}
 	}
@@ -369,26 +371,33 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 		}
 	case protocol.OpRead:
 		// A broker's poll takes its launches and cancels from the ledger, so
-		// the raw rows are consumed here without being handed back.
+		// the raw rows are consumed here without being handed back. Broker is
+		// decided by the authenticated row and daemon-stamped provenance, never
+		// by the client's wire-level kind claim.
+		broker := req.Origin == relayOrigin && actorID.Origin == store.RelayOrigin &&
+			actorID.Kind == protocol.KindLauncher
 		read := st.Read
-		if req.Kind == protocol.KindLauncher {
+		if broker {
 			read = st.ReadBroker
 		}
 		msgs, err := read(req.Scope, req.From)
 		if err != nil {
 			return fail(err)
 		}
-		return withPending(st, req, protocol.Response{OK: true, Messages: msgs})
+		return withPending(st, req.SessionID, broker, protocol.OpRead,
+			protocol.Response{OK: true, Messages: msgs})
 	case protocol.OpPeek:
+		broker := req.Origin == relayOrigin && actorID.Origin == store.RelayOrigin &&
+			actorID.Kind == protocol.KindLauncher
 		peek := st.PeekMail
-		if req.Kind == protocol.KindLauncher {
+		if broker {
 			peek = st.PeekBrokerMail
 		}
 		info, err := peek(req.Scope, req.From, req.AfterID)
 		if err != nil {
 			return fail(err)
 		}
-		return withPending(st, req, protocol.Response{OK: true, Unread: info.Unread,
+		return withPending(st, req.SessionID, broker, protocol.OpPeek, protocol.Response{OK: true, Unread: info.Unread,
 			HighWater: info.HighWater, PeekIDs: info.IDs, PeekFroms: info.Froms})
 	case protocol.OpBroadcast:
 		if err := st.Broadcast(req.Scope, req.From, req.Body); err != nil {

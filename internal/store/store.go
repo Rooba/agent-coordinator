@@ -299,14 +299,17 @@ type AgentIdentity struct {
 	AgentID string
 	Source  string
 	Parent  string // parent agent's name, set only for subagent child rows
+	Kind    string
+	Origin  string
 }
 
 // Identity returns the stored identity for a session.
 func (s *Store) Identity(scope, sessionID string) (AgentIdentity, error) {
 	var id AgentIdentity
 	var parentSession string
-	err := s.db.QueryRow(`SELECT name, agent_id, source, parent_session_id FROM agents WHERE scope=? AND session_id=?`,
-		scope, sessionID).Scan(&id.Name, &id.AgentID, &id.Source, &parentSession)
+	err := s.db.QueryRow(`SELECT name, agent_id, source, parent_session_id, kind, origin
+		FROM agents WHERE scope=? AND session_id=?`, scope, sessionID).
+		Scan(&id.Name, &id.AgentID, &id.Source, &parentSession, &id.Kind, &id.Origin)
 	if err == sql.ErrNoRows {
 		return id, fmt.Errorf("no agent for this session in this workspace")
 	}

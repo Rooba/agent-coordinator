@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -68,7 +69,7 @@ func RelayTokenPath() (string, error) {
 // (the daemon's first relay listen). Both are held to the minted shape - a
 // hand-typed secret opens the whole relay wherever it came from.
 func RelayToken() (string, error) {
-	if t := strings.TrimSpace(os.Getenv("AC_TOKEN")); t != "" {
+	if t := os.Getenv("AC_TOKEN"); t != "" {
 		if !mintedToken(t) {
 			return "", fmt.Errorf("AC_TOKEN must hold 64 lowercase hex characters")
 		}
@@ -100,7 +101,7 @@ func publishToken(path, token string) (string, error) {
 		return "", err
 	}
 	defer os.Remove(f.Name())
-	if _, err := f.WriteString(token + "\n"); err != nil {
+	if _, err := f.WriteString(token); err != nil {
 		f.Close()
 		return "", err
 	}
@@ -126,19 +127,51 @@ func publishToken(path, token string) (string, error) {
 // reported rather than repaired: a weak or shared-readable secret opens the
 // whole relay, and silently rewriting it would strand the paired broker.
 func readToken(path string) (string, error) {
-	b, err := os.ReadFile(path)
+	before, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", nil
 	}
 	if err != nil {
 		return "", err
 	}
-	if err := checkTokenPerm(path); err != nil {
+	if !before.Mode().IsRegular() {
+		return "", fmt.Errorf("relay token file %s must be a regular, non-symlink file", path)
+	}
+	if before.Size() != 64 {
+		return "", fmt.Errorf("relay token file %s must hold exactly 64 lowercase hex characters: delete it to mint a new token", path)
+	}
+	f, err := os.Open(path)
+	if err != nil {
 		return "", err
 	}
-	token := strings.TrimSpace(string(b))
+	defer f.Close()
+	after, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !after.Mode().IsRegular() || !os.SameFile(before, after) {
+		return "", fmt.Errorf("relay token file %s changed while opening", path)
+	}
+	current, err := os.Lstat(path)
+	if err != nil || !current.Mode().IsRegular() || !os.SameFile(current, after) {
+		return "", fmt.Errorf("relay token file %s changed while opening", path)
+	}
+	if err := checkTokenPerm(path, after); err != nil {
+		return "", err
+	}
+	if after.Size() != 64 {
+		return "", fmt.Errorf("relay token file %s must hold exactly 64 lowercase hex characters: delete it to mint a new token", path)
+	}
+	b, err := io.ReadAll(io.LimitReader(f, 65))
+	if err != nil {
+		return "", err
+	}
+	if len(b) != 64 {
+		return "", fmt.Errorf("relay token file %s must hold exactly 64 lowercase hex characters: delete it to mint a new token", path)
+	}
+	token := string(b)
 	if !mintedToken(token) {
-		return "", fmt.Errorf("relay token file %s must hold 64 lowercase hex characters: delete it to mint a new token", path)
+		return "", fmt.Errorf("relay token file %s must hold exactly 64 lowercase hex characters: delete it to mint a new token", path)
 	}
 	return token, nil
 }

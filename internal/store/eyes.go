@@ -152,15 +152,10 @@ func (s *Store) pickLauncher(q execQuerier, runtime string) (LauncherRef, error)
 	return l, nil
 }
 
-// bodyMatch is how a task body is recognised in SQL: the type field wherever
-// it sits, so reordering the struct that writes it cannot change what matches.
-func bodyMatch(msgType string) string { return `"type":"` + msgType + `"` }
-
-// taskLedgerBody matches the two bodies the ledger hands out itself. They are
-// never ordinary mail: a broker reading a stale launch after the cancel that
-// called it off would start a provider nobody wants.
-var taskLedgerBody = `(instr(m.body, '` + bodyMatch(protocol.TaskLaunch) + `') > 0
-	OR instr(m.body, '` + bodyMatch(protocol.TaskCancel) + `') > 0)`
+// taskLedgerBody is the daemon-owned task stamp. Ordinary send paths never
+// write task_id, so body text that merely quotes or nests "task.launch" stays
+// ordinary mail while real ledger mail never depends on JSON substring scans.
+const taskLedgerBody = `m.task_id != ''`
 
 // EyesTask is one requested host-eyes job. The ledger exists so cancel
 // authorization and launch idempotency never depend on scanning inboxes.
@@ -249,32 +244,38 @@ func (s *Store) AssignEyesTask(req EyesRequest) (EyesTask, protocol.AgentRef, er
 // PendingLaunches lists the launch mail of every task still queued on this
 // broker: work it has not acked yet.
 func (s *Store) PendingLaunches(launcherSession string) ([]protocol.Message, error) {
-	return s.pendingTaskMail(launcherSession, "queued", protocol.TaskLaunch)
+	return s.pendingTaskMail(launcherSession, "queued", false)
 }
 
 // PendingCancels lists the cancel mail of every cancelled task this broker
 // has not answered. A cancel is only durable once the broker reports back:
 // until then the provider may still be running, so the notice is redelivered.
 func (s *Store) PendingCancels(launcherSession string) ([]protocol.Message, error) {
-	return s.pendingTaskMail(launcherSession, "cancelled", protocol.TaskCancel)
+	return s.pendingTaskMail(launcherSession, "cancelled", true)
 }
 
 // pendingTaskMail is the redelivery queue behind both: this broker's tasks in
-// one state, with the mail of one body type addressed to it, oldest first.
+// one state, with their first launcher message (launch) or last (cancel),
+// oldest first. Those positions are ledger invariants: assignment writes one
+// launch, and cancellation writes at most one later cancel transactionally.
 // Redelivery is at-least-once on purpose - dropping a duplicate by task id is
 // the broker's own job.
-func (s *Store) pendingTaskMail(launcherSession, state, bodyType string) ([]protocol.Message, error) {
+func (s *Store) pendingTaskMail(launcherSession, state string, latest bool) ([]protocol.Message, error) {
+	position := "MIN"
+	if latest {
+		position = "MAX"
+	}
 	rows, err := s.db.Query(`
 		SELECT m.id, COALESCE(a.name, m.from_agent), m.body, m.created_at,
 		       m.reply_to, m.from_scope, m.kind, m.task_id
 		FROM eyes_tasks t
 		JOIN agents l ON l.rowid = (SELECT l2.rowid FROM agents l2
 			WHERE l2.session_id = t.launcher_session `+relayFirstRow+`)
-		JOIN messages m ON m.task_id = t.task_id AND m.scope = l.scope AND m.to_agent = l.agent_id
-			AND instr(m.body, ?) > 0
+		JOIN messages m ON m.id = (SELECT `+position+`(m2.id) FROM messages m2
+			WHERE m2.task_id = t.task_id AND m2.scope = l.scope AND m2.to_agent = l.agent_id)
 		`+senderJoin+`
 		WHERE t.launcher_session = ? AND t.state = ? AND t.cancel_acked = 0
-		ORDER BY t.created_at, m.id`, bodyMatch(bodyType), launcherSession, state)
+		ORDER BY t.created_at, m.id`, launcherSession, state)
 	if err != nil {
 		return nil, err
 	}

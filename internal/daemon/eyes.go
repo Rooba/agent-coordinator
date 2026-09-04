@@ -3,6 +3,7 @@ package daemon
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"slices"
 	"strings"
 
@@ -75,44 +76,137 @@ func taskReport(st *store.Store, req protocol.Request, actor protocol.AgentRef) 
 	// The type alone decides whether this is the lifecycle's; only then does
 	// the rest of the body have to be well formed, and a task.* body that is
 	// not a report - or does not decode - is refused rather than delivered.
-	var head struct {
-		Type string `json:"type"`
-	}
-	if json.Unmarshal([]byte(req.Body), &head) != nil || !strings.HasPrefix(head.Type, taskPrefix) {
+	typ, taskBody := taskMessageType(req.Body)
+	if !taskBody {
 		return protocol.Response{}, false
 	}
-	var body struct {
-		TaskID string `json:"task_id"`
+	to, ok := taskStates[typ]
+	taskID, valid := decodeTaskReport(typ, req.Body)
+	if !ok || !valid {
+		return fail(errReservedTask), true
 	}
-	to, ok := taskStates[head.Type]
-	if !ok || json.Unmarshal([]byte(req.Body), &body) != nil {
+	// Lifecycle mail always uses the structured cross-workspace send and the
+	// exact requester id the daemon put in task.launch. The store still routes
+	// from its ledger, but rejecting any other target catches malformed or
+	// replayed broker frames instead of silently fixing them up.
+	task, err := st.EyesTask(taskID)
+	if err != nil {
+		return protocol.Response{Error: relayError(err)}, true
+	}
+	if req.Op != protocol.OpSendWorkspace || req.Target == nil ||
+		req.Target.Scope != task.RequesterScope || req.Target.AgentID != task.RequesterAgentID {
 		return fail(errReservedTask), true
 	}
 	// Who may make this move is the store's call: only the broker holding the
 	// task, or the child it minted for it, has standing in it.
-	if _, _, err := st.TransitionEyesTask(body.TaskID, eyesActor(req, actor), to, req.Body); err != nil {
+	if _, _, err := st.TransitionEyesTask(taskID, eyesActor(req, actor), to, req.Body); err != nil {
 		return protocol.Response{Error: relayError(err)}, true
 	}
-	return protocol.Response{OK: true, TaskID: body.TaskID}, true
+	return protocol.Response{OK: true, TaskID: taskID}, true
+}
+
+// taskMessageType reads only top-level fields, so nested or quoted task text
+// remains ordinary mail. Once a top-level task.* type is seen, later malformed
+// JSON or a duplicate type still belongs to the reserved family and the strict
+// typed decoder will refuse it.
+func taskMessageType(body string) (string, bool) {
+	decoder := json.NewDecoder(strings.NewReader(body))
+	open, err := decoder.Token()
+	if err != nil || open != json.Delim('{') {
+		return "", false
+	}
+	typ := ""
+	found := false
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			return typ, strings.HasPrefix(typ, taskPrefix)
+		}
+		if key == "type" {
+			if found {
+				return taskPrefix, true
+			}
+			found = true
+			if err := decoder.Decode(&typ); err != nil {
+				return "", false
+			}
+			continue
+		}
+		var discard json.RawMessage
+		if err := decoder.Decode(&discard); err != nil {
+			return typ, strings.HasPrefix(typ, taskPrefix)
+		}
+	}
+	return typ, strings.HasPrefix(typ, taskPrefix)
+}
+
+// decodeTaskReport strictly decodes the one shared wire struct named by typ.
+// Unknown fields, trailing values, type mismatches and absent required fields
+// all make the reserved task body invalid rather than ordinary mail.
+func decodeTaskReport(typ, body string) (string, bool) {
+	validRef := func(ref *protocol.AgentRef) bool {
+		return ref == nil || ref.Name != "" && ref.AgentID != "" && ref.Scope != ""
+	}
+	switch typ {
+	case protocol.TaskAccepted:
+		var msg protocol.TaskAcceptedMsg
+		if !decodeTaskJSON(body, &msg) || msg.Type != typ || !validTaskID(msg.TaskID) || !validRef(msg.Child) {
+			return "", false
+		}
+		return msg.TaskID, true
+	case protocol.TaskResult:
+		var msg protocol.TaskResultMsg
+		if !decodeTaskJSON(body, &msg) || msg.Type != typ || !validTaskID(msg.TaskID) ||
+			(msg.Status != "succeeded" && msg.Status != "failed") || strings.TrimSpace(msg.Summary) == "" ||
+			msg.Observations == nil || msg.Actions == nil || msg.Evidence == nil ||
+			(msg.Status == "succeeded" && msg.Error != "") ||
+			(msg.Status == "failed" && strings.TrimSpace(msg.Error) == "") {
+			return "", false
+		}
+		return msg.TaskID, true
+	case protocol.TaskFailed:
+		var msg protocol.TaskFailedMsg
+		if !decodeTaskJSON(body, &msg) || msg.Type != typ || !validTaskID(msg.TaskID) || strings.TrimSpace(msg.Error) == "" {
+			return "", false
+		}
+		return msg.TaskID, true
+	}
+	return "", false
+}
+
+func decodeTaskJSON(body string, dst any) bool {
+	decoder := json.NewDecoder(strings.NewReader(body))
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(dst) == nil && decoder.Decode(new(any)) == io.EOF
+}
+
+func validTaskID(taskID string) bool {
+	if len(taskID) != len("task-")+12 || !strings.HasPrefix(taskID, "task-") {
+		return false
+	}
+	for _, c := range taskID[len("task-"):] {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // pendingTaskMail is what this broker still owes an answer for: launches it
 // has not acked, plus cancels it has not reported on. Redelivery is
 // at-least-once on purpose - a broker that lost a poll must see the work
 // again, and dropping a duplicate by task id is its job.
-func pendingTaskMail(st *store.Store, req protocol.Request) ([]protocol.Message, error) {
-	// Both queues are scoped to the tasks assigned to this session id. Over
-	// the relay the gate has already proved that session; on the unix socket
-	// the caller supplies it, where the socket's permissions are the trust
-	// boundary as they are for every other op.
-	if req.Kind != protocol.KindLauncher {
+func pendingTaskMail(st *store.Store, sessionID string, broker bool) ([]protocol.Message, error) {
+	// Broker is true only for the relay-authenticated launcher row dispatch
+	// resolved. A wire-level kind claim has no path to this queue.
+	if !broker {
 		return nil, nil
 	}
-	launches, err := st.PendingLaunches(req.SessionID)
+	launches, err := st.PendingLaunches(sessionID)
 	if err != nil {
 		return nil, err
 	}
-	cancels, err := st.PendingCancels(req.SessionID)
+	cancels, err := st.PendingCancels(sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -123,15 +217,15 @@ func pendingTaskMail(st *store.Store, req protocol.Request) ([]protocol.Message,
 // of the fresh mail. It cannot duplicate anything: a broker's poll leaves the
 // raw launch and cancel rows out, so the queue is the only place it ever sees
 // them - and the only one that knows what is still owed.
-func withPending(st *store.Store, req protocol.Request, resp protocol.Response) protocol.Response {
-	owed, err := pendingTaskMail(st, req)
+func withPending(st *store.Store, sessionID string, broker bool, op string, resp protocol.Response) protocol.Response {
+	owed, err := pendingTaskMail(st, sessionID, broker)
 	if err != nil {
 		return fail(err)
 	}
 	if len(owed) == 0 {
 		return resp // the ordinary poll, untouched
 	}
-	if req.Op == protocol.OpRead {
+	if op == protocol.OpRead {
 		resp.Messages = append(owed, resp.Messages...)
 		return resp
 	}
