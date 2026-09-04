@@ -183,7 +183,6 @@ func runRelay(args []string) {
 func runSummon(args []string) {
 	fs := flag.NewFlagSet("request-eyes", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	workspace := fs.String("workspace", "", "destination scope id")
 	runtime := fs.String("runtime", "", "host provider: claude, codex, or grok")
 	briefFlag := fs.String("brief", "", "literal brief, or - for stdin")
 	briefFile := fs.String("brief-file", "", "read brief from file")
@@ -192,7 +191,7 @@ func runSummon(args []string) {
 		os.Exit(2)
 	}
 	if fs.NArg() != 0 || (*briefFlag == "" && *briefFile == "") {
-		fmt.Fprintln(os.Stderr, "usage: agent-coordinator request-eyes|summon [-workspace SCOPE] [-runtime claude|codex|grok] [-timeout N] (-brief TEXT|- | -brief-file FILE)")
+		fmt.Fprintln(os.Stderr, "usage: agent-coordinator request-eyes|summon [-runtime claude|codex|grok] [-timeout N] (-brief TEXT|- | -brief-file FILE)")
 		os.Exit(2)
 	}
 	if *timeout != 0 && (*timeout < 300 || *timeout > 1800) {
@@ -216,7 +215,6 @@ func runSummon(args []string) {
 		Runtime:   *runtime,
 		Brief:     brief,
 		DeadlineS: *timeout,
-		Target:    cliTarget(*workspace, "", ""),
 	}
 	resp := mustOnce("request-eyes", req)
 	if resp.TaskID == "" {

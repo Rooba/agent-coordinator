@@ -309,7 +309,6 @@ func (s *server) callTool(p callParams) map[string]any {
 		req.From = arg(p.Arguments, "from")
 		req.Brief = arg(p.Arguments, "brief")
 		req.Runtime = arg(p.Arguments, "runtime")
-		req.Target = agentRefFromArgs(p.Arguments)
 		if err := parseTimeoutArg(p.Arguments, &req); err != nil {
 			return errResult(err.Error())
 		}
@@ -617,13 +616,12 @@ var toolDefs = []map[string]any{
 	},
 	{
 		"name":        "request_eyes",
-		"description": "Dispatch a brief to host eyes; the report arrives as ordinary mail in your inbox. Optional runtime is claude, codex, or grok. timeout is seconds in 300..1800.",
+		"description": "Dispatch a brief to host eyes in this workspace; the report arrives as ordinary mail. Scope is this session. Optional runtime is claude, codex, or grok. timeout is seconds in 300..1800.",
 		"inputSchema": map[string]any{"type": "object", "required": []string{"brief"}, "properties": map[string]any{
-			"brief":     map[string]any{"type": "string"},
-			"workspace": map[string]any{"type": "string", "description": "Destination scope id."},
-			"runtime":   map[string]any{"type": "string", "enum": []any{"claude", "codex", "grok"}},
-			"timeout":   map[string]any{"type": "integer", "minimum": 300, "maximum": 1800, "description": "Deadline in seconds."},
-			"from":      map[string]any{"type": "string"}}},
+			"brief":   map[string]any{"type": "string"},
+			"runtime": map[string]any{"type": "string", "enum": []any{"claude", "codex", "grok"}},
+			"timeout": map[string]any{"type": "integer", "minimum": 300, "maximum": 1800, "description": "Deadline in seconds."},
+			"from":    map[string]any{"type": "string"}}},
 	},
 	{
 		"name":        "cancel_eyes",

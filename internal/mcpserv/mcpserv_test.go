@@ -144,6 +144,10 @@ func TestRelayToolSchema(t *testing.T) {
 	if timeout["type"] != "integer" || timeout["minimum"] != float64(300) || timeout["maximum"] != float64(1800) {
 		t.Fatalf("timeout schema: %+v", timeout)
 	}
+	reqProps, _ := byName["request_eyes"]["properties"].(map[string]any)
+	if _, ok := reqProps["workspace"]; ok {
+		t.Fatal("request_eyes must not expose workspace")
+	}
 	if !strings.Contains(desc["list_eyes"], "launcher") {
 		t.Fatalf("list_eyes desc: %s", desc["list_eyes"])
 	}
@@ -574,13 +578,13 @@ func TestRequestEyesForwards(t *testing.T) {
 		OK: true, Name: "amber-fox", TaskID: "t1", Launcher: &protocol.AgentRef{Name: "host-eyes"},
 	})
 	out := rpc(t, sock,
-		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"request_eyes","arguments":{"from":"amber-fox/Explore-1","brief":"open chrome","runtime":"claude","workspace":"/other/repo","timeout":600}}}`)
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"request_eyes","arguments":{"from":"amber-fox/Explore-1","brief":"open chrome","runtime":"claude","timeout":600}}}`)
 	r, ok := findOp(*got, protocol.OpRequestEyes)
 	if !ok || r.Brief != "open chrome" || r.Runtime != "claude" || r.From != "amber-fox/Explore-1" || r.ReplyTo != nil || r.DeadlineS != 600 || r.SessionID == "" {
 		t.Fatalf("request_eyes request: %+v", *got)
 	}
-	if r.Target == nil || r.Target.Scope != "/other/repo" {
-		t.Fatalf("request_eyes target: %+v", r.Target)
+	if r.Target != nil {
+		t.Fatalf("request_eyes must not send Target: %+v", r.Target)
 	}
 	if !strings.Contains(out[0], "task_id=t1") || !strings.Contains(out[0], "launcher=host-eyes") ||
 		!strings.Contains(out[0], "wait 'amber-fox/Explore-1'") {
