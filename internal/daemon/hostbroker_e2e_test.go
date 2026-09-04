@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,11 +24,15 @@ const e2eProviderMarker = "hostbroker-e2e-provider"
 
 type e2eProvider struct {
 	mode, runPath, readyPath string
+	prepared                 *atomic.Int32
 }
 
 func (p e2eProvider) Name() string { return "claude" }
 
 func (p e2eProvider) Prepare(task hostrunner.Task, scratch string) (hostrunner.Invocation, error) {
+	if p.prepared != nil {
+		p.prepared.Add(1)
+	}
 	executable, err := os.Executable()
 	if err != nil {
 		return hostrunner.Invocation{}, err
@@ -259,9 +264,10 @@ func TestHostBrokerE2EHappyPathSurvivesLostResponses(t *testing.T) {
 	}
 
 	runPath := filepath.Join(t.TempDir(), "runs")
+	var prepared atomic.Int32
 	journal := newE2EJournal()
 	running, _ := startE2EBroker(t, addr, token, computer, launcherSession, credential.SessionSecret,
-		e2eProvider{mode: "success", runPath: runPath}, journal)
+		e2eProvider{mode: "success", runPath: runPath, prepared: &prepared}, journal)
 	awaitE2E(t, running, func() bool {
 		task, err := st.EyesTask(request.TaskID)
 		record, exists := journal.Get(request.TaskID)
@@ -271,8 +277,8 @@ func TestHostBrokerE2EHappyPathSurvivesLostResponses(t *testing.T) {
 	if err != nil || identity != firstIdentity {
 		t.Fatalf("launcher retry changed identity: first=%+v retry=%+v (%v)", firstIdentity, identity, err)
 	}
-	if runs := providerRuns(runPath); runs != 1 {
-		t.Fatalf("provider executions = %d, want 1", runs)
+	if runs := providerRuns(runPath); runs != 1 || prepared.Load() != 1 {
+		t.Fatalf("provider prepare/executions = %d/%d, want 1/1", prepared.Load(), runs)
 	}
 
 	read := roundTrip(t, sock, protocol.Request{Op: protocol.OpRead, Scope: requester.Scope,
@@ -305,9 +311,10 @@ func TestHostBrokerE2ECancelStopsProviderAndAcknowledges(t *testing.T) {
 	secret := premintSecret(launcherSession)
 	providerDir := t.TempDir()
 	runPath, readyPath := filepath.Join(providerDir, "runs"), filepath.Join(providerDir, "ready")
+	var prepared atomic.Int32
 	journal := newE2EJournal()
 	running, runner := startE2EBroker(t, addr, token, computer, launcherSession, secret,
-		e2eProvider{mode: "block", runPath: runPath, readyPath: readyPath}, journal)
+		e2eProvider{mode: "block", runPath: runPath, readyPath: readyPath, prepared: &prepared}, journal)
 	awaitE2E(t, running, func() bool {
 		_, err := st.Identity("host:"+computer, launcherSession)
 		return err == nil
@@ -331,8 +338,8 @@ func TestHostBrokerE2ECancelStopsProviderAndAcknowledges(t *testing.T) {
 		return taskErr == nil && task.State == "cancelled" && pendingErr == nil && len(pending) == 0 &&
 			exists && record.State == "delivered" && !busy
 	})
-	if runs := providerRuns(runPath); runs != 1 {
-		t.Fatalf("provider executions = %d, want 1", runs)
+	if runs := providerRuns(runPath); runs != 1 || prepared.Load() != 1 {
+		t.Fatalf("provider prepare/executions = %d/%d, want 1/1", prepared.Load(), runs)
 	}
 	record, exists := journal.Get(request.TaskID)
 	if !exists || record.State != "delivered" || len(record.Terminal) != 0 {
@@ -355,24 +362,25 @@ func TestHostBrokerE2ECancelBeforeObservedLaunchStartsNoProvider(t *testing.T) {
 	credential, launcher := lostLauncherRegistration(t, addr, token, computer, launcherSession, st)
 	requester := registerUnix(t, sock, "/e2e/early", "requester-early")
 	request := requestE2EEyes(t, sock, requester.Scope, "requester-early")
-	tcpHangUp(t, addr, protocol.Request{Op: protocol.OpRead, SessionID: launcherSession,
-		Token: token, SessionSecret: credential.SessionSecret})
-	awaitE2E(t, nil, func() bool {
-		unread, err := st.UnreadCount("host:"+computer, launcher.Name)
-		return err == nil && unread == 0
-	})
 	if response := roundTrip(t, sock, protocol.Request{Op: protocol.OpCancelEyes, Scope: requester.Scope,
 		SessionID: "requester-early", TaskID: request.TaskID}); !response.OK {
 		t.Fatalf("cancel_eyes: %+v", response)
+	}
+	if launches, err := st.PendingLaunches(launcherSession); err != nil || len(launches) != 0 {
+		t.Fatalf("cancelled task remains a current launch: %+v (%v)", launches, err)
 	}
 	pending, err := st.PendingCancels(launcherSession)
 	if err != nil || len(pending) != 1 || pending[0].TaskID != request.TaskID {
 		t.Fatalf("pending cancel: %+v (%v)", pending, err)
 	}
+	if unread, err := st.UnreadCount("host:"+computer, launcher.Name); err != nil || unread != 2 {
+		t.Fatalf("raw launch and cancel precondition: unread=%d (%v)", unread, err)
+	}
 	runPath := filepath.Join(t.TempDir(), "runs")
+	var prepared atomic.Int32
 	journal := newE2EJournal()
 	running, _ := startE2EBroker(t, addr, token, computer, launcherSession, credential.SessionSecret,
-		e2eProvider{mode: "success", runPath: runPath}, journal)
+		e2eProvider{mode: "success", runPath: runPath, prepared: &prepared}, journal)
 	awaitE2E(t, running, func() bool {
 		pending, err := st.PendingCancels(launcherSession)
 		record, exists := journal.Get(request.TaskID)
@@ -382,11 +390,11 @@ func TestHostBrokerE2ECancelBeforeObservedLaunchStartsNoProvider(t *testing.T) {
 	if err != nil || task.State != "cancelled" {
 		t.Fatalf("cancelled task: %+v (%v)", task, err)
 	}
-	if runs := providerRuns(runPath); runs != 0 {
-		t.Fatalf("cancelled unseen launch ran provider %d times", runs)
+	if runs := providerRuns(runPath); runs != 0 || prepared.Load() != 0 {
+		t.Fatalf("cancelled unseen launch prepared/ran provider %d/%d times", prepared.Load(), runs)
 	}
 	record, exists := journal.Get(request.TaskID)
-	if !exists || record.State != "delivered" || record.ChildSession != "" || len(record.Terminal) != 0 {
+	if !exists || record.State != "delivered" || record.ChildSession != "" || len(record.Terminal) != 0 || record.Launch.Brief != "" {
 		t.Fatalf("unknown cancel journal: %+v, exists=%v", record, exists)
 	}
 	read := roundTrip(t, sock, protocol.Request{Op: protocol.OpRead, Scope: requester.Scope,
@@ -396,5 +404,132 @@ func TestHostBrokerE2ECancelBeforeObservedLaunchStartsNoProvider(t *testing.T) {
 	}
 	if _, err := st.Identity(requester.Scope, "eyes-"+request.TaskID); err == nil {
 		t.Fatal("early cancel must not create an eyes child")
+	}
+}
+
+func TestHostBrokerE2ERetriesLostTerminalAcknowledgement(t *testing.T) {
+	sock, addr, token, st := relayDaemon(t)
+	const computer, launcherSession = "E2ETERM", "launcher-e2e-terminal"
+	launcher, secret := registerLauncher(t, addr, token, launcherSession, "host:"+computer)
+	requester := registerUnix(t, sock, "/e2e/terminal", "requester-terminal")
+	request := requestE2EEyes(t, sock, requester.Scope, "requester-terminal")
+	pending, err := st.PendingLaunches(launcherSession)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending launch: %+v (%v)", pending, err)
+	}
+	var launch protocol.TaskLaunchMsg
+	if err := json.Unmarshal([]byte(pending[0].Body), &launch); err != nil {
+		t.Fatal(err)
+	}
+	childSession := "eyes-" + request.TaskID
+	child := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpRegister, Scope: requester.Scope,
+		SessionID: childSession, Kind: protocol.KindEyes, AuthSessionID: launcherSession,
+		Token: token, SessionSecret: secret})
+	if !child.OK || child.SessionSecret == "" {
+		t.Fatalf("child registration: %+v", child)
+	}
+	childRef := protocol.AgentRef{Name: child.Name, AgentID: child.AgentID, Scope: requester.Scope}
+	accepted, err := json.Marshal(protocol.TaskAcceptedMsg{Type: protocol.TaskAccepted,
+		TaskID: request.TaskID, Child: &childRef})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpSendWorkspace,
+		SessionID: launcherSession, Token: token, SessionSecret: secret, Body: string(accepted), Target: &launch.ReplyTo}); !response.OK {
+		t.Fatalf("task.accepted: %+v", response)
+	}
+	terminal, err := json.Marshal(protocol.TaskResultMsg{Type: protocol.TaskResult, TaskID: request.TaskID,
+		Status: hostrunner.ReportSucceeded, Summary: "browser ready", Observations: []string{"login visible"},
+		Actions: []string{}, Evidence: []string{"page title"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcpHangUp(t, addr, protocol.Request{Op: protocol.OpSendWorkspace, SessionID: childSession,
+		Token: token, SessionSecret: child.SessionSecret, Body: string(terminal), Target: &launch.ReplyTo})
+	awaitE2E(t, nil, func() bool {
+		task, err := st.EyesTask(request.TaskID)
+		return err == nil && task.State == "done"
+	})
+
+	journal := newE2EJournal()
+	if err := journal.Put(hostbroker.TaskRecord{Launch: launch, Child: childRef, ChildSession: childSession,
+		ChildSecret: child.SessionSecret, State: "terminal", Terminal: terminal}); err != nil {
+		t.Fatal(err)
+	}
+	var prepared atomic.Int32
+	running, _ := startE2EBroker(t, addr, token, computer, launcherSession, secret,
+		e2eProvider{mode: "success", runPath: filepath.Join(t.TempDir(), "runs"), prepared: &prepared}, journal)
+	awaitE2E(t, running, func() bool {
+		record, exists := journal.Get(request.TaskID)
+		return exists && record.State == "delivered"
+	})
+	if prepared.Load() != 0 {
+		t.Fatalf("terminal retry prepared provider %d times", prepared.Load())
+	}
+	read := roundTrip(t, sock, protocol.Request{Op: protocol.OpRead, Scope: requester.Scope,
+		SessionID: "requester-terminal"})
+	if !read.OK || len(read.Messages) != 2 {
+		t.Fatalf("terminal retry duplicated requester mail: %+v", read)
+	}
+	if read.Messages[0].Kind != protocol.KindLauncher || read.Messages[1].Kind != protocol.KindEyes ||
+		read.Messages[0].TaskID != request.TaskID || read.Messages[1].TaskID != request.TaskID ||
+		read.Messages[0].From != launcher.Name || read.Messages[1].From != child.Name {
+		t.Fatalf("terminal retry mail identity: %+v", read.Messages)
+	}
+}
+
+func TestHostBrokerE2ERecoversLostChildSecretAfterCancel(t *testing.T) {
+	sock, addr, token, st := relayDaemon(t)
+	const computer, launcherSession = "E2ERECOVER", "launcher-e2e-recover"
+	_, secret := registerLauncher(t, addr, token, launcherSession, "host:"+computer)
+	requester := registerUnix(t, sock, "/e2e/recover", "requester-recover")
+	request := requestE2EEyes(t, sock, requester.Scope, "requester-recover")
+	pending, err := st.PendingLaunches(launcherSession)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending launch: %+v (%v)", pending, err)
+	}
+	var launch protocol.TaskLaunchMsg
+	if err := json.Unmarshal([]byte(pending[0].Body), &launch); err != nil {
+		t.Fatal(err)
+	}
+	journal := newE2EJournal()
+	if err := journal.Put(hostbroker.TaskRecord{Launch: launch, State: "received"}); err != nil {
+		t.Fatal(err)
+	}
+
+	childSession := "eyes-" + request.TaskID
+	tcpHangUp(t, addr, protocol.Request{Op: protocol.OpRegister, Scope: requester.Scope,
+		SessionID: childSession, Kind: protocol.KindEyes, AuthSessionID: launcherSession,
+		Platform: "windows", Capabilities: []string{"browser.chrome", "provider.claude"},
+		Token: token, SessionSecret: secret})
+	awaitRow(t, st, requester.Scope, childSession)
+	if response := roundTrip(t, sock, protocol.Request{Op: protocol.OpCancelEyes, Scope: requester.Scope,
+		SessionID: "requester-recover", TaskID: request.TaskID}); !response.OK {
+		t.Fatalf("cancel_eyes: %+v", response)
+	}
+	if pending, err := st.PendingCancels(launcherSession); err != nil || len(pending) != 1 {
+		t.Fatalf("pending cancel: %+v (%v)", pending, err)
+	}
+
+	var prepared atomic.Int32
+	runPath := filepath.Join(t.TempDir(), "runs")
+	running, _ := startE2EBroker(t, addr, token, computer, launcherSession, secret,
+		e2eProvider{mode: "success", runPath: runPath, prepared: &prepared}, journal)
+	awaitE2E(t, running, func() bool {
+		record, exists := journal.Get(request.TaskID)
+		pending, err := st.PendingCancels(launcherSession)
+		return exists && record.State == "delivered" && err == nil && len(pending) == 0
+	})
+	if runs := providerRuns(runPath); runs != 0 || prepared.Load() != 0 {
+		t.Fatalf("recovery prepared/ran provider %d/%d times", prepared.Load(), runs)
+	}
+	task, err := st.EyesTask(request.TaskID)
+	if err != nil || task.State != "cancelled" {
+		t.Fatalf("recovered cancellation: %+v (%v)", task, err)
+	}
+	read := roundTrip(t, sock, protocol.Request{Op: protocol.OpRead, Scope: requester.Scope,
+		SessionID: "requester-recover"})
+	if !read.OK || len(read.Messages) != 0 {
+		t.Fatalf("recovered cancel must not mail requester: %+v", read)
 	}
 }
