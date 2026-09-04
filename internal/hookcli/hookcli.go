@@ -84,9 +84,9 @@ func Run(stdin io.Reader, stdout io.Writer, socketPath string) {
 		debugf("bad input: %v", err)
 		return
 	}
-	sc := scope.Resolve(in.CWD)
+	sc := resolveScope(in.CWD)
 	event := canonicalEvent(in.HookEventName)
-	req := protocol.Request{Scope: sc, SessionID: in.SessionID}
+	req := protocol.Request{Scope: sc, SessionID: in.SessionID, Kind: strings.TrimSpace(os.Getenv("AC_KIND"))}
 	switch event {
 	case "SessionStart":
 		req.Op = protocol.OpRegister
@@ -248,6 +248,15 @@ func coordToolCall(tool string, input map[string]any, want string) (match bool, 
 		return true, ""
 	}
 	return false, ""
+}
+
+// resolveScope uses AC_SCOPE when set so a host eyes process can join a WSL
+// workspace instead of its Windows cwd.
+func resolveScope(cwd string) string {
+	if v := strings.TrimSpace(os.Getenv("AC_SCOPE")); v != "" {
+		return v
+	}
+	return scope.Resolve(cwd)
 }
 
 func normalizePaths(cwd string, paths []string) []string {

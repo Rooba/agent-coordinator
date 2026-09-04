@@ -16,6 +16,16 @@ const (
 	OpRelease    = "release"
 	OpClaims     = "claims"
 	OpHistory    = "history"
+	// Cross-workspace / host-eyes ops. TCP callers may use the same strings;
+	// the daemon's TCP path allowlists them and binds identity itself.
+	OpListWorkspaces = "list_workspaces"
+	OpListEyes       = "list_eyes"
+	OpSendWorkspace  = "send_workspace"
+	OpRequestEyes    = "request_eyes"
+	OpCancelEyes     = "cancel_eyes"
+
+	KindEyes     = "eyes"
+	KindLauncher = "launcher"
 )
 
 type TaskEvent struct {
@@ -62,6 +72,98 @@ type Request struct {
 	// rows (default 20, capped at 100).
 	Peer  string `json:"peer,omitempty"`
 	Limit int    `json:"limit,omitempty"`
+	// Token authenticates TCP relay frames. Unix-socket callers leave it empty.
+	Token string `json:"token,omitempty"`
+	// SessionSecret is the per-session TCP credential returned on relay register.
+	SessionSecret string `json:"session_secret,omitempty"`
+	// Kind is the agent role at register: "" (normal), "eyes", or "launcher".
+	Kind string `json:"kind,omitempty"`
+	// Runtime selects a host provider on OpRequestEyes: "claude" | "codex" | "grok".
+	Runtime string `json:"runtime,omitempty"`
+	// Brief is the eyes task document on OpRequestEyes.
+	Brief string `json:"brief,omitempty"`
+	// ReplyTo is the return-to-sender stamp. Callers omit it; the daemon fills
+	// it from the authenticated session so results cannot be redirected.
+	ReplyTo *AgentRef `json:"reply_to,omitempty"`
+	// Target addresses OpSendWorkspace: Scope required, Name/AgentID optional for unicast.
+	Target *AgentRef `json:"target,omitempty"`
+	// TaskID identifies an eyes job (OpCancelEyes, and responses to OpRequestEyes).
+	TaskID string `json:"task_id,omitempty"`
+	// Platform / Capabilities are advertised at register by a host broker.
+	Platform     string   `json:"platform,omitempty"`
+	Capabilities []string `json:"capabilities,omitempty"`
+	// DeadlineS is the eyes-job deadline in seconds (300..1800).
+	DeadlineS int `json:"deadline_s,omitempty"`
+	// AuthSessionID is the launcher session that is minting a kind=eyes child.
+	// SessionID names the new child; AuthSessionID+SessionSecret prove the launcher.
+	AuthSessionID string `json:"auth_session_id,omitempty"`
+}
+
+// AgentRef is a structured address (never a smashed name@path string).
+type AgentRef struct {
+	Name    string `json:"name,omitempty"`
+	AgentID string `json:"agent_id,omitempty"`
+	Scope   string `json:"scope,omitempty"`
+}
+
+const (
+	TaskLaunch   = "task.launch"
+	TaskCancel   = "task.cancel"
+	TaskAccepted = "task.accepted"
+	TaskResult   = "task.result"
+	TaskFailed   = "task.failed"
+)
+
+// TaskLaunchMsg is the body the daemon delivers to a launcher inbox.
+type TaskLaunchMsg struct {
+	Type      string   `json:"type"`
+	TaskID    string   `json:"task_id"`
+	Runtime   string   `json:"runtime,omitempty"`
+	Scope     string   `json:"scope"`
+	Brief     string   `json:"brief"`
+	ReplyTo   AgentRef `json:"reply_to"`
+	DeadlineS int      `json:"deadline_s"`
+}
+
+// TaskCancelMsg is the body the daemon delivers to cancel an eyes job.
+type TaskCancelMsg struct {
+	Type   string `json:"type"`
+	TaskID string `json:"task_id"`
+}
+
+// TaskAcceptedMsg is the launcher ack to the requester.
+type TaskAcceptedMsg struct {
+	Type   string    `json:"type"`
+	TaskID string    `json:"task_id"`
+	Child  *AgentRef `json:"child,omitempty"`
+}
+
+// TaskResultMsg is the eyes report DMed to reply_to.
+type TaskResultMsg struct {
+	Type         string   `json:"type"`
+	TaskID       string   `json:"task_id"`
+	Status       string   `json:"status"`
+	Summary      string   `json:"summary"`
+	Observations []string `json:"observations"`
+	Actions      []string `json:"actions"`
+	Evidence     []string `json:"evidence"`
+	Error        string   `json:"error,omitempty"`
+}
+
+// TaskFailedMsg is sent when the child dies without a result.
+type TaskFailedMsg struct {
+	Type   string `json:"type"`
+	TaskID string `json:"task_id"`
+	Error  string `json:"error"`
+}
+
+// WorkspaceInfo is one occupancy row from OpListWorkspaces.
+type WorkspaceInfo struct {
+	Scope          string `json:"scope"`
+	LiveAgents     int    `json:"live_agents"`
+	EyesAgents     int    `json:"eyes_agents"`
+	LauncherAgents int    `json:"launcher_agents,omitempty"`
+	LastSeen       int64  `json:"last_seen,omitempty"`
 }
 
 type AgentInfo struct {
@@ -76,6 +178,11 @@ type AgentInfo struct {
 	TasksDone    int      `json:"tasks_completed"`
 	Parent       string   `json:"parent,omitempty"` // parent agent's name for subagent rows
 	Claims       []string `json:"claims,omitempty"` // paths this agent holds in the claims ledger
+	Kind         string   `json:"kind,omitempty"`
+	Scope        string   `json:"scope,omitempty"`
+	Origin       string   `json:"origin,omitempty"`
+	Platform     string   `json:"platform,omitempty"`
+	Capabilities []string `json:"capabilities,omitempty"`
 }
 
 // ClaimInfo is one row of the claims ledger, holder resolved live.
@@ -100,11 +207,15 @@ type HistoryInfo struct {
 }
 
 type Message struct {
-	ID        int64  `json:"id"`
-	From      string `json:"from"`
-	Body      string `json:"body"`
-	SentAt    int64  `json:"sent_at"`
-	Broadcast bool   `json:"broadcast"`
+	ID        int64     `json:"id"`
+	From      string    `json:"from"`
+	Body      string    `json:"body"`
+	SentAt    int64     `json:"sent_at"`
+	Broadcast bool      `json:"broadcast"`
+	ReplyTo   *AgentRef `json:"reply_to,omitempty"`
+	FromScope string    `json:"from_scope,omitempty"` // set only when it differs from the message scope
+	Kind      string    `json:"kind,omitempty"`
+	TaskID    string    `json:"task_id,omitempty"`
 }
 
 type Response struct {
@@ -129,4 +240,9 @@ type Response struct {
 	// Claims / History carry the claims-ledger and message-journal listings.
 	Claims  []ClaimInfo   `json:"claims,omitempty"`
 	History []HistoryInfo `json:"history,omitempty"`
+	// Workspaces is the occupancy directory from OpListWorkspaces.
+	Workspaces    []WorkspaceInfo `json:"workspaces,omitempty"`
+	TaskID        string          `json:"task_id,omitempty"`
+	Launcher      *AgentRef       `json:"launcher,omitempty"`
+	SessionSecret string          `json:"session_secret,omitempty"`
 }

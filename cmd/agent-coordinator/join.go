@@ -1,15 +1,13 @@
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/Rooba/agent-coordinator/internal/dialer"
-	"github.com/Rooba/agent-coordinator/internal/paths"
 	"github.com/Rooba/agent-coordinator/internal/protocol"
 	"github.com/Rooba/agent-coordinator/internal/scope"
 )
@@ -21,71 +19,126 @@ import (
 // Session id resolution order: -session-id flag, then common harness env
 // vars, then a fresh ephemeral id (name will not stick across restarts).
 func runJoin(args []string) {
+	if err := doJoin(args, os.Stdout, os.Stderr); err != nil {
+		fmt.Fprintln(os.Stderr, "join:", err)
+		os.Exit(1)
+	}
+}
+
+func doJoin(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("join", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
+	fs.SetOutput(stderr)
 	sessionFlag := fs.String("session-id", "", "stable session id (prefer harness env when available)")
 	source := fs.String("source", "join", "registration source label shown in diagnostics")
+	kindFlag := fs.String("kind", "", "agent kind: eyes or launcher")
+	scopeFlag := fs.String("scope", "", "workspace scope (default: resolve from cwd)")
+	addrFlag := fs.String("addr", "", "unix://path or tcp://host:port (default AC_ADDR or unix socket)")
+	credFile := fs.String("cred-file", "", "write/read session secret here (TCP; path only, never the secret)")
+	platformFlag := fs.String("platform", "", "host platform advertised at register")
+	capsFlag := fs.String("caps", "", "comma-separated capabilities (maps to JSON capabilities)")
 	if err := fs.Parse(args); err != nil {
-		os.Exit(2)
+		return err
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(os.Stderr, "usage: agent-coordinator join [-session-id <id>] [-source <label>]")
-		os.Exit(2)
+		fmt.Fprintln(stderr, "usage: agent-coordinator join [-session-id <id>] [-source <label>] [-kind eyes|launcher] [-scope <path>] [-addr tcp://host:port] [-cred-file PATH] [-platform windows] [-caps cap,cap]")
+		return fmt.Errorf("usage")
 	}
 
+	sc := strings.TrimSpace(*scopeFlag)
+	if sc == "" {
+		sc = strings.TrimSpace(os.Getenv("AC_SCOPE"))
+	}
+	if sc == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			cwd = "."
+		}
+		sc = scope.Resolve(cwd)
+	}
+	kind := strings.TrimSpace(*kindFlag)
+	if kind == "" {
+		kind = strings.TrimSpace(os.Getenv("AC_KIND"))
+	}
+	addr := strings.TrimSpace(*addrFlag)
+	if addr == "" {
+		addr = coordinatorAddr()
+	}
+	credPath := strings.TrimSpace(*credFile)
+	if isTCPAddr(addr) && credPath == "" {
+		return fmt.Errorf("tcp join requires -cred-file PATH (session secret is written there, never printed)")
+	}
+	var loaded sessionCred
+	if credPath != "" {
+		if c, err := loadCred(credPath); err == nil {
+			loaded = c
+		}
+	}
 	sessionID := strings.TrimSpace(*sessionFlag)
 	if sessionID == "" {
 		sessionID = sessionIDFromEnv()
 	}
+	if sessionID != "" && loaded.SessionID != "" && sessionID != loaded.SessionID {
+		return fmt.Errorf("session id %q does not match cred-file id %q", sessionID, loaded.SessionID)
+	}
+	if sessionID == "" {
+		sessionID = loaded.SessionID
+	}
 	if sessionID == "" {
 		sessionID = fmt.Sprintf("join-%d-%d", os.Getpid(), time.Now().UnixNano())
 	}
-
-	cwd, err := os.Getwd()
-	if err != nil {
-		cwd = "."
-	}
-	sc := scope.Resolve(cwd)
-	conn, err := dialer.Dial(paths.Socket(), time.Second)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "join: daemon unreachable: %v\n", err)
-		os.Exit(1)
-	}
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(5 * time.Second))
 	req := protocol.Request{
 		Op:        protocol.OpRegister,
 		Scope:     sc,
 		SessionID: sessionID,
 		Source:    *source,
+		Kind:      kind,
+		Platform:  strings.TrimSpace(*platformFlag),
 	}
-	b, err := json.Marshal(req)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+	if caps := strings.TrimSpace(*capsFlag); caps != "" {
+		req.Capabilities = splitCaps(caps)
 	}
-	if _, err := conn.Write(append(b, '\n')); err != nil {
-		fmt.Fprintf(os.Stderr, "join: write: %v\n", err)
-		os.Exit(1)
+	if err := applyRelayAuth(&req, addr, credPath); err != nil {
+		return err
 	}
-	var resp protocol.Response
-	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		fmt.Fprintf(os.Stderr, "join: decode: %v\n", err)
-		os.Exit(1)
-	}
-	if !resp.OK || resp.Name == "" {
+	resp, err := once(addr, req)
+	if err != nil || resp.Name == "" {
 		errMsg := resp.Error
+		if err != nil {
+			errMsg = err.Error()
+		}
 		if errMsg == "" {
 			errMsg = "register failed"
 		}
-		fmt.Fprintf(os.Stderr, "join: %s\n", errMsg)
-		os.Exit(1)
+		return fmt.Errorf("%s", errMsg)
 	}
-	// Same injection line the SessionStart hook emits so harness context and
-	// manual bootstrap stay interchangeable for agents.
-	fmt.Printf("[coordinator] you are '%s' in this workspace. Peer tools (MCP agent-coordinator): status_board, list_agents, send_message, read_messages, broadcast. "+
+	if credPath != "" {
+		secret := resp.SessionSecret
+		if secret == "" {
+			secret = loaded.SessionSecret
+		}
+		if err := saveCred(credPath, sessionCred{SessionID: sessionID, SessionSecret: secret}); err != nil {
+			dereg := protocol.Request{Op: protocol.OpDeregister, Scope: sc, SessionID: sessionID, SessionSecret: resp.SessionSecret}
+			_ = applyRelayAuth(&dereg, addr, credPath)
+			dereg.SessionSecret = resp.SessionSecret
+			_, _ = once(addr, dereg)
+			return fmt.Errorf("write cred file: %w", err)
+		}
+	}
+	fmt.Fprintf(stdout, "[coordinator] you are '%s' in this workspace. Peer tools (MCP agent-coordinator): status_board, list_agents, send_message, read_messages, broadcast. "+
 		"To be wakeable while waiting or delegating, arm a background task first: agent-coordinator wait '%s' - it exits the moment new mail arrives and the harness re-invokes you.\n",
 		resp.Name, resp.Name)
+	return nil
+}
+
+func splitCaps(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func sessionIDFromEnv() string {

@@ -28,7 +28,26 @@ func TestMain(m *testing.M) {
 	bindDirFn = func() (string, error) { return "", errors.New("bind disabled in tests") }
 	ancestryFn = func() []int { return nil }
 	hookcli.PidAlive = func(int) bool { return true } // test pids are fictional
+	os.Unsetenv("AC_SCOPE")
+	os.Unsetenv("AC_KIND")
 	os.Exit(m.Run())
+}
+
+func bindAs(t *testing.T, sessionID, name string) {
+	t.Helper()
+	dir := stubBind(t, []int{42})
+	hookcli.WriteBind(dir, hookcli.Bind{
+		SessionID: sessionID, Scope: scope.Resolve(cwd), Name: name, Pids: []int{42}, TS: time.Now().Unix(),
+	})
+}
+
+func findOp(reqs []protocol.Request, op string) (protocol.Request, bool) {
+	for _, r := range reqs {
+		if r.Op == op {
+			return r, true
+		}
+	}
+	return protocol.Request{}, false
 }
 
 func stubBind(t *testing.T, chain []int) string {
@@ -47,7 +66,7 @@ func stubBind(t *testing.T, chain []int) string {
 // volume-qualified backslash path).
 const cwd = "/some/repo"
 
-func fakeDaemon(t *testing.T, resp protocol.Response) (string, *[]protocol.Request) {
+func fakeDaemonFunc(t *testing.T, fn func(protocol.Request) protocol.Response) (string, *[]protocol.Request) {
 	t.Helper()
 	sock := filepath.Join(socktest.Dir(t), "d.sock")
 	l, err := net.Listen("unix", sock)
@@ -66,12 +85,16 @@ func fakeDaemon(t *testing.T, resp protocol.Response) (string, *[]protocol.Reque
 			var r protocol.Request
 			json.Unmarshal(line, &r)
 			got = append(got, r)
-			b, _ := json.Marshal(resp)
+			b, _ := json.Marshal(fn(r))
 			c.Write(append(b, '\n'))
 			c.Close()
 		}
 	}()
 	return sock, &got
+}
+
+func fakeDaemon(t *testing.T, resp protocol.Response) (string, *[]protocol.Request) {
+	return fakeDaemonFunc(t, func(protocol.Request) protocol.Response { return resp })
 }
 
 func rpc(t *testing.T, sock string, lines ...string) []string {
@@ -82,6 +105,48 @@ func rpc(t *testing.T, sock string, lines ...string) []string {
 		t.Fatal(err)
 	}
 	return strings.Split(strings.TrimSpace(out.String()), "\n")
+}
+
+func TestRelayToolSchema(t *testing.T) {
+	sock, _ := fakeDaemon(t, protocol.Response{OK: true})
+	out := rpc(t, sock, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	var env struct {
+		Result struct {
+			Tools []struct {
+				Name        string         `json:"name"`
+				Description string         `json:"description"`
+				InputSchema map[string]any `json:"inputSchema"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(out[0]), &env); err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]map[string]any{}
+	desc := map[string]string{}
+	for _, tool := range env.Result.Tools {
+		byName[tool.Name] = tool.InputSchema
+		desc[tool.Name] = tool.Description
+	}
+	target, _ := byName["relay"]["properties"].(map[string]any)["target"].(map[string]any)
+	props, _ := target["properties"].(map[string]any)
+	for _, k := range []string{"scope", "agent_id", "name"} {
+		if _, ok := props[k]; !ok {
+			t.Fatalf("relay target missing %s: %+v", k, target)
+		}
+	}
+	runtime, _ := byName["request_eyes"]["properties"].(map[string]any)["runtime"].(map[string]any)
+	enum, _ := runtime["enum"].([]any)
+	if len(enum) != 3 {
+		t.Fatalf("runtime enum: %+v", runtime)
+	}
+	timeout, _ := byName["request_eyes"]["properties"].(map[string]any)["timeout"].(map[string]any)
+	if timeout["type"] != "integer" || timeout["minimum"] != float64(300) || timeout["maximum"] != float64(1800) {
+		t.Fatalf("timeout schema: %+v", timeout)
+	}
+	if !strings.Contains(desc["list_eyes"], "launcher") {
+		t.Fatalf("list_eyes desc: %s", desc["list_eyes"])
+	}
 }
 
 func TestInitializeAndList(t *testing.T) {
@@ -97,7 +162,12 @@ func TestInitializeAndList(t *testing.T) {
 		!strings.Contains(out[0], "agent-coordinator") || !strings.Contains(out[0], `"instructions"`) {
 		t.Fatalf("initialize: %s", out[0])
 	}
-	for _, tool := range []string{"register_agent", "whoami", "status_board", "list_agents", "send_message", "read_messages", "peek_messages", "broadcast", "claim", "release", "list_claims", "message_history"} {
+	for _, tool := range []string{
+		"register_agent", "whoami", "status_board", "list_agents", "send_message",
+		"read_messages", "peek_messages", "broadcast", "claim", "release",
+		"list_claims", "message_history", "list_workspaces", "list_eyes",
+		"relay", "request_eyes", "cancel_eyes",
+	} {
 		if !strings.Contains(out[1], `"`+tool+`"`) {
 			t.Fatalf("tools/list missing %s: %s", tool, out[1])
 		}
@@ -153,10 +223,12 @@ func TestGarbageLineYieldsParseError(t *testing.T) {
 }
 
 func TestSendMessageToolCall(t *testing.T) {
-	sock, got := fakeDaemon(t, protocol.Response{OK: true})
+	bindAs(t, "bound-s", "amber-fox")
+	sock, got := fakeDaemon(t, protocol.Response{OK: true, Name: "amber-fox"})
 	out := rpc(t, sock,
 		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_message","arguments":{"from":"amber-fox","to":"brisk-owl","body":"ping"}}}`)
-	if len(*got) != 1 || (*got)[0].Op != protocol.OpSend || (*got)[0].To != "brisk-owl" || (*got)[0].Scope != scope.Resolve(cwd) {
+	send, ok := findOp(*got, protocol.OpSend)
+	if !ok || send.To != "brisk-owl" || send.Scope != scope.Resolve(cwd) || send.SessionID == "" {
 		t.Fatalf("daemon saw %+v", *got)
 	}
 	if !strings.Contains(out[0], `"content"`) {
@@ -283,12 +355,15 @@ func TestFailClosedWhenIdentityUnknown(t *testing.T) {
 			t.Fatalf("only guarded registers expected: %+v", r)
 		}
 	}
-	// Explicit from still works without any registration.
-	sock2, got2 := fakeDaemon(t, protocol.Response{OK: true})
-	rpc(t, sock2,
-		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_message","arguments":{"from":"quick-wolf","to":"brisk-owl","body":"ping"}}}`)
-	if len(*got2) != 1 || (*got2)[0].Op != protocol.OpSend {
-		t.Fatalf("explicit from must bypass binding: %+v", *got2)
+	bindAs(t, "bound-s", "amber-fox")
+	sock2, got2 := fakeDaemon(t, protocol.Response{OK: true, Name: "amber-fox"})
+	out2 := rpc(t, sock2,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_message","arguments":{"from":"stranger","to":"brisk-owl","body":"ping"}}}`)
+	if !strings.Contains(out2[0], `"isError":true`) || !strings.Contains(out2[0], "from must be this session") {
+		t.Fatalf("unrelated from must be rejected: %s", out2[0])
+	}
+	if _, ok := findOp(*got2, protocol.OpSend); ok {
+		t.Fatalf("rejected from must not send: %+v", *got2)
 	}
 }
 
@@ -350,6 +425,7 @@ func TestChildReadDoesNotDrainParentInbox(t *testing.T) {
 	seed(protocol.Request{Op: protocol.OpSend, From: peer.Name, To: parent.Name, Body: "for-parent-2"})
 	seed(protocol.Request{Op: protocol.OpSend, From: peer.Name, To: child.Name, Body: "for-child"})
 
+	bindAs(t, "p1", parent.Name)
 	out := rpc(t, sock,
 		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_messages","arguments":{"from":"`+child.Name+`"}}}`)
 	if !strings.Contains(out[0], "for-child") || strings.Contains(out[0], "for-parent") {
@@ -394,6 +470,7 @@ func TestPeekMessagesIsNonDestructive(t *testing.T) {
 	seed(protocol.Request{Op: protocol.OpSend, From: a.Name, To: b.Name, Body: "first"})
 	seed(protocol.Request{Op: protocol.OpSend, From: a.Name, To: b.Name, Body: "second"})
 
+	bindAs(t, "sb", b.Name)
 	out := rpc(t, sock,
 		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"peek_messages","arguments":{"from":"`+b.Name+`"}}}`)
 	for _, want := range []string{`\"unread\": 2`, `\"` + a.Name + `\"`, `\"high_water\"`, `\"ids\"`} {
@@ -438,10 +515,175 @@ func TestStatusBoardForwardsIncludeGone(t *testing.T) {
 }
 
 func TestDaemonErrorSurfacesAsToolError(t *testing.T) {
-	sock, _ := fakeDaemon(t, protocol.Response{Error: "no agent \"nobody\" in this workspace"})
+	bindAs(t, "bound-s", "a")
+	sock, _ := fakeDaemonFunc(t, func(r protocol.Request) protocol.Response {
+		if r.Op == protocol.OpRegister {
+			return protocol.Response{OK: true, Name: "a"}
+		}
+		return protocol.Response{Error: "no agent \"nobody\" in this workspace"}
+	})
 	out := rpc(t, sock,
 		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_message","arguments":{"from":"a","to":"nobody","body":"x"}}}`)
 	if !strings.Contains(out[0], `"isError":true`) || !strings.Contains(out[0], "nobody") {
 		t.Fatalf("want isError with reason: %s", out[0])
+	}
+}
+
+func TestRelayForwardsSendWorkspace(t *testing.T) {
+	bindAs(t, "bound-s", "amber-fox")
+	sock, got := fakeDaemon(t, protocol.Response{OK: true, Name: "amber-fox"})
+	out := rpc(t, sock,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"relay","arguments":{"from":"amber-fox","to":"brisk-owl","workspace":"/other/repo","body":"hello"}}}`)
+	r, ok := findOp(*got, protocol.OpSendWorkspace)
+	if !ok || r.Body != "hello" || r.From != "amber-fox" || r.ReplyTo != nil || r.Token != "" || r.SessionID == "" {
+		t.Fatalf("relay request: %+v", *got)
+	}
+	if r.Target == nil || r.Target.Scope != "/other/repo" || r.Target.Name != "brisk-owl" {
+		t.Fatalf("relay target: %+v", r.Target)
+	}
+	if !strings.Contains(out[0], `"text":"ok"`) {
+		t.Fatalf("relay result: %s", out[0])
+	}
+}
+
+func TestRelayStructuredTargetKeepsUnicast(t *testing.T) {
+	bindAs(t, "bound-s", "amber-fox")
+	sock, got := fakeDaemon(t, protocol.Response{OK: true, Name: "amber-fox"})
+	rpc(t, sock,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"relay","arguments":{"from":"amber-fox","body":"report","target":{"scope":"/home/ra/proj","agent_id":"98ffc675471a","name":"eyes-host"}}}}`)
+	r, ok := findOp(*got, protocol.OpSendWorkspace)
+	if !ok || r.Target == nil || r.Target.AgentID != "98ffc675471a" || r.Target.Scope != "/home/ra/proj" || r.Target.Name != "eyes-host" {
+		t.Fatalf("structured target: %+v", *got)
+	}
+}
+
+func TestRelayAgentIDWinsOverName(t *testing.T) {
+	bindAs(t, "bound-s", "amber-fox")
+	sock, got := fakeDaemon(t, protocol.Response{OK: true, Name: "amber-fox"})
+	rpc(t, sock,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"relay","arguments":{"from":"amber-fox","body":"report","to":"someone","agent_id":"98ffc675471a","workspace":"/home/ra/proj"}}}`)
+	r, ok := findOp(*got, protocol.OpSendWorkspace)
+	if !ok || r.Target == nil || r.Target.AgentID != "98ffc675471a" || r.Target.Name != "" {
+		t.Fatalf("agent_id must win: %+v", r.Target)
+	}
+}
+
+func TestRequestEyesForwards(t *testing.T) {
+	bindAs(t, "bound-s", "amber-fox")
+	sock, got := fakeDaemon(t, protocol.Response{
+		OK: true, Name: "amber-fox", TaskID: "t1", Launcher: &protocol.AgentRef{Name: "host-eyes"},
+	})
+	out := rpc(t, sock,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"request_eyes","arguments":{"from":"amber-fox/Explore-1","brief":"open chrome","runtime":"claude","workspace":"/other/repo","timeout":600}}}`)
+	r, ok := findOp(*got, protocol.OpRequestEyes)
+	if !ok || r.Brief != "open chrome" || r.Runtime != "claude" || r.From != "amber-fox/Explore-1" || r.ReplyTo != nil || r.DeadlineS != 600 || r.SessionID == "" {
+		t.Fatalf("request_eyes request: %+v", *got)
+	}
+	if r.Target == nil || r.Target.Scope != "/other/repo" {
+		t.Fatalf("request_eyes target: %+v", r.Target)
+	}
+	if !strings.Contains(out[0], "task_id=t1") || !strings.Contains(out[0], "launcher=host-eyes") ||
+		!strings.Contains(out[0], "wait 'amber-fox/Explore-1'") {
+		t.Fatalf("request_eyes result: %s", out[0])
+	}
+}
+
+func TestRequestEyesEmptyTaskIDIsError(t *testing.T) {
+	bindAs(t, "bound-s", "amber-fox")
+	sock, _ := fakeDaemon(t, protocol.Response{OK: true, Name: "amber-fox"})
+	out := rpc(t, sock,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"request_eyes","arguments":{"from":"amber-fox","brief":"x"}}}`)
+	if !strings.Contains(out[0], `"isError":true`) || !strings.Contains(out[0], "no task_id") {
+		t.Fatalf("empty task_id: %s", out[0])
+	}
+}
+
+func TestRequestEyesRejectsBadRuntime(t *testing.T) {
+	bindAs(t, "bound-s", "amber-fox")
+	sock, _ := fakeDaemon(t, protocol.Response{OK: true, Name: "amber-fox", TaskID: "t1"})
+	out := rpc(t, sock,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"request_eyes","arguments":{"from":"amber-fox","brief":"x","runtime":"notepad"}}}`)
+	if !strings.Contains(out[0], `"isError":true`) || !strings.Contains(out[0], "claude") {
+		t.Fatalf("runtime enum: %s", out[0])
+	}
+}
+
+func TestRequestEyesTimeoutBounds(t *testing.T) {
+	bindAs(t, "bound-s", "amber-fox")
+	sock, _ := fakeDaemon(t, protocol.Response{OK: true, Name: "amber-fox", TaskID: "t1"})
+	out := rpc(t, sock,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"request_eyes","arguments":{"from":"amber-fox","brief":"x","timeout":10}}}`)
+	if !strings.Contains(out[0], `"isError":true`) || !strings.Contains(out[0], "300") {
+		t.Fatalf("timeout bounds: %s", out[0])
+	}
+}
+
+func TestListWorkspacesAndEyesSendNoFrom(t *testing.T) {
+	sock, got := fakeDaemon(t, protocol.Response{OK: true})
+	out := rpc(t, sock,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_workspaces","arguments":{}}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_eyes","arguments":{}}}`)
+	if len(*got) != 2 {
+		t.Fatalf("daemon saw %+v", *got)
+	}
+	if r := (*got)[0]; r.Op != protocol.OpListWorkspaces || r.From != "" {
+		t.Fatalf("list_workspaces must send no From: %+v", r)
+	}
+	if r := (*got)[1]; r.Op != protocol.OpListEyes || r.From != "" {
+		t.Fatalf("list_eyes must send no From: %+v", r)
+	}
+	if !strings.Contains(out[0], "no workspaces") {
+		t.Fatalf("empty workspaces: %s", out[0])
+	}
+	if !strings.Contains(out[1], "no eyes agents") {
+		t.Fatalf("empty eyes: %s", out[1])
+	}
+}
+
+func TestCancelEyesForwardsTaskID(t *testing.T) {
+	bindAs(t, "bound-s", "amber-fox")
+	sock, got := fakeDaemon(t, protocol.Response{OK: true, Name: "amber-fox"})
+	out := rpc(t, sock,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cancel_eyes","arguments":{"from":"amber-fox","task_id":"t1"}}}`)
+	r, ok := findOp(*got, protocol.OpCancelEyes)
+	if !ok || r.TaskID != "t1" || r.From != "amber-fox" || r.SessionID == "" {
+		t.Fatalf("cancel_eyes request: %+v", *got)
+	}
+	if !strings.Contains(out[0], "cancelled t1") {
+		t.Fatalf("cancel_eyes result: %s", out[0])
+	}
+}
+
+func TestServeHonorsScopeEnv(t *testing.T) {
+	t.Setenv("AC_SCOPE", "/home/ra/proj")
+	sock, got := fakeDaemon(t, protocol.Response{OK: true})
+	rpc(t, sock,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_workspaces","arguments":{}}}`)
+	if len(*got) != 1 || (*got)[0].Scope != "/home/ra/proj" {
+		t.Fatalf("want AC_SCOPE on request, got %+v", *got)
+	}
+}
+
+func TestRelayWithoutFromTriggersBindOrRegister(t *testing.T) {
+	stubBind(t, []int{999})
+	sock, got := fakeDaemon(t, protocol.Response{OK: true, Name: "amber-fox"})
+	out := rpc(t, sock,
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"codex","version":"1"}}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"relay","arguments":{"body":"ping"}}}`)
+	if len(out) != 2 || !strings.Contains(out[1], `"content"`) {
+		t.Fatalf("tool result: %v", out)
+	}
+	if len(*got) != 3 {
+		t.Fatalf("want register, send_workspace, deregister; got %+v", *got)
+	}
+	if r := (*got)[0]; r.Op != protocol.OpRegister || !strings.HasPrefix(r.SessionID, "mcp-") ||
+		r.Source != "mcp:codex" || !r.OnlyIfNoHook {
+		t.Fatalf("register request: %+v", r)
+	}
+	if r := (*got)[1]; r.Op != protocol.OpSendWorkspace || r.From != "amber-fox" || r.Body != "ping" || r.Target != nil || r.ReplyTo != nil {
+		t.Fatalf("relay request: %+v", r)
+	}
+	if (*got)[2].Op != protocol.OpDeregister || (*got)[2].SessionID != (*got)[0].SessionID {
+		t.Fatalf("deregister request: %+v", (*got)[2])
 	}
 }

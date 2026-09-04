@@ -56,8 +56,12 @@ var (
 )
 
 func Serve(stdin io.Reader, stdout io.Writer, socketPath, cwd string) error {
+	sc := strings.TrimSpace(os.Getenv("AC_SCOPE"))
+	if sc == "" {
+		sc = scope.Resolve(cwd)
+	}
 	s := &server{
-		scope:      scope.Resolve(cwd),
+		scope:      sc,
 		socketPath: socketPath,
 		sessionID:  newSessionID(),
 		source:     "mcp",
@@ -155,6 +159,98 @@ func (s *server) handle(req rpcReq) (any, map[string]any) {
 
 func arg(m map[string]any, k string) string { s, _ := m[k].(string); return s }
 
+const (
+	minEyesDeadlineS = 300
+	maxEyesDeadlineS = 1800
+)
+
+func isAgentID(s string) bool {
+	if len(s) != 12 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// agentRefFromArgs prefers a structured target object (so a message reply_to
+// stays unicast). Flat workspace/to/agent_id fill empty fields; agent_id wins.
+func agentRefFromArgs(m map[string]any) *protocol.AgentRef {
+	var ref protocol.AgentRef
+	if raw, ok := m["target"].(map[string]any); ok {
+		ref.Scope = arg(raw, "scope")
+		ref.AgentID = arg(raw, "agent_id")
+		ref.Name = arg(raw, "name")
+	}
+	if s := arg(m, "workspace"); s != "" && ref.Scope == "" {
+		ref.Scope = s
+	}
+	if id := arg(m, "agent_id"); id != "" && ref.AgentID == "" {
+		ref.AgentID = id
+	}
+	if to := arg(m, "to"); to != "" && ref.AgentID == "" && ref.Name == "" {
+		if isAgentID(to) {
+			ref.AgentID = to
+		} else {
+			ref.Name = to
+		}
+	}
+	if ref.Scope == "" && ref.AgentID == "" && ref.Name == "" {
+		return nil
+	}
+	return &ref
+}
+
+func parseTimeoutArg(m map[string]any, req *protocol.Request) error {
+	v, ok := m["timeout"]
+	if !ok || v == nil {
+		return nil
+	}
+	n, ok := v.(float64)
+	if !ok || n != float64(int(n)) {
+		return fmt.Errorf("timeout must be an integer number of seconds")
+	}
+	d := int(n)
+	if d < minEyesDeadlineS || d > maxEyesDeadlineS {
+		return fmt.Errorf("timeout must be between 300 and 1800 seconds")
+	}
+	req.DeadlineS = d
+	return nil
+}
+
+func identityOp(op string) bool {
+	switch op {
+	case protocol.OpSend, protocol.OpRead, protocol.OpPeek, protocol.OpBroadcast,
+		protocol.OpClaim, protocol.OpRelease, protocol.OpHistory,
+		protocol.OpSendWorkspace, protocol.OpRequestEyes, protocol.OpCancelEyes:
+		return true
+	}
+	return false
+}
+
+func (s *server) bindIdentity(req *protocol.Request) error {
+	if !identityOp(req.Op) {
+		return nil
+	}
+	name, err := s.ensureRegistered(false)
+	if err != nil {
+		return err
+	}
+	req.SessionID = s.sessionID
+	if req.From == "" {
+		req.From = name
+		return nil
+	}
+	if req.From != name && !strings.HasPrefix(req.From, name+"/") {
+		return fmt.Errorf("from must be this session (%s) or a child identity", name)
+	}
+	return nil
+}
+
 func (s *server) callTool(p callParams) map[string]any {
 	req := protocol.Request{Scope: s.scope}
 	switch p.Name {
@@ -200,24 +296,35 @@ func (s *server) callTool(p callParams) map[string]any {
 		if l, ok := p.Arguments["limit"].(float64); ok {
 			req.Limit = int(l)
 		}
+	case "list_workspaces":
+		req.Op = protocol.OpListWorkspaces
+	case "list_eyes":
+		req.Op = protocol.OpListEyes
+	case "relay":
+		req.Op = protocol.OpSendWorkspace
+		req.From, req.Body = arg(p.Arguments, "from"), arg(p.Arguments, "body")
+		req.Target = agentRefFromArgs(p.Arguments)
+	case "request_eyes":
+		req.Op = protocol.OpRequestEyes
+		req.From = arg(p.Arguments, "from")
+		req.Brief = arg(p.Arguments, "brief")
+		req.Runtime = arg(p.Arguments, "runtime")
+		req.Target = agentRefFromArgs(p.Arguments)
+		if err := parseTimeoutArg(p.Arguments, &req); err != nil {
+			return errResult(err.Error())
+		}
+		if rt := req.Runtime; rt != "" && rt != "claude" && rt != "codex" && rt != "grok" {
+			return errResult("runtime must be claude, codex, or grok")
+		}
+	case "cancel_eyes":
+		req.Op = protocol.OpCancelEyes
+		req.From = arg(p.Arguments, "from")
+		req.TaskID = arg(p.Arguments, "task_id")
 	default:
 		return errResult("unknown tool " + p.Name)
 	}
-	// Caller-identity ops resolve a missing from exactly like messaging:
-	// bind-or-register, fail closed when identity cannot be determined.
-	if req.From == "" {
-		switch req.Op {
-		case protocol.OpSend, protocol.OpRead, protocol.OpPeek, protocol.OpBroadcast,
-			protocol.OpClaim, protocol.OpRelease, protocol.OpHistory:
-			name, err := s.ensureRegistered(false)
-			if err != nil {
-				return errResult(err.Error())
-			}
-			req.From = name
-		}
-	}
-	if s.name != "" {
-		req.SessionID = s.sessionID // heartbeat: every call keeps the bound row fresh
+	if err := s.bindIdentity(&req); err != nil {
+		return errResult(err.Error())
 	}
 	resp, err := roundTrip(s.socketPath, req)
 	if err != nil {
@@ -270,6 +377,29 @@ func (s *server) callTool(p callParams) map[string]any {
 		if len(resp.History) == 0 {
 			text = "no message history"
 		}
+	case "list_workspaces":
+		b, _ := json.MarshalIndent(resp.Workspaces, "", "  ")
+		text = string(b)
+		if len(resp.Workspaces) == 0 {
+			text = "no workspaces"
+		}
+	case "list_eyes":
+		b, _ := json.MarshalIndent(resp.Agents, "", "  ")
+		text = string(b)
+		if len(resp.Agents) == 0 {
+			text = "no eyes agents"
+		}
+	case "request_eyes":
+		if resp.TaskID == "" {
+			return errResult("request_eyes: daemon returned no task_id")
+		}
+		text = "task_id=" + resp.TaskID
+		if resp.Launcher != nil {
+			text += " launcher=" + resp.Launcher.Name
+		}
+		text += "\narm: agent-coordinator wait '" + req.From + "'"
+	case "cancel_eyes":
+		text = "cancelled " + req.TaskID
 	default:
 		text = "ok"
 	}
@@ -304,6 +434,7 @@ func (s *server) ensureRegistered(explicit bool) (string, error) {
 		Scope:        s.scope,
 		SessionID:    s.sessionID,
 		Source:       s.source,
+		Kind:         strings.TrimSpace(os.Getenv("AC_KIND")),
 		OnlyIfNoHook: !s.bound && !explicit,
 	})
 	if err != nil {
@@ -454,5 +585,51 @@ var toolDefs = []map[string]any{
 			"peer":  map[string]any{"type": "string", "description": "Only exchanges with this agent (name or agent_id)."},
 			"limit": map[string]any{"type": "number", "description": "Max rows, default 20, capped at 100."},
 			"from":  map[string]any{"type": "string"}}},
+	},
+	{
+		"name":        "list_workspaces",
+		"description": "Occupancy directory of every workspace with a live agent: scope, live/eyes/launcher counts.",
+		"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
+	},
+	{
+		"name":        "list_eyes",
+		"description": "Live eyes and launcher agents across workspaces (kind, scope, platform, capabilities). Empty means no host broker is connected.",
+		"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
+	},
+	{
+		"name":        "relay",
+		"description": "Send a body to a workspace, optionally one agent. Prefer structured 'target' {scope, agent_id, name} (agent_id wins) so a reply_to stays unicast. Flat workspace/to/agent_id are compatibility aliases. Server stamps reply-to.",
+		"inputSchema": map[string]any{"type": "object", "required": []string{"body"}, "properties": map[string]any{
+			"body": map[string]any{"type": "string"},
+			"target": map[string]any{
+				"type":        "object",
+				"description": "Structured address. agent_id wins over name.",
+				"properties": map[string]any{
+					"scope":    map[string]any{"type": "string"},
+					"agent_id": map[string]any{"type": "string"},
+					"name":     map[string]any{"type": "string"},
+				},
+			},
+			"workspace": map[string]any{"type": "string", "description": "Destination scope id (flat)."},
+			"to":        map[string]any{"type": "string", "description": "Destination name or 12-hex agent_id (flat)."},
+			"agent_id":  map[string]any{"type": "string", "description": "Destination agent_id (flat)."},
+			"from":      map[string]any{"type": "string"}}},
+	},
+	{
+		"name":        "request_eyes",
+		"description": "Dispatch a brief to host eyes; the report arrives as ordinary mail in your inbox. Optional runtime is claude, codex, or grok. timeout is seconds in 300..1800.",
+		"inputSchema": map[string]any{"type": "object", "required": []string{"brief"}, "properties": map[string]any{
+			"brief":     map[string]any{"type": "string"},
+			"workspace": map[string]any{"type": "string", "description": "Destination scope id."},
+			"runtime":   map[string]any{"type": "string", "enum": []any{"claude", "codex", "grok"}},
+			"timeout":   map[string]any{"type": "integer", "minimum": 300, "maximum": 1800, "description": "Deadline in seconds."},
+			"from":      map[string]any{"type": "string"}}},
+	},
+	{
+		"name":        "cancel_eyes",
+		"description": "Cancel an eyes task you requested. Only the stamped requester (or a child passing from=) can cancel.",
+		"inputSchema": map[string]any{"type": "object", "required": []string{"task_id"}, "properties": map[string]any{
+			"task_id": map[string]any{"type": "string"},
+			"from":    map[string]any{"type": "string"}}},
 	},
 }

@@ -46,22 +46,21 @@ func startDaemon(t *testing.T) (string, func(protocol.Request) protocol.Response
 }
 
 func TestClaimToolForwardsPathAndNote(t *testing.T) {
-	sock, got := fakeDaemon(t, protocol.Response{OK: true})
+	bindAs(t, "bound-s", "amber-fox")
+	sock, got := fakeDaemon(t, protocol.Response{OK: true, Name: "amber-fox"})
 	out := rpc(t, sock,
 		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"claim","arguments":{"from":"amber-fox","path":"internal/hub.go","note":"rewiring"}}}`,
 		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"release","arguments":{"from":"amber-fox","path":"internal/hub.go"}}}`,
 		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"message_history","arguments":{"from":"amber-fox","peer":"brisk-owl","limit":5}}}`)
-	if len(*got) != 3 {
-		t.Fatalf("want claim+release+history requests: %+v", *got)
+	claim, ok := findOp(*got, protocol.OpClaim)
+	if !ok || claim.From != "amber-fox" || claim.Path != "internal/hub.go" || claim.Note != "rewiring" || claim.SessionID == "" {
+		t.Fatalf("claim request: %+v", *got)
 	}
-	if r := (*got)[0]; r.Op != protocol.OpClaim || r.From != "amber-fox" || r.Path != "internal/hub.go" || r.Note != "rewiring" {
-		t.Fatalf("claim request: %+v", r)
+	if r, ok := findOp(*got, protocol.OpRelease); !ok || r.Path != "internal/hub.go" {
+		t.Fatalf("release request: %+v", *got)
 	}
-	if r := (*got)[1]; r.Op != protocol.OpRelease || r.Path != "internal/hub.go" {
-		t.Fatalf("release request: %+v", r)
-	}
-	if r := (*got)[2]; r.Op != protocol.OpHistory || r.Peer != "brisk-owl" || r.Limit != 5 {
-		t.Fatalf("history request: %+v", r)
+	if r, ok := findOp(*got, protocol.OpHistory); !ok || r.Peer != "brisk-owl" || r.Limit != 5 {
+		t.Fatalf("history request: %+v", *got)
 	}
 	if !strings.Contains(out[0], "claimed internal/hub.go") || !strings.Contains(out[1], "released internal/hub.go") {
 		t.Fatalf("claim/release results: %v", out[:2])
@@ -75,6 +74,7 @@ func TestClaimConflictRendersHolderAndNote(t *testing.T) {
 	a := seed(protocol.Request{Op: protocol.OpRegister, SessionID: "sa", Source: "hook"})
 	b := seed(protocol.Request{Op: protocol.OpRegister, SessionID: "sb", Source: "hook"})
 	seed(protocol.Request{Op: protocol.OpClaim, From: a.Name, Path: "/hub.go", Note: "rewiring dispatch"})
+	bindAs(t, "sb", b.Name)
 	out := rpc(t, sock,
 		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"claim","arguments":{"from":"`+b.Name+`","path":"/hub.go","note":"mine"}}}`)
 	if !strings.Contains(out[0], `"isError":true`) ||
@@ -95,6 +95,7 @@ func TestMessageHistoryIsNonDestructive(t *testing.T) {
 	a := seed(protocol.Request{Op: protocol.OpRegister, SessionID: "sa", Source: "hook"})
 	b := seed(protocol.Request{Op: protocol.OpRegister, SessionID: "sb", Source: "hook"})
 	seed(protocol.Request{Op: protocol.OpSend, From: a.Name, To: b.Name, Body: "audit me"})
+	bindAs(t, "sb", b.Name)
 	out := rpc(t, sock,
 		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"message_history","arguments":{"from":"`+b.Name+`"}}}`)
 	for _, want := range []string{`\"body_preview\": \"audit me\"`, `\"read_at\": 0`, `\"from\": \"` + a.Name + `\"`} {

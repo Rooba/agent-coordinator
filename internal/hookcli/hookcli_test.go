@@ -105,6 +105,21 @@ func TestSessionStartIntroducesName(t *testing.T) {
 	}
 }
 
+func TestSessionStartHonorsScopeAndKindEnv(t *testing.T) {
+	t.Setenv("AC_SCOPE", "/home/ra/proj")
+	t.Setenv("AC_KIND", protocol.KindEyes)
+	sock, got := fakeDaemon(t, protocol.Response{OK: true, Name: "amber-fox"})
+	var out bytes.Buffer
+	Run(bytes.NewReader(fixture(t, "session_start.json")), &out, sock)
+	if len(*got) != 1 {
+		t.Fatalf("daemon saw %+v", got)
+	}
+	req := (*got)[0]
+	if req.Scope != "/home/ra/proj" || req.Kind != protocol.KindEyes || req.Op != protocol.OpRegister {
+		t.Fatalf("want AC_SCOPE/AC_KIND on register, got %+v", req)
+	}
+}
+
 func TestStopEmitsBlockOnNotices(t *testing.T) {
 	sock, got := fakeDaemon(t, protocol.Response{OK: true,
 		Notices: []string{"[coordinator] 1 new message from amber-fox - call read_messages"}})

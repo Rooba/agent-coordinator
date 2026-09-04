@@ -25,12 +25,22 @@ func main() {
 		runJoin(os.Args[2:])
 	case "board":
 		runBoard(os.Args[2:])
+	case "workspaces":
+		runWorkspaces(os.Args[2:])
+	case "eyes":
+		runEyes(os.Args[2:])
+	case "relay":
+		runRelay(os.Args[2:])
+	case "summon", "request-eyes":
+		runSummon(os.Args[2:])
+	case "cancel-eyes":
+		runCancelEyes(os.Args[2:])
 	case "install":
 		runInstall(os.Args[2:])
 	case "version":
 		fmt.Println(version)
 	default:
-		fmt.Fprintln(os.Stderr, "usage: agent-coordinator daemon|hook|mcp|wait <name>|join|board|install [--uninstall]|version")
+		fmt.Fprintln(os.Stderr, "usage: agent-coordinator daemon|hook|mcp|wait <name>|join|board|workspaces|eyes|relay|summon|request-eyes|cancel-eyes|install [--uninstall]|version")
 		os.Exit(2)
 	}
 }
