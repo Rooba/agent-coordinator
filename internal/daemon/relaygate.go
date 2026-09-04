@@ -3,6 +3,8 @@ package daemon
 import (
 	"crypto/subtle"
 	"errors"
+	"fmt"
+	"os"
 	"strings"
 
 	"github.com/Rooba/agent-coordinator/internal/protocol"
@@ -32,12 +34,27 @@ var relayOps = map[string]bool{
 	protocol.OpSendWorkspace: true,
 }
 
+// relayWireErrors are the only store failures whose text may cross the wire.
+// Anything else is this daemon's problem, not the caller's business, so it is
+// logged here and answered "internal error".
+var relayWireErrors = []error{
+	store.ErrRelayAuth, store.ErrForeignSession, store.ErrEyesBusy, store.ErrNoLauncher,
+	store.ErrUnknownTask, store.ErrNotYourTask, store.ErrTaskNotLive, store.ErrBadTransition,
+}
+
 // relayGate authenticates TCP requests and rewrites their identity from the
 // row the caller proved it owns. A nil gate is the unix listener, whose trust
 // boundary is the socket directory's permissions.
 type relayGate struct {
-	st    *store.Store
-	token string // empty means AC_RELAY_INSECURE: skip the shared-token check
+	st       *store.Store
+	token    string
+	insecure bool // AC_RELAY_INSECURE: skip the shared-token compare, nothing else
+}
+
+// relayLog is the relay's one log line. Loopback traffic is low volume and a
+// refusal has to be visible; credentials never appear in it.
+func relayLog(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "relay: "+format+"\n", args...)
 }
 
 // refuse is a gate refusal: the connection is answered and closed with
@@ -47,14 +64,25 @@ func refuse(reason string) (protocol.Response, bool) {
 }
 
 // check either answers a relay request outright - a refusal, or the register
-// that mints the caller's credential - or rewrites it for dispatch. Token,
-// then allowlist, then the session binding: a caller failing the first two
-// never touches the store.
+// that binds the caller's credential - or rewrites it for dispatch. Every
+// refusal is logged here, in the one place they all pass through.
 func (g *relayGate) check(req *protocol.Request) (protocol.Response, bool) {
 	if g == nil {
 		return protocol.Response{}, false // unix: nothing to prove
 	}
-	if g.token != "" && subtle.ConstantTimeCompare([]byte(req.Token), []byte(g.token)) != 1 {
+	resp, final := g.decide(req)
+	if resp.Error != "" {
+		relayLog("refused %s: %s", req.Op, resp.Error)
+	}
+	return resp, final
+}
+
+// decide is the gate proper: token, then allowlist, then the session binding,
+// so a caller failing the first two never touches the store.
+func (g *relayGate) decide(req *protocol.Request) (protocol.Response, bool) {
+	// An empty token authorizes nobody: only AC_RELAY_INSECURE, set on
+	// purpose, drops this check.
+	if !g.insecure && (g.token == "" || subtle.ConstantTimeCompare([]byte(req.Token), []byte(g.token)) != 1) {
 		return refuse("unauthorized")
 	}
 	if !relayOps[req.Op] {
@@ -73,8 +101,10 @@ func (g *relayGate) check(req *protocol.Request) (protocol.Response, bool) {
 	if err != nil {
 		return refuse(relayError(err))
 	}
-	// The row, never the caller, says who this is.
-	req.Scope, req.From = id.Scope, id.Name
+	// The row, never the caller, says who this is - and a relay client has no
+	// subagents, so an agent_id it sent would mint or retarget a child row in
+	// somebody else's workspace.
+	req.Scope, req.From, req.AgentID = id.Scope, id.Name, ""
 	// A task id belongs to the eyes lifecycle, so ordinary mail never carries
 	// one a relay client chose.
 	if req.Op == protocol.OpSend || req.Op == protocol.OpBroadcast {
@@ -83,23 +113,24 @@ func (g *relayGate) check(req *protocol.Request) (protocol.Response, bool) {
 	return protocol.Response{}, false
 }
 
-// register answers the two registrations the relay allows. It is the one op
-// that mints a credential, and each shape needs proof of its own: the shared
-// token for a broker's launcher row, the assigned launcher's secret for that
-// task's eyes child.
+// register answers the two registrations the relay allows. Each needs proof
+// of its own: a broker brings the secret it preminted for its launcher row,
+// while an eyes child is minted for it by the launcher holding that task.
 func (g *relayGate) register(req *protocol.Request) (protocol.Response, bool) {
 	switch req.Kind {
 	case protocol.KindLauncher:
 		if !strings.HasPrefix(req.Scope, hostScopePrefix) {
 			return refuse("foreign session")
 		}
-		reg, err := g.st.RegisterRelay(store.RelayRegistration{
+		// The store keeps only the sha256 of what the broker brought, and
+		// mints nothing, so a lost response costs a retry and never an
+		// identity.
+		if _, err := g.st.RegisterRelay(store.RelayRegistration{
 			Scope: req.Scope, SessionID: req.SessionID, Kind: req.Kind, Origin: relayOrigin,
-			Platform: req.Platform, Capabilities: req.Capabilities, Secret: req.SessionSecret})
-		if err != nil {
+			Platform: req.Platform, Capabilities: req.Capabilities, Secret: req.SessionSecret}); err != nil {
 			return refuse(relayError(err))
 		}
-		return protocol.Response{OK: true, Name: reg.Name, SessionSecret: reg.Secret}, true
+		return g.registered(req.Scope, req.SessionID, "")
 	case protocol.KindEyes:
 		// Only the launcher already holding this task's launch may spin its
 		// child up: the session id names the task, auth_session_id and the
@@ -121,17 +152,35 @@ func (g *relayGate) register(req *protocol.Request) (protocol.Response, bool) {
 		if err != nil {
 			return refuse(relayError(err))
 		}
-		return protocol.Response{OK: true, Name: reg.Name, SessionSecret: reg.Secret}, true
+		return g.registered(task.RequesterScope, req.SessionID, reg.Secret)
 	}
 	return refuse("op not allowed on relay")
 }
 
-// relayError turns a store failure into the wire string the spec fixes. The
-// sentinels already spell their own; only "no session" is normalized, because
-// a caller must never learn whether the id or the secret was wrong.
+// registered answers a register with the row that was actually written. The
+// broker addresses its launcher and its children by agent_id, so a response
+// that only named them would leave it guessing.
+func (g *relayGate) registered(scope, sessionID, secret string) (protocol.Response, bool) {
+	id, err := g.st.Identity(scope, sessionID)
+	if err != nil {
+		return refuse(relayError(err))
+	}
+	return protocol.Response{OK: true, Name: id.Name, AgentID: id.AgentID, SessionSecret: secret}, true
+}
+
+// relayError turns a store failure into the wire string the spec fixes. A
+// session that does not exist and a secret that does not match share one
+// answer, so a caller never learns which credential was wrong, and anything
+// undocumented stays local.
 func relayError(err error) string {
 	if errors.Is(err, store.ErrNoSession) {
 		return store.ErrRelayAuth.Error()
 	}
-	return err.Error()
+	for _, wire := range relayWireErrors {
+		if errors.Is(err, wire) {
+			return err.Error()
+		}
+	}
+	relayLog("internal: %v", err)
+	return "internal error"
 }

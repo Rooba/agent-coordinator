@@ -97,7 +97,7 @@ var relayReady = func(string) {}
 func relayListener(st *store.Store) (net.Listener, *relayGate) {
 	addr, err := paths.RelayListen()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "relay: %v\n", err)
+		relayLog("%v", err)
 		return nil, nil
 	}
 	if addr == "" {
@@ -105,20 +105,20 @@ func relayListener(st *store.Store) (net.Listener, *relayGate) {
 	}
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "relay: listen %s: %v\n", addr, err)
+		relayLog("listen %s: %v", addr, err)
 		return nil, nil
 	}
 	// The token is resolved once the relay is really up, so a daemon that
 	// never listens leaves no secret lying around.
-	gate := &relayGate{st: st}
-	if paths.RelayInsecure() {
-		fmt.Fprintf(os.Stderr, "relay: WARNING AC_RELAY_INSECURE is set - the shared token is NOT checked\n")
+	gate := &relayGate{st: st, insecure: paths.RelayInsecure()}
+	if gate.insecure {
+		relayLog("WARNING AC_RELAY_INSECURE is set - the shared token is NOT checked")
 	} else if gate.token, err = paths.RelayToken(); err != nil {
-		fmt.Fprintf(os.Stderr, "relay: token: %v\n", err)
+		relayLog("token: %v", err)
 		l.Close()
 		return nil, nil
 	}
-	fmt.Fprintf(os.Stderr, "relay: listening on %s\n", l.Addr())
+	relayLog("listening on %s", l.Addr())
 	relayReady(l.Addr().String())
 	return l, gate
 }
@@ -195,7 +195,7 @@ func Serve(l net.Listener, st *store.Store, idleTimeout time.Duration) error {
 		go func() {
 			defer wg.Done()
 			if err := accept(relay, st, gate, &lastActivity, &wg); err != nil {
-				fmt.Fprintf(os.Stderr, "relay: accept: %v\n", err)
+				relayLog("accept: %v", err)
 			}
 		}()
 	}
