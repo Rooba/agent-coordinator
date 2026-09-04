@@ -324,15 +324,21 @@ func (s *Store) ResolveActor(scope, callerSessionID, explicitFrom string) (Agent
 		return s.Identity(scope, callerSessionID)
 	}
 	var sessionID, parentSession string
-	err := s.db.QueryRow(`SELECT session_id, parent_session_id FROM agents WHERE scope=? AND (name=? OR agent_id=?)`,
-		scope, explicitFrom, explicitFrom).Scan(&sessionID, &parentSession)
+	var callerHere bool
+	err := s.db.QueryRow(`SELECT a.session_id, a.parent_session_id,
+		EXISTS(SELECT 1 FROM agents c WHERE c.scope = a.scope AND c.session_id = ?) AS caller_here
+		FROM agents a WHERE a.scope=? AND (a.name=? OR a.agent_id=?)`,
+		callerSessionID, scope, explicitFrom, explicitFrom).Scan(&sessionID, &parentSession, &callerHere)
 	if err == sql.ErrNoRows {
 		return AgentIdentity{}, fmt.Errorf("no agent %q in this workspace", explicitFrom)
 	}
 	if err != nil {
 		return AgentIdentity{}, err
 	}
-	if callerSessionID != "" && callerSessionID != sessionID && callerSessionID != parentSession {
+	// Speaking for a child needs the caller's OWN row to still be here: once a
+	// parent is purged, its children are nobody's proxy.
+	own := callerSessionID == sessionID || (callerHere && callerSessionID == parentSession)
+	if callerSessionID != "" && !own {
 		return AgentIdentity{}, ErrForeignSession
 	}
 	return s.Identity(scope, sessionID)
@@ -496,6 +502,19 @@ func (s *Store) sendToScope(q execQuerier, d Delivery) error {
 	return nil
 }
 
+// replyRef decodes a message's stamped return address. A corrupt stamp is
+// dropped rather than raised: it must never swallow the message itself.
+func replyRef(stamped string) *protocol.AgentRef {
+	if stamped == "" {
+		return nil
+	}
+	ref := &protocol.AgentRef{}
+	if json.Unmarshal([]byte(stamped), ref) != nil {
+		return nil
+	}
+	return ref
+}
+
 // liveAgents lists the active or idle agent ids in a scope, minus the
 // sender. Collected before any write: with SetMaxOpenConns(1) an open cursor
 // holds the sole connection.
@@ -565,12 +584,7 @@ func (s *Store) Read(scope, name string) ([]protocol.Message, error) {
 			rows.Close()
 			return nil, err
 		}
-		if replyTo != "" {
-			m.ReplyTo = &protocol.AgentRef{}
-			if json.Unmarshal([]byte(replyTo), m.ReplyTo) != nil {
-				m.ReplyTo = nil // a corrupt stamp must not swallow the message
-			}
-		}
+		m.ReplyTo = replyRef(replyTo)
 		out = append(out, m)
 	}
 	rows.Close() // release the tx's connection before the UPDATEs below

@@ -3,6 +3,8 @@ package paths
 import (
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -160,5 +162,76 @@ func TestRelayTokenEmptyFileIsError(t *testing.T) {
 	}
 	if got, err := RelayToken(); err == nil {
 		t.Fatalf("empty token file must be an error, got %q", got)
+	}
+}
+
+// hexToken is a well-formed token file body: 32 CSPRNG bytes as lowercase hex.
+const hexToken = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+// A token file must be exactly what the daemon mints. Anything else is
+// reported, never repaired: a short or hand-typed secret guards the whole
+// relay, and silently replacing it would break the paired broker instead.
+func TestRelayTokenRejectsMalformedFile(t *testing.T) {
+	for _, body := range []string{"hunter2\n", hexToken[:63] + "\n", hexToken + "extra\n",
+		strings.ToUpper(hexToken) + "\n", "zzzz56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01\n"} {
+		dir := t.TempDir()
+		t.Setenv("AC_DB", filepath.Join(dir, "coordinator.db"))
+		t.Setenv("AC_TOKEN", "")
+		path := filepath.Join(dir, "relay.token")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		got, err := RelayToken()
+		if err == nil {
+			t.Fatalf("token file %q must be refused, got %q", body, got)
+		}
+		if !strings.Contains(err.Error(), path) {
+			t.Fatalf("the error must name the file: %v", err)
+		}
+		if after, _ := os.ReadFile(path); string(after) != body {
+			t.Fatalf("a bad token file must be left alone, got %q", after)
+		}
+	}
+}
+
+// A token readable by other local accounts is not a secret: refuse it rather
+// than chmod it back, so whoever loosened it finds out.
+func TestRelayTokenRejectsLooseFileMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows reports synthesized permission bits")
+	}
+	dir := t.TempDir()
+	t.Setenv("AC_DB", filepath.Join(dir, "coordinator.db"))
+	t.Setenv("AC_TOKEN", "")
+	path := filepath.Join(dir, "relay.token")
+	if err := os.WriteFile(path, []byte(hexToken+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := RelayToken()
+	if err == nil {
+		t.Fatalf("a world-readable token file must be refused, got %q", got)
+	}
+	if !strings.Contains(err.Error(), "0600") {
+		t.Fatalf("the error must say what is wrong: %v", err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := RelayToken(); err != nil || got != hexToken {
+		t.Fatalf("a 0600 hex token file reads back: %q (%v)", got, err)
+	}
+}
+
+// AC_TOKEN is the client's pairing override, not a minted file: it is taken
+// as given, even while a broken file sits next to the database.
+func TestRelayTokenEnvOverrideIsFreeForm(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("AC_DB", filepath.Join(dir, "coordinator.db"))
+	if err := os.WriteFile(filepath.Join(dir, "relay.token"), []byte("junk\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AC_TOKEN", "  paired-by-hand  ")
+	if got, err := RelayToken(); err != nil || got != "paired-by-hand" {
+		t.Fatalf("AC_TOKEN must win verbatim: %q (%v)", got, err)
 	}
 }

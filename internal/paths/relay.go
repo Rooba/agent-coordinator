@@ -63,9 +63,10 @@ func RelayTokenPath() (string, error) {
 	return filepath.Join(filepath.Dir(db), "relay.token"), nil
 }
 
-// RelayToken returns the shared relay secret: AC_TOKEN wins for clients,
-// otherwise the token file, created 0600 with 32 CSPRNG bytes on first use
-// (the daemon's first relay listen).
+// RelayToken returns the shared relay secret: AC_TOKEN wins for clients and
+// is taken as given (pairing may hand it over by hand), otherwise the token
+// file, created 0600 with 32 CSPRNG bytes on first use (the daemon's first
+// relay listen) and validated on every read.
 func RelayToken() (string, error) {
 	if t := strings.TrimSpace(os.Getenv("AC_TOKEN")); t != "" {
 		return t, nil
@@ -117,8 +118,10 @@ func publishToken(path, token string) (string, error) {
 }
 
 // readToken reads the token file, reporting "" when it is absent so the
-// caller can mint one. An existing but empty file is an error, never a
-// blank secret that would authorize every caller.
+// caller can mint one. What is there must be exactly what this daemon writes
+// - 32 CSPRNG bytes as lowercase hex, mode 0600 - and anything else is
+// reported rather than repaired: a weak or shared-readable secret opens the
+// whole relay, and silently rewriting it would strand the paired broker.
 func readToken(path string) (string, error) {
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -127,11 +130,23 @@ func readToken(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if err := checkTokenPerm(path); err != nil {
+		return "", err
+	}
 	token := strings.TrimSpace(string(b))
-	if token == "" {
-		return "", fmt.Errorf("relay token file %s is empty: delete it to mint a new token", path)
+	if !mintedToken(token) {
+		return "", fmt.Errorf("relay token file %s must hold 64 lowercase hex characters: delete it to mint a new token", path)
 	}
 	return token, nil
+}
+
+// mintedToken reports whether a token has the shape RelayToken writes.
+func mintedToken(t string) bool {
+	if len(t) != 64 || strings.ToLower(t) != t {
+		return false
+	}
+	_, err := hex.DecodeString(t)
+	return err == nil
 }
 
 // RelayInsecure reports whether the token check is disabled - local test
