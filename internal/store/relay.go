@@ -221,16 +221,23 @@ type RelayIdentity struct {
 	secretHash                         string
 }
 
+// relayFirstRow picks ONE agents row for a session id, wherever a lookup has
+// to resolve a relay session across scopes: the relay row wins, then the
+// oldest, then the lowest scope. Every such lookup shares this so they cannot
+// drift apart and answer with different rows for the same broker. The columns
+// are unqualified, which resolves to the agents table in any single-table
+// scope it is dropped into.
+const relayFirstRow = `ORDER BY origin='relay' DESC, registered_at, scope LIMIT 1`
+
 // agentBySession finds a row by session id across scopes - the relay's one
 // non-scoped identity read, because the gate must authenticate a caller
-// before it knows which workspace answers for it. A relay row always wins:
-// every caller of this is asking about a relay identity, and a local session
-// that happens to share the id must not be able to shadow one. The rest of
-// the order is fixed so a squatted id resolves the same way every time.
+// before it knows which workspace answers for it. A local session that
+// happens to share the id must not shadow the relay row, so the shared
+// relay-first order decides.
 func (s *Store) agentBySession(q execQuerier, sessionID string) (RelayIdentity, error) {
 	var id RelayIdentity
 	err := q.QueryRow(`SELECT scope, name, agent_id, kind, origin, relay_secret_hash FROM agents
-		WHERE session_id=? ORDER BY origin='relay' DESC, registered_at, scope LIMIT 1`, sessionID).
+		WHERE session_id=? `+relayFirstRow, sessionID).
 		Scan(&id.Scope, &id.Name, &id.AgentID, &id.Kind, &id.Origin, &id.secretHash)
 	if err == sql.ErrNoRows {
 		return RelayIdentity{}, ErrNoSession

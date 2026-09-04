@@ -881,38 +881,90 @@ func TestCancelEyesTaskIsBoundToTheRequestersScope(t *testing.T) {
 	}
 }
 
-// A report that lands between the sweep's snapshot and its move leaves
-// nothing to expire: the task is already settled, so the sweep skips it
-// instead of counting it or reporting it as a failure. The clock hook is the
-// race, fired once before the sweep opens its transaction.
-func TestExpireEyesTasksToleratesAConcurrentReport(t *testing.T) {
-	s := open(t)
-	now := time.Unix(7600000, 0)
-	s.Now = func() time.Time { return now }
-	_, _, task, _ := liveTask(t, s)
-	if _, ok, err := s.TransitionEyesTask(task.TaskID, "broker-1", "accepted", "{}"); err != nil || !ok {
-		t.Fatalf("accept: ok=%v (%v)", ok, err)
-	}
-	if _, err := s.db.Exec(`UPDATE eyes_tasks SET created_at=? WHERE task_id=?`,
-		now.Unix()-301, task.TaskID); err != nil {
-		t.Fatal(err)
-	}
-	racing := true
-	s.Now = func() time.Time {
-		if racing {
-			racing = false
-			if _, ok, err := s.TransitionEyesTask(task.TaskID, "eyes-"+task.TaskID, "done",
-				`{"type":"task.result","task_id":"`+task.TaskID+`"}`); err != nil || !ok {
+// A task that settles - or disappears - between the sweep's snapshot and its
+// move leaves nothing to expire, so the sweep skips it instead of counting it
+// or reporting it as a failure. The clock hook is the race: it fires once,
+// just before the sweep opens its transaction.
+func TestExpireEyesTasksToleratesAConcurrentSettle(t *testing.T) {
+	for _, c := range []struct {
+		what, wantState string
+		race            func(t *testing.T, s *Store, taskID string)
+	}{
+		{"a report that lands first", "done", func(t *testing.T, s *Store, taskID string) {
+			if _, ok, err := s.TransitionEyesTask(taskID, "eyes-"+taskID, "done",
+				`{"type":"task.result","task_id":"`+taskID+`"}`); err != nil || !ok {
 				t.Errorf("the racing report: ok=%v (%v)", ok, err)
 			}
+		}},
+		{"a purge that gets there first", "", func(t *testing.T, s *Store, taskID string) {
+			if _, err := s.db.Exec(`DELETE FROM eyes_tasks WHERE task_id=?`, taskID); err != nil {
+				t.Error(err)
+			}
+		}},
+	} {
+		s := open(t)
+		now := time.Unix(7600000, 0)
+		s.Now = func() time.Time { return now }
+		_, _, task, _ := liveTask(t, s)
+		if _, ok, err := s.TransitionEyesTask(task.TaskID, "broker-1", "accepted", "{}"); err != nil || !ok {
+			t.Fatalf("accept: ok=%v (%v)", ok, err)
 		}
-		return now
+		if _, err := s.db.Exec(`UPDATE eyes_tasks SET created_at=? WHERE task_id=?`,
+			now.Unix()-301, task.TaskID); err != nil {
+			t.Fatal(err)
+		}
+		racing := true
+		s.Now = func() time.Time {
+			if racing {
+				racing = false
+				c.race(t, s, task.TaskID)
+			}
+			return now
+		}
+		if n, err := s.ExpireEyesTasks(now); err != nil || n != 0 {
+			t.Fatalf("%s: the sweep must skip it, not report it: %d (%v)", c.what, n, err)
+		}
+		got, err := s.EyesTask(task.TaskID)
+		if c.wantState == "" {
+			if !errors.Is(err, ErrUnknownTask) {
+				t.Fatalf("%s: the task is gone: %+v (%v)", c.what, got, err)
+			}
+			continue
+		}
+		if err != nil || got.State != c.wantState {
+			t.Fatalf("%s: the race wins: %+v (%v)", c.what, got, err)
+		}
 	}
-	if n, err := s.ExpireEyesTasks(now); err != nil || n != 0 {
-		t.Fatalf("a task settled under the sweep is skipped, not reported: %d (%v)", n, err)
+}
+
+// A local row may share a broker's session id. Resolving the broker's queue
+// to that row would silently empty it: the mail is addressed to the broker's
+// workspace, not the squatter's.
+func TestPendingTaskMailIgnoresALocalRowWithTheSameSessionID(t *testing.T) {
+	s := open(t)
+	now := time.Unix(9200000, 0)
+	s.Now = func() time.Time { return now }
+	name, _ := s.Register("/r", "s-a", "hook")
+	registerBroker(t, s, "host:BOX", "broker-1")
+	// Registered in the same second, in a scope that sorts ahead of host:BOX.
+	if _, err := s.Register("/r", "broker-1", "hook"); err != nil {
+		t.Fatal(err)
 	}
-	if got, _ := s.EyesTask(task.TaskID); got.State != "done" {
-		t.Fatalf("the report wins: %+v", got)
+	requester := protocol.AgentRef{Name: name, AgentID: agentID("s-a"), Scope: "/r"}
+	task, _, err := s.AssignEyesTask(EyesRequest{Requester: requester, Brief: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := s.PendingLaunches("broker-1")
+	if err != nil || len(pending) != 1 || pending[0].TaskID != task.TaskID {
+		t.Fatalf("the broker's own launch queue must answer: %+v (%v)", pending, err)
+	}
+	if _, err := s.CancelEyesTask(task.TaskID, requester); err != nil {
+		t.Fatal(err)
+	}
+	cancels, err := s.PendingCancels("broker-1")
+	if err != nil || len(cancels) != 1 || cancels[0].TaskID != task.TaskID {
+		t.Fatalf("and so must its cancel queue: %+v (%v)", cancels, err)
 	}
 }
 

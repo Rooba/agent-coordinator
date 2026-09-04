@@ -226,20 +226,21 @@ func (s *Store) PendingCancels(launcherSession string) ([]protocol.Message, erro
 	return s.pendingTaskMail(launcherSession, "cancelled", protocol.TaskCancel)
 }
 
-// pendingTaskMail is the redelivery queue both of those read: the daemon's own
-// mail of one body type for this broker's tasks in one state, oldest task
-// first, whether or not the broker already read it. Delivery is at-least-once
+// pendingTaskMail is the redelivery queue behind both: this broker's tasks in
+// one state, with the mail of one body type addressed to it, oldest task
+// first and whether or not it was already read. Redelivery is at-least-once
 // on purpose - a broker that lost a read asks again, and dropping a duplicate
-// by task id is its job. Only that one body type counts, an acked cancel
-// leaves the queue, and one launcher session resolves to one row, so a
-// squatted id cannot fan the queue out.
+// by task id is its job. A task leaves the queue when it changes state, or,
+// for a cancel, when the broker acks it; the launcher lookup takes the same
+// single row every other relay lookup does, so a second row wearing the
+// session id neither doubles the queue nor empties it.
 func (s *Store) pendingTaskMail(launcherSession, state, bodyType string) ([]protocol.Message, error) {
 	rows, err := s.db.Query(`
 		SELECT m.id, COALESCE(a.name, m.from_agent), m.body, m.created_at,
 		       m.reply_to, m.from_scope, m.kind, m.task_id
 		FROM eyes_tasks t
 		JOIN agents l ON l.rowid = (SELECT l2.rowid FROM agents l2
-			WHERE l2.session_id = t.launcher_session ORDER BY l2.registered_at, l2.scope LIMIT 1)
+			WHERE l2.session_id = t.launcher_session `+relayFirstRow+`)
 		JOIN messages m ON m.task_id = t.task_id AND m.scope = l.scope AND m.to_agent = l.agent_id
 			AND m.body LIKE ?
 		LEFT JOIN agents a ON a.scope = COALESCE(NULLIF(m.from_scope, ''), m.scope) AND a.agent_id = m.from_agent
@@ -531,9 +532,9 @@ func (s *Store) ExpireEyesTasks(now time.Time) (int, error) {
 		}
 		_, moved, err := s.moveEyesTask(id, "failed", eyesActor{System: true}, string(body))
 		switch {
-		// Somebody reported between the snapshot and the move - which is
-		// exactly what the deadline was waiting for, so it is not a failure.
-		case errors.Is(err, ErrBadTransition), errors.Is(err, ErrTaskNotLive):
+		// The task settled or was purged between the snapshot and the move -
+		// either way there is nothing left for the deadline to do to it.
+		case errors.Is(err, ErrBadTransition), errors.Is(err, ErrUnknownTask):
 		case err != nil:
 			last = err
 		case moved:
