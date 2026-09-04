@@ -88,6 +88,28 @@ func validRuntime(r string) bool {
 	return true
 }
 
+// providerMatch is the runtime test the pick applies: the named provider, or
+// - for a brief that named none - any provider defaultProvider could choose,
+// so the pick and the default can never disagree about what a provider is.
+func providerMatch(runtime string) (string, []any) {
+	runtimes := []string{runtime}
+	if runtime == "" {
+		runtimes = providerOrder
+	}
+	terms := make([]string, len(runtimes))
+	args := make([]any, len(runtimes))
+	for i, r := range runtimes {
+		terms[i], args[i] = "instr(a.caps, ?) > 0", providerCap(r)
+	}
+	return "(" + strings.Join(terms, " OR ") + ")", args
+}
+
+// taskHoldsBroker is the ledger's "still running" rule: a live task, or a
+// cancelled one the broker has not answered - the provider keeps running
+// until it says it stopped. The pick and the deadline sweep share it, so a
+// task can never reserve a broker nothing will ever release.
+const taskHoldsBroker = `(t.state IN ('queued','accepted') OR (t.state = 'cancelled' AND t.cancel_acked = 0))`
+
 // PickLauncher returns any broker that is still polling and not already
 // running a job. A broker is a relay-registered launcher in a reserved host:
 // scope - a local agent calling itself a launcher is not one.
@@ -103,29 +125,19 @@ func (s *Store) PickLauncher() (LauncherRef, error) {
 func (s *Store) pickLauncher(q execQuerier, runtime string) (LauncherRef, error) {
 	var l LauncherRef
 	var matches, busy bool
-	now := s.Now()
-	// A runtime is served by the capability "provider.<runtime>"; a brief that
-	// named none still needs a broker with some provider, so the needle drops
-	// to the prefix every provider cap shares.
-	needle := `"provider.`
-	if runtime != "" {
-		needle = providerCap(runtime)
-	}
-	// Any live task reserves its broker, and so does a cancelled one it has
-	// not acked - the provider keeps running until the broker says it stopped.
-	// ExpireEyesTasks is what hands a broker back when nobody reports. substr
-	// rather than LIKE keeps host: one case-sensitive rule, the same one
-	// ListWorkspaces hides by.
+	// ExpireEyesTasks is what hands a busy broker back when nobody reports.
+	// substr rather than LIKE keeps host: one case-sensitive rule, the same
+	// one ListWorkspaces hides by.
+	match, args := providerMatch(runtime)
+	args = append(args, browserCap, protocol.KindLauncher, len(hostScopePrefix), hostScopePrefix,
+		s.Now().Add(-launcherWindow).Unix())
 	err := q.QueryRow(`SELECT a.session_id, a.scope, a.name, a.agent_id, a.caps,
-		instr(a.caps, ?) > 0 AND instr(a.caps, ?) > 0 AS matches,
+		`+match+` AND instr(a.caps, ?) > 0 AS matches,
 		EXISTS(SELECT 1 FROM eyes_tasks t WHERE t.launcher_session = a.session_id
-		       AND (t.state IN ('queued','accepted')
-		            OR (t.state = 'cancelled' AND t.cancel_acked = 0))) AS busy
+		       AND `+taskHoldsBroker+`) AS busy
 		FROM agents a WHERE a.kind=? AND a.origin='relay' AND substr(a.scope,1,?)=?
 		AND a.status != 'gone' AND a.last_seen >= ?
-		ORDER BY matches DESC, busy, a.last_seen DESC LIMIT 1`,
-		needle, browserCap, protocol.KindLauncher,
-		len(hostScopePrefix), hostScopePrefix, now.Add(-launcherWindow).Unix()).
+		ORDER BY matches DESC, busy, a.last_seen DESC LIMIT 1`, args...).
 		Scan(&l.SessionID, &l.Scope, &l.Name, &l.AgentID, &l.caps, &matches, &busy)
 	switch {
 	case err == sql.ErrNoRows:
@@ -140,11 +152,32 @@ func (s *Store) pickLauncher(q execQuerier, runtime string) (LauncherRef, error)
 	return l, nil
 }
 
+// bodyMatch is how a task body is recognised in SQL: the type field wherever
+// it sits, so reordering the struct that writes it cannot change what matches.
+func bodyMatch(msgType string) string { return `"type":"` + msgType + `"` }
+
+// taskLedgerBody matches the two bodies the ledger hands out itself. They are
+// never ordinary mail: a broker reading a stale launch after the cancel that
+// called it off would start a provider nobody wants.
+var taskLedgerBody = `(instr(m.body, '` + bodyMatch(protocol.TaskLaunch) + `') > 0
+	OR instr(m.body, '` + bodyMatch(protocol.TaskCancel) + `') > 0)`
+
 // EyesTask is one requested host-eyes job. The ledger exists so cancel
 // authorization and launch idempotency never depend on scanning inboxes.
 type EyesTask struct {
 	TaskID, RequesterScope, RequesterAgentID, LauncherSession, Runtime, State string
 	CreatedAt, UpdatedAt                                                      int64
+	// CancelAcked is set once the broker has reported on a cancelled task.
+	// Until then the task still reserves its broker.
+	CancelAcked bool
+}
+
+// unsettled reports whether the task still holds its broker: live, or
+// cancelled with the broker yet to say it stopped. Such a task can still gain
+// a child, because that child is what sends the report acking the cancel.
+func (t EyesTask) unsettled() bool {
+	return t.State == "queued" || t.State == "accepted" ||
+		(t.State == "cancelled" && !t.CancelAcked)
 }
 
 // EyesRequest is one request_eyes: who is asking (stamped by the daemon from
@@ -157,13 +190,10 @@ type EyesRequest struct {
 }
 
 // AssignEyesTask reserves a launcher, queues the task and delivers
-// task.launch to that launcher in ONE transaction, so two concurrent requests
-// cannot take the same broker and a queued task always has the mail that
-// starts it. The task id is minted here, so there is no id a caller could
-// replay: every accepted call is a new task by construction. A brief that
-// named no runtime gets the broker's first advertised provider, recorded on
-// the task along with its bounded deadline so nothing downstream - the sweep
-// that fails an abandoned task included - has to guess either.
+// task.launch in ONE transaction, so no two requests can take the same broker
+// and a queued task always has the mail that starts it. The id, the chosen
+// runtime and the bounded deadline are all recorded here, so nothing
+// downstream has to guess them.
 func (s *Store) AssignEyesTask(req EyesRequest) (EyesTask, protocol.AgentRef, error) {
 	if !validRuntime(req.Runtime) {
 		return EyesTask{}, protocol.AgentRef{}, fmt.Errorf("%w: %q", ErrBadRuntime, req.Runtime)
@@ -230,13 +260,9 @@ func (s *Store) PendingCancels(launcherSession string) ([]protocol.Message, erro
 }
 
 // pendingTaskMail is the redelivery queue behind both: this broker's tasks in
-// one state, with the mail of one body type addressed to it, oldest task
-// first and whether or not it was already read. Redelivery is at-least-once
-// on purpose - a broker that lost a read asks again, and dropping a duplicate
-// by task id is its job. A task leaves the queue when it changes state, or,
-// for a cancel, when the broker acks it; the launcher lookup takes the same
-// single row every other relay lookup does, so a second row wearing the
-// session id neither doubles the queue nor empties it.
+// one state, with the mail of one body type addressed to it, oldest first.
+// Redelivery is at-least-once on purpose - dropping a duplicate by task id is
+// the broker's own job.
 func (s *Store) pendingTaskMail(launcherSession, state, bodyType string) ([]protocol.Message, error) {
 	rows, err := s.db.Query(`
 		SELECT m.id, COALESCE(a.name, m.from_agent), m.body, m.created_at,
@@ -245,10 +271,10 @@ func (s *Store) pendingTaskMail(launcherSession, state, bodyType string) ([]prot
 		JOIN agents l ON l.rowid = (SELECT l2.rowid FROM agents l2
 			WHERE l2.session_id = t.launcher_session `+relayFirstRow+`)
 		JOIN messages m ON m.task_id = t.task_id AND m.scope = l.scope AND m.to_agent = l.agent_id
-			AND m.body LIKE ?
-		LEFT JOIN agents a ON a.scope = COALESCE(NULLIF(m.from_scope, ''), m.scope) AND a.agent_id = m.from_agent
+			AND instr(m.body, ?) > 0
+		`+senderJoin+`
 		WHERE t.launcher_session = ? AND t.state = ? AND t.cancel_acked = 0
-		ORDER BY t.created_at, m.id`, `{"type":"`+bodyType+`"%`, launcherSession, state)
+		ORDER BY t.created_at, m.id`, bodyMatch(bodyType), launcherSession, state)
 	if err != nil {
 		return nil, err
 	}
@@ -295,9 +321,9 @@ func (s *Store) EyesTask(taskID string) (EyesTask, error) {
 func (s *Store) eyesTask(q execQuerier, taskID string) (EyesTask, error) {
 	var t EyesTask
 	err := q.QueryRow(`SELECT task_id, requester_scope, requester_agent_id, launcher_session,
-		runtime, state, created_at, updated_at FROM eyes_tasks WHERE task_id=?`, taskID).
+		runtime, state, cancel_acked, created_at, updated_at FROM eyes_tasks WHERE task_id=?`, taskID).
 		Scan(&t.TaskID, &t.RequesterScope, &t.RequesterAgentID, &t.LauncherSession,
-			&t.Runtime, &t.State, &t.CreatedAt, &t.UpdatedAt)
+			&t.Runtime, &t.State, &t.CancelAcked, &t.CreatedAt, &t.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return EyesTask{}, ErrUnknownTask
 	}
@@ -329,27 +355,27 @@ var eyesEdges = map[string]map[eyesRole][]string{
 	"cancelled": {roleRequester: {"queued", "accepted"}},
 }
 
-// eyesActor is how a caller proves which side it is: a relay session id (the
-// assigned launcher, or the task's child), a local agent ref (the requester
-// or one of its bound children), or System for the deadline sweep, which
-// speaks for nobody.
-type eyesActor struct {
-	Session string
-	Ref     protocol.AgentRef
-	System  bool
+// EyesActor is the authenticated caller behind one lifecycle move: the row it
+// proved (its workspace and session), the ref that workspace knows it by, and
+// where the request arrived. Origin is the daemon's own stamp and never
+// travels on the wire, so only a relay client can be a broker or its child.
+type EyesActor struct {
+	Scope, SessionID, Origin string
+	Ref                      protocol.AgentRef
+	system                   bool // the deadline sweep, which speaks for nobody
 }
 
 // TransitionEyesTask applies one lifecycle move made by a relay session - the
 // launcher's ack, or the child's report - and mails body to the requester.
-func (s *Store) TransitionEyesTask(taskID, actorSession, to, body string) (EyesTask, bool, error) {
-	return s.moveEyesTask(taskID, to, eyesActor{Session: actorSession}, body)
+func (s *Store) TransitionEyesTask(taskID string, a EyesActor, to, body string) (EyesTask, bool, error) {
+	return s.moveEyesTask(taskID, to, a, body)
 }
 
 // CancelEyesTask is the requester's own move: it settles the task and tells
 // the broker holding it. Cancelling an already cancelled task is a no-op, so
 // a retried cancel_eyes never sends a second task.cancel.
-func (s *Store) CancelEyesTask(taskID string, caller protocol.AgentRef) (EyesTask, error) {
-	t, _, err := s.moveEyesTask(taskID, "cancelled", eyesActor{Ref: caller}, "")
+func (s *Store) CancelEyesTask(taskID string, a EyesActor) (EyesTask, error) {
+	t, _, err := s.moveEyesTask(taskID, "cancelled", a, "")
 	return t, err
 }
 
@@ -357,7 +383,7 @@ func (s *Store) CancelEyesTask(taskID string, caller protocol.AgentRef) (EyesTas
 // role against the edge table, then write the new state and the message that
 // move implies in a single transaction - so a state change never exists
 // without its mail, and a repeat adds neither.
-func (s *Store) moveEyesTask(taskID, to string, a eyesActor, msg string) (EyesTask, bool, error) {
+func (s *Store) moveEyesTask(taskID, to string, a EyesActor, msg string) (EyesTask, bool, error) {
 	edge, ok := eyesEdges[to]
 	if !ok {
 		return EyesTask{}, false, fmt.Errorf("%w: %q is not a task state", ErrBadTransition, to)
@@ -418,44 +444,49 @@ func (s *Store) moveEyesTask(taskID, to string, a eyesActor, msg string) (EyesTa
 }
 
 // eyesRole says which side of this task the actor is, or "" for a caller with
-// no standing in it. An agent id is derived from a session id alone, so the
-// requester's workspace is half of that identity and is checked with it; the
-// launcher and its child exist only over the relay.
-func (s *Store) eyesRole(q execQuerier, t EyesTask, a eyesActor) eyesRole {
+// no standing in it. Every side is decided on the row the caller actually
+// proved - its workspace, its session and the kind that row was registered
+// with - so a session id alone buys nothing: the launcher and its child exist
+// only over the relay, and the requester's side only off the unix socket.
+func (s *Store) eyesRole(q execQuerier, t EyesTask, a EyesActor) eyesRole {
 	switch {
-	case a.System:
+	case a.system:
 		return roleSystem
-	case a.Session == "":
-		if a.Ref.Scope == t.RequesterScope && s.actsFor(q, t.RequesterScope, a.Ref.AgentID, t.RequesterAgentID) {
-			return roleRequester
+	case a.Origin == RelayOrigin && a.SessionID == "eyes-"+t.TaskID && a.Scope == t.RequesterScope:
+		if s.relayKind(q, a.Scope, a.SessionID, protocol.KindEyes) {
+			return roleChild
 		}
-	case !s.relaySpeaker(q, a.Session):
-		return "" // a local row wearing a relay session id is not that session
-	case a.Session == "eyes-"+t.TaskID:
-		return roleChild
-	case a.Session == t.LauncherSession:
-		return roleLauncher
+	case a.Origin == RelayOrigin && a.SessionID == t.LauncherSession:
+		if s.relayKind(q, a.Scope, a.SessionID, protocol.KindLauncher) {
+			return roleLauncher
+		}
+	case a.Origin == "" && a.Ref.Scope == t.RequesterScope &&
+		s.actsFor(q, t.RequesterScope, a.Ref.AgentID, t.RequesterAgentID):
+		return roleRequester
 	}
 	return ""
 }
 
-// relaySpeaker reports whether a session id names a broker or an eyes child
-// that came in over the relay - the only rows that can speak for a task.
-func (s *Store) relaySpeaker(q execQuerier, session string) bool {
-	id, err := s.agentBySession(q, session)
-	return err == nil && id.Origin == "relay" &&
-		(id.Kind == protocol.KindLauncher || id.Kind == protocol.KindEyes)
+// relayKind reports whether the row the caller proved is a relay row of that
+// kind. The lookup is (scope, session) - never a session id searched across
+// workspaces - so nothing registered elsewhere can wear a broker's name.
+func (s *Store) relayKind(q execQuerier, scope, session, kind string) bool {
+	id, err := s.agentAt(q, scope, session)
+	return err == nil && id.Origin == RelayOrigin && id.Kind == kind
 }
 
-// acksCancel reports whether a terminal report on a cancelled task is the
-// answer to its cancel: the child the broker killed, or - when the task never
-// got a child to speak for it - the broker's own failure.
+// acksCancel reports whether a terminal report on a cancelled task answers
+// its cancel: the child the broker killed, the broker's own failure when the
+// task never got a child, or the deadline sweep - which is the only thing
+// left to free a broker that never reported at all.
 func (s *Store) acksCancel(q execQuerier, t EyesTask, role eyesRole, to string) bool {
 	switch role {
 	case roleChild:
 		return to == "done" || to == "failed"
 	case roleLauncher:
-		return to == "failed" && !s.relaySpeaker(q, "eyes-"+t.TaskID)
+		return to == "failed" && !s.relayKind(q, t.RequesterScope, "eyes-"+t.TaskID, protocol.KindEyes)
+	case roleSystem:
+		return to == "failed"
 	}
 	return false
 }
@@ -466,7 +497,7 @@ func (s *Store) acksCancel(q execQuerier, t EyesTask, role eyesRole, to string) 
 // actor sent. It reports false when there is nobody left to tell a cancel, or
 // nobody left to speak an expiry - an agent row is purged hours before its
 // task is, and that must not block a move nobody could have mailed anyway.
-func (s *Store) eyesMail(q execQuerier, t EyesTask, role eyesRole, a eyesActor, msg string) (Delivery, bool, error) {
+func (s *Store) eyesMail(q execQuerier, t EyesTask, role eyesRole, a EyesActor, msg string) (Delivery, bool, error) {
 	if role == roleRequester {
 		l, err := s.agentBySession(q, t.LauncherSession)
 		if errors.Is(err, ErrNoSession) {
@@ -485,12 +516,18 @@ func (s *Store) eyesMail(q execQuerier, t EyesTask, role eyesRole, a eyesActor, 
 		return Delivery{FromScope: t.RequesterScope, FromName: senderKey(ref), ToScope: l.Scope,
 			ToName: l.AgentID, Body: string(cancel), ReplyTo: &ref, TaskID: t.TaskID}, true, nil
 	}
-	actor, err := s.taskVoice(q, t, a.Session)
+	actor, err := s.taskVoice(q, t, a)
+	if err == nil && role == roleSystem {
+		// An agent row is purged hours before its task, so the sweep confirms
+		// the requester is still there before it counts on mailing one.
+		_, _, err = s.resolveAgent(q, t.RequesterScope, t.RequesterAgentID)
+	}
 	if err != nil {
-		// Only an expiry tolerates a missing speaker. An authenticated actor
-		// whose row vanished must fail instead, so no state change can exist
-		// without the mail it implies.
-		if role == roleSystem && errors.Is(err, ErrNoSession) {
+		// Only an expiry tolerates a missing party - it speaks for nobody and
+		// its job is freeing the broker. An authenticated actor whose row
+		// vanished must fail instead, so no state change can exist without
+		// the mail it implies.
+		if role == roleSystem && (errors.Is(err, ErrNoSession) || errors.Is(err, ErrNoAgent)) {
 			return Delivery{}, false, nil
 		}
 		return Delivery{}, false, err
@@ -500,26 +537,29 @@ func (s *Store) eyesMail(q execQuerier, t EyesTask, role eyesRole, a eyesActor, 
 		ToName: t.RequesterAgentID, Body: msg, ReplyTo: &ref, TaskID: t.TaskID}, true, nil
 }
 
-// taskVoice is the identity a report leaves under: the actor's own session,
+// taskVoice is the identity a report leaves under: the row the actor proved,
 // or - when the deadline sweep settles a task with no caller at all - the
-// task's child, falling back to the broker that was holding it.
-func (s *Store) taskVoice(q execQuerier, t EyesTask, session string) (RelayIdentity, error) {
-	if session != "" {
-		return s.agentBySession(q, session)
+// task's child, falling back to the broker that was holding it. Only the
+// ledger's own launcher_session is resolved without a workspace, because the
+// ledger is where that session id came from.
+func (s *Store) taskVoice(q execQuerier, t EyesTask, a EyesActor) (RelayIdentity, error) {
+	if a.SessionID != "" {
+		return s.agentAt(q, a.Scope, a.SessionID)
 	}
-	id, err := s.agentBySession(q, "eyes-"+t.TaskID)
+	id, err := s.agentAt(q, t.RequesterScope, "eyes-"+t.TaskID)
 	if errors.Is(err, ErrNoSession) {
 		return s.agentBySession(q, t.LauncherSession)
 	}
 	return id, err
 }
 
-// ExpireEyesTasks fails every live task whose deadline has passed and tells
-// its requester, so a broker that died mid-job neither strands the requester
-// nor holds its launcher out of service. It goes through the same transition
-// path as any other move, and one task it cannot settle - a report that
-// landed first, a requester already purged - costs the others nothing: the
-// sweep finishes and answers with what it settled plus the last error it hit.
+// ExpireEyesTasks settles every task whose deadline has passed while it still
+// holds a broker, so one that died mid-job neither strands its requester nor
+// keeps a launcher out of service. A live task is failed and its requester
+// told; a cancel nobody answered is simply acked, since the requester already
+// asked for the stop and only the broker was owed anything. One task it
+// cannot settle costs the others nothing: the sweep finishes and answers with
+// what it settled plus the last error it hit.
 func (s *Store) ExpireEyesTasks(now time.Time) (int, error) {
 	ids, err := s.expiredTasks(now)
 	if err != nil {
@@ -534,27 +574,29 @@ func (s *Store) ExpireEyesTasks(now time.Time) (int, error) {
 			last = err
 			continue
 		}
-		_, moved, err := s.moveEyesTask(id, "failed", eyesActor{System: true}, string(body))
+		t, moved, err := s.moveEyesTask(id, "failed", EyesActor{system: true}, string(body))
 		switch {
 		// The task settled or was purged between the snapshot and the move -
 		// either way there is nothing left for the deadline to do to it.
 		case errors.Is(err, ErrBadTransition), errors.Is(err, ErrUnknownTask):
 		case err != nil:
 			last = err
-		case moved:
+		// Failing a live task and acking an abandoned cancel both settle one.
+		case moved, t.State == "cancelled":
 			n++
 		}
 	}
 	return n, last
 }
 
-// expiredTasks names the live tasks past their deadline, oldest first. Its
-// cursor closes before any of them is settled: one connection serves the
-// whole store, so a read still open would block every write.
+// expiredTasks names the tasks past their deadline that still hold a broker,
+// oldest first. Its cursor closes before any of them is settled: one
+// connection serves the whole store, so a read still open would block every
+// write.
 func (s *Store) expiredTasks(now time.Time) ([]string, error) {
-	rows, err := s.db.Query(`SELECT task_id FROM eyes_tasks
-		WHERE state IN ('queued','accepted') AND created_at + deadline_s < ?
-		ORDER BY created_at`, now.Unix())
+	rows, err := s.db.Query(`SELECT t.task_id FROM eyes_tasks t
+		WHERE `+taskHoldsBroker+` AND t.created_at + t.deadline_s < ?
+		ORDER BY t.created_at`, now.Unix())
 	if err != nil {
 		return nil, err
 	}

@@ -418,11 +418,16 @@ func (s *Store) RecordEvent(scope, sessionID string, req protocol.Request) ([]st
 
 const conflictWindow = 30 * time.Minute
 
+// ErrNoAgent: the workspace has no agent by that name or id. It is a sentinel
+// because a purged row is a normal outcome for the deadline sweep, which must
+// settle a task even when nobody is left to tell.
+var ErrNoAgent = errors.New("no agent")
+
 func (s *Store) resolveAgent(q execQuerier, scope, nameOrID string) (aid, name string, err error) {
 	err = q.QueryRow(`SELECT agent_id, name FROM agents WHERE scope=? AND (name=? OR agent_id=?)`,
 		scope, nameOrID, nameOrID).Scan(&aid, &name)
 	if err == sql.ErrNoRows {
-		return "", "", fmt.Errorf("no agent %q in this workspace", nameOrID)
+		return "", "", fmt.Errorf("%w %q in this workspace", ErrNoAgent, nameOrID)
 	}
 	return aid, name, err
 }
@@ -554,7 +559,25 @@ func (s *Store) Broadcast(scope, fromName, body string) error {
 	return s.SendToScope(Delivery{FromScope: scope, FromName: fromName, Body: body})
 }
 
+// senderJoin resolves a message's sender to a name in the SENDER's own
+// workspace, so cross-scope mail still shows a name and mail outlives its
+// sender's row (COALESCE falls back to the raw id). Every inbox read shares
+// it, so none of them can answer with a different name.
+const senderJoin = `LEFT JOIN agents a ON a.scope = COALESCE(NULLIF(m.from_scope, ''), m.scope) AND a.agent_id = m.from_agent`
+
 func (s *Store) Read(scope, name string) ([]protocol.Message, error) {
+	return s.read(scope, name, false)
+}
+
+// ReadBroker is Read for a host broker: a launch or a cancel is consumed like
+// any other mail but handed back only by the redelivery queue, which alone
+// knows whether it is still owed. A stale launch read after the cancel that
+// called it off would start a provider nobody wants.
+func (s *Store) ReadBroker(scope, name string) ([]protocol.Message, error) {
+	return s.read(scope, name, true)
+}
+
+func (s *Store) read(scope, name string, skipLedger bool) ([]protocol.Message, error) {
 	aid, _, err := s.resolveAgent(s.db, scope, name)
 	if err != nil {
 		return nil, err
@@ -567,30 +590,33 @@ func (s *Store) Read(scope, name string) ([]protocol.Message, error) {
 		return nil, err
 	}
 	defer tx.Rollback()
-	// LEFT JOIN on the sender's own scope: mail must stay readable after its
-	// sender is purged (falling back to the raw id) and must still show a
-	// name when the sender lives in another workspace.
 	rows, err := tx.Query(`
 		SELECT m.id, COALESCE(a.name, m.from_agent), m.body, m.created_at, m.to_agent IS NULL,
-		       m.reply_to, m.from_scope, m.kind, m.task_id
+		       m.reply_to, m.from_scope, m.kind, m.task_id, `+taskLedgerBody+`
 		FROM deliveries d
 		JOIN messages m ON m.id = d.message_id
-		LEFT JOIN agents a ON a.scope = COALESCE(NULLIF(m.from_scope, ''), m.scope) AND a.agent_id = m.from_agent
+		`+senderJoin+`
 		WHERE d.agent_id = ? AND m.scope = ? AND d.read_at IS NULL
 		ORDER BY m.created_at, m.id`, aid, scope)
 	if err != nil {
 		return nil, err
 	}
 	var out []protocol.Message
+	var seen []int64 // every row read, including the ledger's own bodies
 	for rows.Next() {
 		var m protocol.Message
 		var replyTo string
+		var ledger bool
 		if err := rows.Scan(&m.ID, &m.From, &m.Body, &m.SentAt, &m.Broadcast,
-			&replyTo, &m.FromScope, &m.Kind, &m.TaskID); err != nil {
+			&replyTo, &m.FromScope, &m.Kind, &m.TaskID, &ledger); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		m.ReplyTo = replyRef(replyTo)
+		seen = append(seen, m.ID)
+		if ledger && skipLedger {
+			continue // the queue hands this one out, if it is still owed
+		}
 		out = append(out, m)
 	}
 	rows.Close() // release the tx's connection before the UPDATEs below
@@ -598,8 +624,8 @@ func (s *Store) Read(scope, name string) ([]protocol.Message, error) {
 		return nil, err
 	}
 	now := s.Now().Unix()
-	for _, m := range out {
-		if _, err := tx.Exec(`UPDATE deliveries SET read_at=? WHERE message_id=? AND agent_id=?`, now, m.ID, aid); err != nil {
+	for _, id := range seen {
+		if _, err := tx.Exec(`UPDATE deliveries SET read_at=? WHERE message_id=? AND agent_id=?`, now, id, aid); err != nil {
 			return nil, err
 		}
 	}
@@ -632,6 +658,16 @@ type PeekInfo struct {
 // agent's high-water mark (max delivered message id, read or unread).
 // Strictly read-only - never touches notice_sent_at or read_at.
 func (s *Store) PeekMail(scope, name string, afterID int64) (PeekInfo, error) {
+	return s.peekMail(scope, name, afterID, false)
+}
+
+// PeekBrokerMail is PeekMail for a host broker: the launch and the cancel are
+// not unread mail to it, because the redelivery queue is what hands those out.
+func (s *Store) PeekBrokerMail(scope, name string, afterID int64) (PeekInfo, error) {
+	return s.peekMail(scope, name, afterID, true)
+}
+
+func (s *Store) peekMail(scope, name string, afterID int64, skipLedger bool) (PeekInfo, error) {
 	aid, _, err := s.resolveAgent(s.db, scope, name)
 	if err != nil {
 		return PeekInfo{}, err
@@ -644,11 +680,15 @@ func (s *Store) PeekMail(scope, name string, afterID int64) (PeekInfo, error) {
 	if err != nil {
 		return PeekInfo{}, err
 	}
+	skip := ""
+	if skipLedger {
+		skip = " AND NOT " + taskLedgerBody
+	}
 	rows, err := s.db.Query(`
 		SELECT m.id, COALESCE(a.name, m.from_agent) FROM deliveries d
 		JOIN messages m ON m.id = d.message_id
-		LEFT JOIN agents a ON a.scope = COALESCE(NULLIF(m.from_scope, ''), m.scope) AND a.agent_id = m.from_agent
-		WHERE d.agent_id = ? AND m.scope = ? AND d.read_at IS NULL AND m.id > ?
+		`+senderJoin+`
+		WHERE d.agent_id = ? AND m.scope = ? AND d.read_at IS NULL AND m.id > ?`+skip+`
 		ORDER BY m.id`, aid, scope, afterID)
 	if err != nil {
 		return PeekInfo{}, err
@@ -700,7 +740,7 @@ func (s *Store) noticesFor(scope, aid string, writes []string) ([]string, error)
 		SELECT m.id, COALESCE(a.name, m.from_agent), m.body, m.to_agent IS NULL
 		FROM deliveries d
 		JOIN messages m ON m.id = d.message_id
-		LEFT JOIN agents a ON a.scope = COALESCE(NULLIF(m.from_scope, ''), m.scope) AND a.agent_id = m.from_agent
+		`+senderJoin+`
 		WHERE d.agent_id = ? AND m.scope = ? AND d.notice_sent_at IS NULL AND d.read_at IS NULL
 		ORDER BY m.created_at, m.id`, aid, scope)
 	if err != nil {

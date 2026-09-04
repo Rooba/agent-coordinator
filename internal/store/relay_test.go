@@ -697,3 +697,60 @@ func TestVerifyRelaySecretIgnoresALocalRowWithTheSameSessionID(t *testing.T) {
 		t.Fatalf("a hook session must stay ErrForeignSession, got %v", err)
 	}
 }
+
+// secretHashOf reads the stored credential hash of a session's row.
+func secretHashOf(t *testing.T, s *Store, session string) string {
+	t.Helper()
+	var hash string
+	if err := s.db.QueryRow(`SELECT relay_secret_hash FROM agents WHERE session_id=?`, session).Scan(&hash); err != nil {
+		t.Fatal(err)
+	}
+	return hash
+}
+
+// A relay row is bound to the secret it was created with, and an empty hash
+// on an existing row is damage, not an invitation: a bare register may never
+// bind a credential to a row it did not create.
+func TestRegisterRelayNeverBindsAnExistingRow(t *testing.T) {
+	s := open(t)
+	registerBroker(t, s, "host:BOX", "broker-1")
+	if _, err := s.db.Exec(`UPDATE agents SET relay_secret_hash='' WHERE session_id='broker-1'`); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.RegisterRelay(RelayRegistration{Scope: "host:BOX", SessionID: "broker-1",
+		Kind: protocol.KindLauncher, Origin: "relay", Platform: "linux",
+		Secret: brokerSecret("intruder"), Capabilities: []string{"browser.chrome"}})
+	if !errors.Is(err, ErrRelayAuth) {
+		t.Fatalf("a tampered relay row must not be claimable, got %v", err)
+	}
+	if h := secretHashOf(t, s, "broker-1"); h != "" {
+		t.Fatalf("a refused register must bind nothing, got %q", h)
+	}
+	if p := count(t, s, `SELECT COUNT(*) FROM agents WHERE session_id='broker-1' AND platform='windows'`); p != 1 {
+		t.Fatal("a refused register must not rewrite the row")
+	}
+}
+
+// A sender in another workspace still has a name here: every inbox read
+// resolves it in the SENDER's scope, so peek, history and read agree.
+func TestCrossScopeSenderResolvesToAName(t *testing.T) {
+	s := open(t)
+	nA, _ := s.Register("/repo-a", "s-a", "hook")
+	nB, _ := s.Register("/repo-b", "s-b", "hook")
+	if err := s.SendToScope(Delivery{FromScope: "/repo-a", FromName: nA, ToScope: "/repo-b",
+		ToName: nB, Body: "hello over there"}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := s.PeekMail("/repo-b", nB, 0)
+	if err != nil || len(info.Froms) != 1 || info.Froms[0] != nA {
+		t.Fatalf("peek must name the foreign sender: %+v (%v)", info, err)
+	}
+	hist, err := s.MessageHistory("/repo-b", nB, "", 0)
+	if err != nil || len(hist) != 1 || hist[0].From != nA || hist[0].To != nB {
+		t.Fatalf("history must name the foreign sender: %+v (%v)", hist, err)
+	}
+	msgs, err := s.Read("/repo-b", nB)
+	if err != nil || len(msgs) != 1 || msgs[0].From != nA {
+		t.Fatalf("read must name the foreign sender: %+v (%v)", msgs, err)
+	}
+}

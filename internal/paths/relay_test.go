@@ -211,7 +211,7 @@ func TestRelayTokenRejectsLooseFileMode(t *testing.T) {
 	if err == nil {
 		t.Fatalf("a world-readable token file must be refused, got %q", got)
 	}
-	if !strings.Contains(err.Error(), "0600") {
+	if !strings.Contains(err.Error(), "must not be readable by group or other") {
 		t.Fatalf("the error must say what is wrong: %v", err)
 	}
 	if err := os.Chmod(path, 0o604); err != nil {

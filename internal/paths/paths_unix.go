@@ -45,7 +45,7 @@ func checkTokenPerm(path string) error {
 		return err
 	}
 	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
-		return fmt.Errorf("relay token file %s has mode %04o, want 0600: chmod 600 it or delete it", path, perm)
+		return fmt.Errorf("relay token file %s has mode %04o: it must not be readable by group or other - chmod 600 it or delete it", path, perm)
 	}
 	return nil
 }

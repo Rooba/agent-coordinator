@@ -19,6 +19,11 @@ import (
 // handed a brief.
 const hostScopePrefix = "host:"
 
+// RelayOrigin marks a row created over the relay, and the provenance the
+// daemon stamps on a request that arrived there. It is the daemon's word
+// rather than the client's: a caller off the unix socket has none.
+const RelayOrigin = "relay"
+
 var (
 	// ErrNoSession: no agent row exists for that session id at all.
 	ErrNoSession = errors.New("no session")
@@ -104,8 +109,9 @@ func (s *Store) RegisterRelay(r RelayRegistration) (RelayResult, error) {
 	// Read the prior row inside the tx: with the checks and the write in one
 	// transaction, two racing registrations cannot both create this session.
 	prior, err := s.agentBySession(tx, r.SessionID)
+	fresh := errors.Is(err, ErrNoSession)
 	switch {
-	case errors.Is(err, ErrNoSession):
+	case fresh:
 		if r.Origin == "relay" && !validSecret(r.Secret) {
 			return RelayResult{}, ErrRelayAuth
 		}
@@ -113,7 +119,10 @@ func (s *Store) RegisterRelay(r RelayRegistration) (RelayResult, error) {
 		return RelayResult{}, err
 	case prior.Scope != r.Scope, prior.Origin != r.Origin, prior.Kind != "" && prior.Kind != r.Kind:
 		return RelayResult{}, ErrForeignSession
-	case prior.secretHash != "": // an existing relay row is re-claimed only by its holder
+	// An existing relay row is re-claimed only by its holder, and a hash that
+	// is somehow empty is damage rather than an invitation: the compare fails
+	// and the row stays unclaimable.
+	case prior.Origin == "relay":
 		if subtle.ConstantTimeCompare([]byte(sha256Hex(r.Secret)), []byte(prior.secretHash)) != 1 {
 			return RelayResult{}, ErrRelayAuth
 		}
@@ -126,8 +135,10 @@ func (s *Store) RegisterRelay(r RelayRegistration) (RelayResult, error) {
 	if err != nil {
 		return RelayResult{}, err
 	}
+	// Only a brand new row is bound to a secret; an existing one keeps the
+	// hash it was created with, so no register can rebind an identity.
 	hash := prior.secretHash
-	if hash == "" && r.Origin == "relay" {
+	if fresh && r.Origin == "relay" {
 		hash = sha256Hex(r.Secret)
 	}
 	source := "join"
@@ -149,12 +160,13 @@ func (s *Store) RegisterRelay(r RelayRegistration) (RelayResult, error) {
 	return RelayResult{Name: name}, nil
 }
 
-// ReissueEyesChild re-mints the child session of a live task on its assigned
-// launcher's authority: session "eyes-<task_id>" in the task's requester
-// scope, with a fresh secret that replaces any earlier one. Without it a lost
-// register response strands the task - only the child may report, and only
-// the launcher knows its secret. The launcher proves itself here, in the same
-// transaction that mints the credential, so no gate check can go stale
+// ReissueEyesChild re-mints the child session of an unsettled task on its
+// assigned launcher's authority: session "eyes-<task_id>" in the task's
+// requester scope, with a fresh secret that replaces any earlier one. Without
+// it a lost register response strands the task - only the child may report,
+// and only the launcher knows its secret - and a restarted broker could never
+// ack a cancel it is still holding. The launcher proves itself here, in the
+// same transaction that mints the credential, so no gate check can go stale
 // between the two.
 func (s *Store) ReissueEyesChild(taskID, launcherSession, launcherSecret string) (RelayResult, error) {
 	tx, err := s.db.Begin()
@@ -169,7 +181,7 @@ func (s *Store) ReissueEyesChild(taskID, launcherSession, launcherSecret string)
 	if t.LauncherSession != launcherSession {
 		return RelayResult{}, ErrNotYourTask
 	}
-	if t.State != "queued" && t.State != "accepted" {
+	if !t.unsettled() {
 		return RelayResult{}, ErrTaskNotLive
 	}
 	launcher, err := s.agentBySession(tx, launcherSession)
@@ -228,6 +240,19 @@ type RelayIdentity struct {
 // are unqualified, which resolves to the agents table in any single-table
 // scope it is dropped into.
 const relayFirstRow = `ORDER BY origin='relay' DESC, registered_at, scope LIMIT 1`
+
+// agentAt reads the row a caller proved: the workspace and session id
+// together, which is the only pairing an authenticated lookup may use.
+func (s *Store) agentAt(q execQuerier, scope, sessionID string) (RelayIdentity, error) {
+	var id RelayIdentity
+	err := q.QueryRow(`SELECT scope, name, agent_id, kind, origin, relay_secret_hash FROM agents
+		WHERE scope=? AND session_id=?`, scope, sessionID).
+		Scan(&id.Scope, &id.Name, &id.AgentID, &id.Kind, &id.Origin, &id.secretHash)
+	if err == sql.ErrNoRows {
+		return RelayIdentity{}, ErrNoSession
+	}
+	return id, err
+}
 
 // agentBySession finds a row by session id across scopes - the relay's one
 // non-scoped identity read, because the gate must authenticate a caller
