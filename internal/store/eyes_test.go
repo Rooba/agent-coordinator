@@ -444,9 +444,17 @@ func TestCancelEyesTaskIsATransition(t *testing.T) {
 	if n := count(t, s, `SELECT COUNT(*) FROM messages WHERE task_id=?`, task.TaskID); n != 2 {
 		t.Fatalf("a repeat must not send a second cancel, got %d task messages", n)
 	}
-	// A cancelled task no longer reserves its broker.
+	// A cancelled task still reserves its broker: the provider keeps running
+	// until the broker reports that it stopped, and that ack is what frees it.
+	if _, err := s.PickLauncher(); !errors.Is(err, ErrEyesBusy) {
+		t.Fatalf("an unacked cancel still holds the launcher, got %v", err)
+	}
+	if _, ok, err := s.TransitionEyesTask(task.TaskID, "eyes-"+task.TaskID, "failed",
+		`{"type":"task.failed","task_id":"`+task.TaskID+`","error":"cancelled"}`); err != nil || ok {
+		t.Fatalf("the child's ack: ok=%v (%v)", ok, err)
+	}
 	if l, err := s.PickLauncher(); err != nil || l.SessionID != "broker-1" {
-		t.Fatalf("cancel frees the launcher: %+v (%v)", l, err)
+		t.Fatalf("the ack frees the launcher: %+v (%v)", l, err)
 	}
 
 	s2 := open(t)
@@ -1085,5 +1093,14 @@ func TestTransitionEyesTaskRefusesALocalActor(t *testing.T) {
 	}
 	if got, _ := s.EyesTask(task.TaskID); got.State != "accepted" {
 		t.Fatalf("a refused report must leave the task alone: %+v", got)
+	}
+	// Nor does a relay row of some other kind speak for the task.
+	s2 := open(t)
+	_, _, task2, _ := liveTask(t, s2)
+	if _, err := s2.db.Exec(`UPDATE agents SET kind='' WHERE session_id=?`, "eyes-"+task2.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s2.TransitionEyesTask(task2.TaskID, "eyes-"+task2.TaskID, "failed", "{}"); !errors.Is(err, ErrNotYourTask) {
+		t.Fatalf("a relay row that is neither launcher nor eyes must not report, got %v", err)
 	}
 }

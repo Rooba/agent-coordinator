@@ -111,13 +111,16 @@ func (s *Store) pickLauncher(q execQuerier, runtime string) (LauncherRef, error)
 	if runtime != "" {
 		needle = providerCap(runtime)
 	}
-	// Any live task reserves its broker; ExpireEyesTasks is what hands one
-	// back when nobody reports. substr rather than LIKE keeps host: one
-	// case-sensitive rule, the same one ListWorkspaces hides by.
+	// Any live task reserves its broker, and so does a cancelled one it has
+	// not acked - the provider keeps running until the broker says it stopped.
+	// ExpireEyesTasks is what hands a broker back when nobody reports. substr
+	// rather than LIKE keeps host: one case-sensitive rule, the same one
+	// ListWorkspaces hides by.
 	err := q.QueryRow(`SELECT a.session_id, a.scope, a.name, a.agent_id, a.caps,
 		instr(a.caps, ?) > 0 AND instr(a.caps, ?) > 0 AS matches,
 		EXISTS(SELECT 1 FROM eyes_tasks t WHERE t.launcher_session = a.session_id
-		       AND t.state IN ('queued','accepted')) AS busy
+		       AND (t.state IN ('queued','accepted')
+		            OR (t.state = 'cancelled' AND t.cancel_acked = 0))) AS busy
 		FROM agents a WHERE a.kind=? AND a.origin='relay' AND substr(a.scope,1,?)=?
 		AND a.status != 'gone' AND a.last_seen >= ?
 		ORDER BY matches DESC, busy, a.last_seen DESC LIMIT 1`,
@@ -436,11 +439,12 @@ func (s *Store) eyesRole(q execQuerier, t EyesTask, a eyesActor) eyesRole {
 	return ""
 }
 
-// relaySpeaker reports whether a session id names a row created over the
-// relay - the only kind that can speak for a task's launcher or its child.
+// relaySpeaker reports whether a session id names a broker or an eyes child
+// that came in over the relay - the only rows that can speak for a task.
 func (s *Store) relaySpeaker(q execQuerier, session string) bool {
 	id, err := s.agentBySession(q, session)
-	return err == nil && id.Origin == "relay"
+	return err == nil && id.Origin == "relay" &&
+		(id.Kind == protocol.KindLauncher || id.Kind == protocol.KindEyes)
 }
 
 // acksCancel reports whether a terminal report on a cancelled task is the
