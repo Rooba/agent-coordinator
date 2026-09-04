@@ -405,9 +405,9 @@ func (s *Store) eyesRole(q execQuerier, t EyesTask, a eyesActor) eyesRole {
 // eyesMail addresses the message a move implies: a cancel goes to the broker
 // holding the job and carries its own task.cancel body, while an ack, a
 // report or a deadline failure goes back to the requester carrying what the
-// actor sent. It reports false when there is nobody left to speak or to tell
-// - an agent row is purged hours before its task is, and that must not block
-// the move.
+// actor sent. It reports false when there is nobody left to tell a cancel, or
+// nobody left to speak an expiry - an agent row is purged hours before its
+// task is, and that must not block a move nobody could have mailed anyway.
 func (s *Store) eyesMail(q execQuerier, t EyesTask, role eyesRole, a eyesActor, msg string) (Delivery, bool, error) {
 	if role == roleRequester {
 		l, err := s.agentBySession(q, t.LauncherSession)
@@ -428,10 +428,13 @@ func (s *Store) eyesMail(q execQuerier, t EyesTask, role eyesRole, a eyesActor, 
 			ToName: l.AgentID, Body: string(cancel), ReplyTo: &ref, TaskID: t.TaskID}, true, nil
 	}
 	actor, err := s.taskVoice(q, t, a.Session)
-	if errors.Is(err, ErrNoSession) {
-		return Delivery{}, false, nil // nobody is left to speak for the task
-	}
 	if err != nil {
+		// Only an expiry tolerates a missing speaker. An authenticated actor
+		// whose row vanished must fail instead, so no state change can exist
+		// without the mail it implies.
+		if role == roleSystem && errors.Is(err, ErrNoSession) {
+			return Delivery{}, false, nil
+		}
 		return Delivery{}, false, err
 	}
 	ref := protocol.AgentRef{Name: actor.Name, AgentID: actor.AgentID, Scope: actor.Scope}
@@ -455,30 +458,33 @@ func (s *Store) taskVoice(q execQuerier, t EyesTask, session string) (RelayIdent
 
 // ExpireEyesTasks fails every live task whose deadline has passed and tells
 // its requester, so a broker that died mid-job neither strands the requester
-// nor holds its launcher out of service. It returns how many it settled, and
-// goes through the same transition path as any other move, so an expiry is a
-// state change with its mail and nothing else.
+// nor holds its launcher out of service. It goes through the same transition
+// path as any other move, and one task it cannot settle - a report that
+// landed first, a requester already purged - costs the others nothing: the
+// sweep finishes and answers with what it settled plus the last error it hit.
 func (s *Store) ExpireEyesTasks(now time.Time) (int, error) {
 	ids, err := s.expiredTasks(now)
 	if err != nil {
 		return 0, err
 	}
 	n := 0
+	var last error
 	for _, id := range ids {
 		body, err := json.Marshal(protocol.TaskFailedMsg{Type: protocol.TaskFailed,
 			TaskID: id, Error: "deadline exceeded"})
 		if err != nil {
-			return n, err
+			last = err
+			continue
 		}
 		_, moved, err := s.moveEyesTask(id, "failed", eyesActor{System: true}, string(body))
-		if err != nil {
-			return n, err
-		}
-		if moved {
+		switch {
+		case err != nil:
+			last = err
+		case moved:
 			n++
 		}
 	}
-	return n, nil
+	return n, last
 }
 
 // expiredTasks names the live tasks past their deadline, oldest first. Its

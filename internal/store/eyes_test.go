@@ -724,6 +724,98 @@ func TestExpireEyesTasks(t *testing.T) {
 	}
 }
 
+// One task the sweep cannot settle - a report that landed first, a requester
+// already purged - must not cost the others their deadline, nor cost
+// Housekeep its purges.
+func TestExpireEyesTasksSkipsWhatItCannotSettle(t *testing.T) {
+	s := open(t)
+	now := time.Unix(7300000, 0)
+	s.Now = func() time.Time { return now }
+	stranded, _ := s.Register("/r", "s-a", "hook")
+	heard, _ := s.Register("/r", "s-b", "hook")
+	registerBroker(t, s, "host:BOX", "broker-1")
+	registerBroker(t, s, "host:BOX", "broker-2")
+	first, _, err := s.AssignEyesTask(EyesRequest{
+		Requester: protocol.AgentRef{Name: stranded, AgentID: agentID("s-a"), Scope: "/r"}, Brief: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := s.AssignEyesTask(EyesRequest{
+		Requester: protocol.AgentRef{Name: heard, AgentID: agentID("s-b"), Scope: "/r"}, Brief: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first task has nobody to report to any more, so its move fails.
+	if _, err := s.db.Exec(`DELETE FROM agents WHERE session_id='s-a'`); err != nil {
+		t.Fatal(err)
+	}
+	// A row old enough for Housekeep to purge, to prove the sweep runs anyway.
+	if _, err := s.db.Exec(`INSERT INTO agents (scope, session_id, agent_id, name, status, registered_at, last_seen, source)
+		VALUES ('/r','ghost','aid-ghost','ghost-agent','active',?,?,'hook')`,
+		now.Unix()-3*3600, now.Unix()-3*3600); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(301 * time.Second)
+
+	n, err := s.ExpireEyesTasks(now)
+	if n != 1 || err == nil {
+		t.Fatalf("the sweep must settle the rest and report the failure: %d (%v)", n, err)
+	}
+	if got, _ := s.EyesTask(second.TaskID); got.State != "failed" {
+		t.Fatalf("the settleable task must expire: %+v", got)
+	}
+	if got, _ := s.EyesTask(first.TaskID); got.State != "queued" {
+		t.Fatalf("the unsettleable task must be left alone: %+v", got)
+	}
+	if err := s.Housekeep(); err == nil {
+		t.Fatal("Housekeep must report what the sweep hit")
+	}
+	if n := count(t, s, `SELECT COUNT(*) FROM agents WHERE session_id='ghost'`); n != 0 {
+		t.Fatalf("Housekeep must purge whatever the sweep hit, %d stale rows left", n)
+	}
+}
+
+// An expiry speaks for nobody, so a task whose child and broker rows are both
+// gone still settles - there is simply no voice left to report it.
+func TestExpireEyesTasksWithNoVoiceLeft(t *testing.T) {
+	s := open(t)
+	now := time.Unix(7400000, 0)
+	s.Now = func() time.Time { return now }
+	requester, _, task, _ := liveTask(t, s)
+	if _, err := s.db.Exec(`DELETE FROM agents WHERE session_id IN ('broker-1',?)`, "eyes-"+task.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(301 * time.Second)
+	if n, err := s.ExpireEyesTasks(now); err != nil || n != 1 {
+		t.Fatalf("the task must still settle: %d (%v)", n, err)
+	}
+	if got, _ := s.EyesTask(task.TaskID); got.State != "failed" {
+		t.Fatalf("expired task: %+v", got)
+	}
+	if n, _ := s.UnreadCount("/r", requester.Name); n != 0 {
+		t.Fatalf("there is nobody left to speak, unread=%d", n)
+	}
+}
+
+// A relay actor speaks for itself: with its row gone the move fails outright,
+// so a state change never exists without the mail it implies.
+func TestTransitionEyesTaskNeedsTheActorsRow(t *testing.T) {
+	s := open(t)
+	requester, _, task, _ := liveTask(t, s)
+	if _, err := s.db.Exec(`DELETE FROM agents WHERE session_id='broker-1'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := s.TransitionEyesTask(task.TaskID, "broker-1", "accepted", "{}"); ok || !errors.Is(err, ErrNoSession) {
+		t.Fatalf("a purged launcher must not settle a move: ok=%v (%v)", ok, err)
+	}
+	if got, _ := s.EyesTask(task.TaskID); got.State != "queued" {
+		t.Fatalf("the task must be untouched: %+v", got)
+	}
+	if n, _ := s.UnreadCount("/r", requester.Name); n != 0 {
+		t.Fatalf("a refused move must send nothing, unread=%d", n)
+	}
+}
+
 // The bound the requester asked for is the one the sweep enforces, so the
 // deadline is stored on the task, and Housekeep is what runs the sweep.
 func TestExpireEyesTasksUsesTheStoredDeadline(t *testing.T) {

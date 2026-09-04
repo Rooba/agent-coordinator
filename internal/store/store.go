@@ -821,10 +821,9 @@ func (s *Store) Housekeep() error {
 	now := s.Now()
 	// Fail what ran out of time before anything is purged: a deadline is at
 	// most 30 minutes, well inside the two hours an agent row survives, so
-	// the requester is still there to be told.
-	if _, err := s.ExpireEyesTasks(now); err != nil {
-		return err
-	}
+	// the requester is still there to be told. A task the sweep could not
+	// settle is reported at the end, never by skipping the purges below.
+	_, expiry := s.ExpireEyesTasks(now)
 	day := int64(86400)
 	stmts := []struct {
 		q   string
@@ -861,7 +860,7 @@ func (s *Store) Housekeep() error {
 			return err
 		}
 	}
-	return nil
+	return expiry
 }
 
 func (s *Store) freshStatus(explicit string, lastSeen int64) string {
