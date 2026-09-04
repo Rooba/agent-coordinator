@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -521,6 +522,96 @@ func TestBrokerRejectsForgedOuterTaskMetadata(t *testing.T) {
 			}
 			if len(journal.Records()) != 0 {
 				t.Fatal("forged task was journaled")
+			}
+		})
+	}
+}
+
+func TestBrokerUnknownCancelDurablyAcknowledgesAsLauncher(t *testing.T) {
+	launch := launchMessage("task-000000000009")
+	message := cancelEnvelope(t, launch)
+	journal, runner := newMemoryJournal(), &fakeRunner{}
+	store := &memoryCredentials{value: Credential{Token: testToken, LauncherSession: "launcher-fixed", SessionSecret: testLauncherSecret}}
+	var sends []protocol.Request
+	relay := relayFunc(func(_ context.Context, session Session, request protocol.Request) (protocol.Response, error) {
+		if request.Op != protocol.OpSendWorkspace {
+			return protocol.Response{OK: true}, nil
+		}
+		if session.ID != "launcher-fixed" || session.Secret != testLauncherSecret {
+			t.Fatalf("cancel acknowledgement identity = %+v", session)
+		}
+		sends = append(sends, request)
+		if record, ok := journal.Get(launch.TaskID); !ok || record.State != recordTerminal {
+			t.Fatalf("cancel was not durable before send: %+v, %v", record, ok)
+		}
+		if len(sends) == 1 {
+			return protocol.Response{}, errors.New("ack response lost")
+		}
+		return protocol.Response{OK: true}, nil
+	})
+	broker, err := New(relay, store, journal, runner, func(context.Context) ([]string, error) { return nil, nil }, testOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.refreshCredential(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.handleMessage(context.Background(), message); err != nil {
+		t.Fatal(err)
+	}
+	if len(sends) != 2 || !reflect.DeepEqual(sends[0], sends[1]) {
+		t.Fatalf("cancel acknowledgement retries = %+v", sends)
+	}
+	var failure protocol.TaskFailedMsg
+	if err := json.Unmarshal([]byte(sends[0].Body), &failure); err != nil || failure.Type != protocol.TaskFailed ||
+		failure.TaskID != launch.TaskID || failure.Error != "cancelled" || sends[0].TaskID != launch.TaskID ||
+		sends[0].Target == nil || !reflect.DeepEqual(*sends[0].Target, launch.ReplyTo) {
+		t.Fatalf("cancel acknowledgement = %+v / %v", sends[0], err)
+	}
+	record, ok := journal.Get(launch.TaskID)
+	if !ok || record.State != recordDelivered || len(record.Terminal) != 0 || record.Launch.Brief != "" {
+		t.Fatalf("acknowledged cancel tombstone = %+v, %v", record, ok)
+	}
+	if len(runner.runs) != 0 || len(runner.cancels) != 0 {
+		t.Fatalf("unknown cancel touched runner: runs=%+v cancels=%+v", runner.runs, runner.cancels)
+	}
+}
+
+func TestBrokerIgnoresUntrustedUnknownCancel(t *testing.T) {
+	launch := launchMessage("task-00000000000a")
+	for _, test := range []struct {
+		name   string
+		mutate func(*protocol.Message)
+	}{
+		{name: "unknown field", mutate: func(message *protocol.Message) {
+			message.Body = strings.TrimSuffix(message.Body, "}") + `,"extra":true}`
+		}},
+		{name: "outer task id", mutate: func(message *protocol.Message) { message.TaskID = "task-00000000000b" }},
+		{name: "invalid task id", mutate: func(message *protocol.Message) {
+			message.TaskID = "not-a-task"
+			message.Body = messageBody(t, protocol.TaskCancelMsg{Type: protocol.TaskCancel, TaskID: message.TaskID})
+		}},
+		{name: "missing scope", mutate: func(message *protocol.Message) { message.FromScope = "" }},
+		{name: "missing reply", mutate: func(message *protocol.Message) { message.ReplyTo = nil }},
+		{name: "foreign reply", mutate: func(message *protocol.Message) { message.ReplyTo.Scope = "/forged" }},
+		{name: "empty reply", mutate: func(message *protocol.Message) { message.ReplyTo.Name, message.ReplyTo.AgentID = "", "" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			message := cancelEnvelope(t, launch)
+			test.mutate(&message)
+			journal, sends := newMemoryJournal(), 0
+			broker, err := New(relayFunc(func(context.Context, Session, protocol.Request) (protocol.Response, error) {
+				sends++
+				return protocol.Response{OK: true}, nil
+			}), &memoryCredentials{}, journal, &fakeRunner{}, func(context.Context) ([]string, error) { return nil, nil }, testOptions())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := broker.handleMessage(context.Background(), message); err != nil {
+				t.Fatal(err)
+			}
+			if sends != 0 || len(journal.Records()) != 0 {
+				t.Fatalf("untrusted cancel was handled: sends=%d records=%+v", sends, journal.Records())
 			}
 		})
 	}

@@ -202,13 +202,40 @@ func (b *Broker) handleMessage(ctx context.Context, message protocol.Message) er
 		}
 	case protocol.TaskCancel:
 		var cancel protocol.TaskCancelMsg
-		record, exists := b.journal.Get(message.TaskID)
-		if decodeStrict(body, &cancel) == nil && exists && cancel.Type == protocol.TaskCancel && cancel.TaskID == message.TaskID &&
-			message.FromScope == record.Launch.Scope && message.ReplyTo != nil && reflect.DeepEqual(*message.ReplyTo, record.Launch.ReplyTo) {
-			b.cancel(message.TaskID)
+		if decodeStrict(body, &cancel) != nil || !validCancelEnvelope(message, cancel) {
+			return nil
 		}
+		record, exists := b.journal.Get(message.TaskID)
+		if exists {
+			if message.FromScope == record.Launch.Scope && reflect.DeepEqual(*message.ReplyTo, record.Launch.ReplyTo) {
+				b.cancel(message.TaskID)
+			}
+			return nil
+		}
+		// A cancel may be the first frame received when the launch response was
+		// lost. A durable launcher failure acknowledges it without creating or
+		// running a child; the daemon proves this launcher owns the task.
+		record = TaskRecord{Launch: protocol.TaskLaunchMsg{Type: protocol.TaskLaunch, TaskID: cancel.TaskID,
+			Scope: message.FromScope, ReplyTo: *message.ReplyTo}, State: recordTerminal,
+			Terminal: failedBody(cancel.TaskID, "cancelled")}
+		return b.superviseTerminal(ctx, record)
 	}
 	return nil
+}
+
+func validCancelEnvelope(message protocol.Message, cancel protocol.TaskCancelMsg) bool {
+	if cancel.Type != protocol.TaskCancel || cancel.TaskID != message.TaskID || message.FromScope == "" ||
+		message.ReplyTo == nil || message.ReplyTo.Scope != message.FromScope ||
+		(message.ReplyTo.AgentID == "" && message.ReplyTo.Name == "") || len(cancel.TaskID) != hostrunner.MaxTaskIDBytes ||
+		!strings.HasPrefix(cancel.TaskID, "task-") {
+		return false
+	}
+	for _, c := range cancel.TaskID[len("task-"):] {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func (b *Broker) handleLaunch(ctx context.Context, launch protocol.TaskLaunchMsg) error {
