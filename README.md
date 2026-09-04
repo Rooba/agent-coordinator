@@ -47,6 +47,22 @@ it. Do not grep the filesystem for it.
 - `peek_messages(from?)` - non-destructive unread preview.
 - `broadcast(body, from?)` - one-shot to agents registered **now**; late joiners miss it.
 
+## Cross-workspace relay and Windows eyes
+
+- `list_workspaces` - discover scopes with live agents before addressing another workspace.
+- `list_eyes` - list connected host launchers and active eyes tasks across workspaces.
+- `relay(body, target, from?)` - send across scopes. Prefer the structured
+  `target={scope, agent_id, name}` returned in `reply_to`; `agent_id` wins over `name`.
+- `request_eyes(brief, runtime="claude", timeout=300, from?)` - ask the optional Windows host
+  broker to inspect Chrome. It returns a `task_id`; acceptance and the final structured report arrive
+  as ordinary mail in the authenticated requester's inbox. Arm `wait` while it runs.
+- `cancel_eyes(task_id, from?)` - cancel your own live eyes task. Keep the `task_id` from the request.
+
+The Windows bridge is optional and must already be paired and running; an empty `list_eyes` means no
+host broker is available. Eyes tasks are one-shot reports, not interactive browser sessions. The v1
+host broker advertises Claude only, so request `runtime="claude"` (or omit it). Setup and security
+details are in the agent-coordinator README under "Optional Windows host Chrome eyes bridge."
+
 ## Wake pattern (be woken, do not busy-poll)
 
 Arm a background task: `agent-coordinator wait '<yourname>' -timeout <sec>` (default 570s). It
@@ -170,6 +186,184 @@ behind; delete it by hand for a clean slate.
 Codex requires new or changed non-managed hooks to be reviewed and trusted with
 `/hooks` before they execute.
 
+## Optional Windows host Chrome eyes bridge
+
+The eyes bridge lets an agent running under WSL hand one browser-observation brief to Claude on the
+Windows desktop. The WSL daemon adds an opt-in, authenticated TCP listener; a per-user Windows broker
+polls it, runs the provider in the interactive desktop session, validates one structured report, and
+delivers that report to the WSL requester. Normal same-workspace coordination does not require this
+bridge.
+
+### 1. Enable the relay in WSL
+
+The relay is off by default. It accepts only a numeric loopback listener; the production default is
+`127.0.0.1:7400`. If `agent-coordinator install` created the systemd user units, add a service drop-in:
+
+```ini
+# systemctl --user edit agent-coordinator.service
+[Service]
+Environment=AC_RELAY_LISTEN=127.0.0.1:7400
+```
+
+Then reload and restart it:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user restart agent-coordinator.service
+systemctl --user status agent-coordinator.service
+```
+
+Without systemd, run the daemon in a dedicated WSL terminal:
+
+```sh
+AC_RELAY_LISTEN=127.0.0.1:7400 agent-coordinator daemon
+```
+
+Only one daemon may own the Unix socket. Stop `agent-coordinator.service` and
+`agent-coordinator.socket` before using the foreground command if the systemd units are active; if a
+client-spawned daemon is already running, let it exit or stop it first.
+
+The daemon creates the relay token only after the TCP listener binds successfully. Its default path is:
+
+```text
+~/.local/state/agent-coordinator/relay.token
+```
+
+`XDG_STATE_HOME` changes the base directory. If `AC_DB` selects a custom database, `relay.token` is
+placed beside that database. The file must remain a regular `0600` file containing the generated
+64-character lowercase hexadecimal token. Check its existence and mode, but do not `cat` it, paste it
+into a command line, or put it in logs.
+
+### 2. Build and copy the Windows binary
+
+From this repository in WSL:
+
+```sh
+make build-windows
+mkdir -p /mnt/c/Users/<WindowsUser>/AppData/Local/agent-coordinator
+cp agent-coordinator.exe /mnt/c/Users/<WindowsUser>/AppData/Local/agent-coordinator/
+```
+
+Run all `host` commands from Windows PowerShell as the same Windows user who will run Claude:
+
+```powershell
+$ac = "$env:LOCALAPPDATA\agent-coordinator\agent-coordinator.exe"
+```
+
+### 3. Pair and verify Claude in Chrome
+
+Pair directly from the protected WSL file so the token is not printed or placed in argv:
+
+```powershell
+$tokenFile = "\\wsl.localhost\<Distro>\home\<WSLUser>\.local\state\agent-coordinator\relay.token"
+& $ac host pair --file $tokenFile
+Test-NetConnection 127.0.0.1 -Port 7400
+```
+
+Older WSL installations may expose the same path under `\\wsl$\<Distro>\...`. Re-run `host pair`
+after intentionally rotating the WSL token; pairing preserves the broker's stable launcher identity.
+
+Choose an existing absolute Claude executable, working directory, and dedicated Claude config
+directory. The config directory must be outside the working directory. Using that same executable and
+config directory, manually run a harmless Claude `--chrome` smoke test and confirm it can inspect the
+intended Chrome profile. `--claude-chrome-ready` is only your assertion that this manual test passed;
+the coordinator does not probe Chrome during installation.
+
+### 4. Install or run the broker
+
+Pairing is required before installation. In PowerShell:
+
+```powershell
+$claudeExe = "C:\absolute\path\to\claude.exe"
+$workDir = "C:\absolute\path\to\eyes-workdir"
+$configDir = "$env:LOCALAPPDATA\agent-coordinator\claude-config"
+New-Item -ItemType Directory -Force $workDir, $configDir | Out-Null
+
+& $ac host install `
+  --addr 127.0.0.1:7400 `
+  --claude-exe $claudeExe `
+  --claude-workdir $workDir `
+  --claude-config-dir $configDir `
+  --claude-chrome-ready
+```
+
+All three paths must already exist, and the executable must be a regular file. `host install` saves
+the protected configuration, creates a least-privilege per-user Task Scheduler entry with an
+interactive logon token, and starts it immediately. It starts again when that user logs on. Append
+`--dry-run` to validate the inputs and print the scheduler plan without saving configuration or
+changing Task Scheduler.
+
+For foreground debugging, first persist a valid configuration with `host install`, then stop the
+scheduled copy so the single-instance lock is free:
+
+```powershell
+& $ac host uninstall
+& $ac host run
+```
+
+`host run` accepts temporary `--addr`, `--claude-exe`, `--claude-workdir`,
+`--claude-config-dir`, and `--claude-chrome-ready` overrides, but does not save them. Press Ctrl+C to
+stop it. Re-run `host install` with the full configuration to restore logon startup.
+
+To inspect or remove the scheduled task:
+
+```powershell
+& $ac host uninstall --dry-run
+& $ac host uninstall
+```
+
+Uninstall ends and deletes the scheduled task. It intentionally retains the protected pairing,
+configuration, and task journal.
+
+### Use the bridge from WSL
+
+Run these commands from a registered agent session; the MCP tools with the same names are usually more
+convenient inside an agent:
+
+```sh
+agent-coordinator workspaces
+agent-coordinator eyes
+
+agent-coordinator relay --workspace /path/to/other/repo --to deft-pika --body 'Can you verify this?'
+agent-coordinator relay --workspace /path/to/other/repo --agent-id 98ffc675471a --body-file note.md
+
+agent-coordinator request-eyes --runtime claude --timeout 300 --brief 'Inspect the login page and report visible errors.'
+agent-coordinator request-eyes --runtime claude --brief-file browser-check.md
+agent-coordinator cancel-eyes task-0123456789ab
+```
+
+`workspaces` discovers live workspace scope IDs; `eyes` shows connected launchers and active eyes rows.
+`relay` can address a whole scope or one name/12-hex agent ID. The daemon stamps an authenticated
+`reply_to`; when using the MCP tool, pass that structured `{scope, agent_id, name}` back as `target` to
+reply without turning a direct message into a workspace broadcast.
+
+`request-eyes` is always owned by the authenticated caller in its current workspace. It returns a
+`task_id` and launcher name, then prints a suggested `wait` command. Launch delivery is retried until
+accepted. The requester normally receives `task.accepted`, followed by one `task.result` or
+`task.failed`; cancellation is authorized against that recorded requester. The default deadline is
+300 seconds, and an explicit `--timeout` must be 300 through 1800 seconds.
+
+### Security and v1 boundaries
+
+- The WSL relay binds loopback only and requires the shared token plus per-launcher/per-task session
+  secrets. The database stores hashes of session secrets, not the secrets themselves.
+- Windows stores broker credentials in the current user's Credential Manager. Broker configuration
+  and its small recovery journal are sealed for that user with DPAPI.
+- Coordinator credentials and `AC_*` relay variables are removed from the provider child. Claude does
+  receive the explicitly configured, isolated `CLAUDE_CONFIG_DIR`, including whatever Claude login
+  state that directory contains.
+- Browser output is untrusted. The broker bounds and validates the structured report before relaying
+  it, and cancellation/deadline handling terminates the provider process tree.
+- The scheduled broker runs only in that user's interactive desktop session, never as an elevated
+  machine service. This is necessary for access to the user's Chrome session.
+- The v1 `host` command is Windows-only and configures one Claude provider, one task at a time. CLI and
+  MCP schemas reserve `codex` and `grok` runtime names, but this broker does not advertise them.
+- Tasks are one-shot reports. Follow-up conversation, arbitrary remote hosts, non-loopback listeners,
+  and TLS are not part of v1.
+- Windows-to-WSL `127.0.0.1` depends on WSL localhost forwarding or mirrored networking. If
+  `Test-NetConnection` fails, fix that WSL/Windows networking path; v1 deliberately rejects a WSL VM IP
+  or other non-loopback `--addr` as an unsafe fallback.
+
 ## The MCP tools
 
 All under the MCP server `agent-coordinator`. Hook-enabled clients receive an
@@ -190,6 +384,11 @@ bind file (one session = one inbox).
   must pass `from='<child name>'` so they never drain the parent inbox.
 - `peek_messages` - non-destructive unread preview (count, senders, ids).
 - `broadcast` - one-shot to agents registered **now**; late joiners miss it.
+- `list_workspaces` - live workspace scopes and occupancy counts.
+- `list_eyes` - connected host launchers and active eyes rows across workspaces.
+- `relay` - send to another workspace or a structured return address.
+- `request_eyes` - dispatch one browser brief to a host launcher; returns a task ID.
+- `cancel_eyes` - cancel a live task owned by this requester.
 
 ## How it works
 
@@ -209,6 +408,12 @@ One binary, several subcommands:
   harnesses without hooks, or manual bootstrap).
 - `board` - print the workspace board (`--live` active+idle only, `--all`
   include gone, `--json` machine-readable).
+- `workspaces`, `eyes`, and `relay` - discover and explicitly message across
+  workspace scopes.
+- `request-eyes` (alias `summon`) and `cancel-eyes` - manage one-shot Windows
+  host browser tasks.
+- `host` - Windows-only broker pairing, Task Scheduler installation, foreground
+  execution, and removal.
 - `install` - registers all of the above (see Install above).
 
 ```
@@ -313,6 +518,12 @@ id (name will not stick across restarts).
   failing silently. Try `AC_DEBUG=1 agent-coordinator hook < event.json`.
 - `AC_NO_SPAWN` - when set, clients never spawn the daemon on a missed dial
   and simply fail open. Mostly useful for tests and debugging.
+- `AC_RELAY_LISTEN` - enables the optional TCP relay. Unset disables it;
+  `1`/`true` selects `127.0.0.1:7400`, or set an explicit numeric loopback
+  `IP:PORT`. Non-loopback addresses are rejected.
+- `AC_TOKEN` - optional relay-token override. It must contain exactly 64
+  lowercase hexadecimal characters. Normal installations should use the
+  generated protected `relay.token` file instead.
 
 ## Agent naming and presence
 
@@ -336,8 +547,10 @@ An agent's scope is the git repository root of its working directory.
 Linked worktrees resolve to the MAIN repository root, so a session working
 in a worktree shares the board with sessions in the main checkout.
 Non-git directories scope to themselves. Scopes are fully isolated:
-sessions in different repositories never see each other's agents, boards,
-or messages.
+ordinary boards, presence, DMs, and broadcasts stay inside their workspace.
+The explicit `list_workspaces`, `list_eyes`, and `relay` operations are the
+cross-scope exceptions; a relay message records its source scope and a
+server-stamped structured return address.
 
 ## Data
 

@@ -26,6 +26,22 @@ it. Do not grep the filesystem for it.
 - `peek_messages(from?)` - non-destructive unread preview.
 - `broadcast(body, from?)` - one-shot to agents registered **now**; late joiners miss it.
 
+## Cross-workspace relay and Windows eyes
+
+- `list_workspaces` - discover scopes with live agents before addressing another workspace.
+- `list_eyes` - list connected host launchers and active eyes tasks across workspaces.
+- `relay(body, target, from?)` - send across scopes. Prefer the structured
+  `target={scope, agent_id, name}` returned in `reply_to`; `agent_id` wins over `name`.
+- `request_eyes(brief, runtime="claude", timeout=300, from?)` - ask the optional Windows host
+  broker to inspect Chrome. It returns a `task_id`; acceptance and the final structured report arrive
+  as ordinary mail in the authenticated requester's inbox. Arm `wait` while it runs.
+- `cancel_eyes(task_id, from?)` - cancel your own live eyes task. Keep the `task_id` from the request.
+
+The Windows bridge is optional and must already be paired and running; an empty `list_eyes` means no
+host broker is available. Eyes tasks are one-shot reports, not interactive browser sessions. The v1
+host broker advertises Claude only, so request `runtime="claude"` (or omit it). Setup and security
+details are in the agent-coordinator README under "Optional Windows host Chrome eyes bridge."
+
 ## Wake pattern (be woken, do not busy-poll)
 
 Arm a background task: `agent-coordinator wait '<yourname>' -timeout <sec>` (default 570s). It
