@@ -284,6 +284,12 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 		if err != nil {
 			return fail(err)
 		}
+		// A relay-owned row is usable only through the gate that proved its
+		// per-session secret. The unix socket may know its exact scope, session
+		// and name, but that is not authority to touch or act as it.
+		if id.Origin == store.RelayOrigin && req.Origin != relayOrigin {
+			return fail(store.ErrRelayAuth)
+		}
 		actorID = id
 		req.From = id.Name
 		actor = protocol.AgentRef{Name: id.Name, AgentID: id.AgentID, Scope: req.Scope}

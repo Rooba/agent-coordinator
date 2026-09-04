@@ -444,6 +444,42 @@ func TestUnixKindCannotSelectBrokerPolling(t *testing.T) {
 	}
 }
 
+// Knowing a relay row's complete address on the unix socket is not its
+// credential. The dispatch boundary rejects it before heartbeat or inbox
+// access; only a TCP request that proves the launcher's secret may poll.
+func TestUnixCannotActAsRelayRow(t *testing.T) {
+	sock, addr, tok, st := relayDaemon(t)
+	requester := registerUnix(t, sock, "/r", "s-a")
+	launcher, secret := registerLauncher(t, addr, tok, "broker-1", "host:BOX")
+	task := roundTrip(t, sock, protocol.Request{Op: protocol.OpRequestEyes, Scope: "/r",
+		SessionID: "s-a", From: requester.Name, Brief: "look"})
+	if !task.OK {
+		t.Fatalf("request_eyes: %+v", task)
+	}
+	eyes, err := st.ListEyes()
+	if err != nil || len(eyes) != 1 {
+		t.Fatalf("launcher state: %+v (%v)", eyes, err)
+	}
+	lastSeen := eyes[0].LastSeen
+	st.Now = func() time.Time { return time.Unix(lastSeen+10, 0) }
+	for _, op := range []string{protocol.OpRead, protocol.OpPeek} {
+		got := roundTrip(t, sock, protocol.Request{Op: op, Scope: "host:BOX",
+			SessionID: "broker-1", From: launcher.Name})
+		if got.OK || got.Error != "unauthorized" || len(got.Messages) != 0 || got.Unread != 0 {
+			t.Fatalf("unix %s as relay row: %+v", op, got)
+		}
+	}
+	eyes, err = st.ListEyes()
+	if err != nil || len(eyes) != 1 || eyes[0].LastSeen != lastSeen {
+		t.Fatalf("rejected unix calls must not touch the launcher: %+v (%v)", eyes, err)
+	}
+	real := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpRead,
+		SessionID: "broker-1", Token: tok, SessionSecret: secret})
+	if !real.OK || len(real.Messages) != 1 || real.Messages[0].TaskID != task.TaskID {
+		t.Fatalf("authenticated relay poll must retain the launch: %+v", real)
+	}
+}
+
 // Identity is rewritten from the authenticated row, and a task id is the
 // daemon's to stamp: a relay client cannot put one on ordinary mail.
 func TestRelayGateRewritesTheRequest(t *testing.T) {
@@ -1303,7 +1339,7 @@ func TestOnlyARelayRowSpeaksForATask(t *testing.T) {
 	// The broker's own session id, presented over the unix socket.
 	if r := roundTrip(t, sock, protocol.Request{Op: protocol.OpSendWorkspace, Scope: "host:BOX",
 		SessionID: "broker-1", From: launcher.Name, Target: &a,
-		Body: string(accepted)}); r.OK || r.Error != "not your task" {
+		Body: string(accepted)}); r.OK || r.Error != "unauthorized" {
 		t.Fatalf("a unix caller has no standing in the ledger: %+v", r)
 	}
 	// A second broker registering under the child's session id: its row lives
