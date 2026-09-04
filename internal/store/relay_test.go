@@ -2,9 +2,12 @@ package store
 
 import (
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -39,8 +42,40 @@ func hasColumn(cols []string, want string) bool {
 	return i < len(cols) && cols[i] == want
 }
 
+// count is the one-number probe the store's own tables answer with.
+func count(t *testing.T, s *Store, query string, args ...any) int {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow(query, args...).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// seedTask writes an eyes_tasks row directly: the busy and staleness rules
+// are about the row, not about how it was created.
+func seedTask(t *testing.T, s *Store, taskID, launcherSession, state string, updatedAt int64) {
+	t.Helper()
+	if _, err := s.db.Exec(`INSERT INTO eyes_tasks
+		(task_id, requester_scope, requester_agent_id, launcher_session, runtime, state, created_at, updated_at)
+		VALUES (?,?,?,?,'claude',?,?,?)`, taskID, "/r", "aid-a", launcherSession, state, updatedAt, updatedAt); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// registerBroker registers a host broker the way the relay gate will.
+func registerBroker(t *testing.T, s *Store, scope, session string) RelayResult {
+	t.Helper()
+	r, err := s.RegisterRelay(RelayRegistration{Scope: scope, SessionID: session,
+		Kind: protocol.KindLauncher, Origin: "relay", Platform: "windows"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
 // A database written before the relay columns existed must migrate in place:
-// the old row survives on the new defaults and every column is present.
+// old rows survive on the new defaults and every column is present.
 func TestRelayMigrationsOnLegacyDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy.db")
 	db, err := sql.Open("sqlite", path)
@@ -53,7 +88,13 @@ func TestRelayMigrationsOnLegacyDatabase(t *testing.T) {
 		status TEXT NOT NULL DEFAULT 'active',
 		registered_at INTEGER NOT NULL, last_seen INTEGER NOT NULL,
 		PRIMARY KEY (scope, session_id));
-		INSERT INTO agents VALUES ('/r','s-old','aid-old','old-agent','active',1,1);`); err != nil {
+		INSERT INTO agents VALUES ('/r','s-old','aid-old','old-agent','active',1,1);
+		CREATE TABLE messages (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		scope TEXT NOT NULL, from_agent TEXT NOT NULL, to_agent TEXT,
+		body TEXT NOT NULL, created_at INTEGER NOT NULL);
+		INSERT INTO messages (scope, from_agent, to_agent, body, created_at)
+		VALUES ('/r','aid-old',NULL,'legacy mail',1);`); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()
@@ -80,6 +121,15 @@ func TestRelayMigrationsOnLegacyDatabase(t *testing.T) {
 	}
 	if kind != "" || caps != "[]" {
 		t.Fatalf("legacy row defaults: kind=%q caps=%q, want \"\" and []", kind, caps)
+	}
+	var body, fromScope, replyTo, taskID, mkind string
+	if err := s.db.QueryRow(`SELECT body, from_scope, reply_to, task_id, kind FROM messages WHERE from_agent='aid-old'`).
+		Scan(&body, &fromScope, &replyTo, &taskID, &mkind); err != nil {
+		t.Fatalf("legacy message must survive the migration: %v", err)
+	}
+	if body != "legacy mail" || fromScope != "" || replyTo != "" || taskID != "" || mkind != "" {
+		t.Fatalf("legacy message defaults: body=%q from_scope=%q reply_to=%q task_id=%q kind=%q",
+			body, fromScope, replyTo, taskID, mkind)
 	}
 }
 
@@ -110,6 +160,17 @@ func TestMigrationsIdempotentAndEyesTasksTable(t *testing.T) {
 	}
 }
 
+// The launcher busy check runs on every pick, so eyes_tasks carries the index
+// that backs it.
+func TestEyesTasksLauncherStateIndex(t *testing.T) {
+	s := open(t)
+	var name string
+	if err := s.db.QueryRow(`SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='eyes_tasks'
+		AND name='idx_eyes_tasks_launcher_state'`).Scan(&name); err != nil {
+		t.Fatalf("eyes_tasks(launcher_session, state) index: %v", err)
+	}
+}
+
 // The workspace directory counts live agents by kind and hides the reserved
 // host: scopes - those are broker plumbing, not workspaces.
 func TestListWorkspacesCountsByKindAndHidesHostScopes(t *testing.T) {
@@ -117,10 +178,7 @@ func TestListWorkspacesCountsByKindAndHidesHostScopes(t *testing.T) {
 	s.Register("/repo-a", "s-a1", "hook")
 	s.Register("/repo-a", "s-a2", "hook")
 	s.Register("/repo-b", "s-b1", "hook")
-	if _, err := s.RegisterRelay(RelayRegistration{Scope: "host:BOX", SessionID: "broker-1",
-		Kind: protocol.KindLauncher, Origin: "relay", Platform: "windows"}); err != nil {
-		t.Fatal(err)
-	}
+	registerBroker(t, s, "host:BOX", "broker-1")
 	if _, err := s.RegisterRelay(RelayRegistration{Scope: "/repo-a", SessionID: "eyes-task-1",
 		Kind: protocol.KindEyes, Origin: "relay"}); err != nil {
 		t.Fatal(err)
@@ -208,6 +266,33 @@ func TestSendToScopeWritesIntoTargetScope(t *testing.T) {
 	}
 }
 
+// A message and its deliveries are one write: a delivery that cannot be
+// inserted must not leave a message row nobody can ever read.
+func TestSendToScopeIsOneTransaction(t *testing.T) {
+	s := open(t)
+	nA, _ := s.Register("/r", "s-a", "hook")
+	nB, _ := s.Register("/r", "s-b", "hook")
+	if _, err := s.db.Exec(`CREATE TRIGGER fail_delivery BEFORE INSERT ON deliveries
+		BEGIN SELECT RAISE(ABORT, 'boom'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SendToScope(Delivery{FromScope: "/r", FromName: nA, ToName: nB, Body: "lost"}); err == nil {
+		t.Fatal("a failing delivery insert must fail the send")
+	}
+	if n := count(t, s, `SELECT COUNT(*) FROM messages`); n != 0 {
+		t.Fatalf("an undeliverable message must be rolled back, got %d rows", n)
+	}
+	if _, err := s.db.Exec(`DROP TRIGGER fail_delivery`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SendToScope(Delivery{FromScope: "/r", FromName: nA, ToName: nB, Body: "delivered"}); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.UnreadCount("/r", nB); n != 1 {
+		t.Fatalf("unread after the retry: %d, want 1", n)
+	}
+}
+
 // An eyes child's mail is labelled with its kind and task so the requester
 // can tell a report from a peer's DM.
 func TestSendStampsSenderKindAndTaskID(t *testing.T) {
@@ -234,10 +319,7 @@ func TestPickLauncherRequiresRecentPoll(t *testing.T) {
 	s := open(t)
 	now := time.Unix(1000000, 0)
 	s.Now = func() time.Time { return now }
-	if _, err := s.RegisterRelay(RelayRegistration{Scope: "host:BOX", SessionID: "broker-1",
-		Kind: protocol.KindLauncher, Origin: "relay"}); err != nil {
-		t.Fatal(err)
-	}
+	registerBroker(t, s, "host:BOX", "broker-1")
 	l, err := s.PickLauncher()
 	if err != nil || l.SessionID != "broker-1" || l.Scope != "host:BOX" {
 		t.Fatalf("fresh launcher: %+v (%v)", l, err)
@@ -248,42 +330,73 @@ func TestPickLauncherRequiresRecentPoll(t *testing.T) {
 	}
 }
 
+// Only a relay-registered launcher in a reserved host: scope is a broker.
+// AC_KIND is plumbed from local callers, so a local agent calling itself a
+// launcher must never absorb a brief.
+func TestPickLauncherRequiresRelayOriginAndHostScope(t *testing.T) {
+	s := open(t)
+	if _, err := s.RegisterRelay(RelayRegistration{Scope: "/r", SessionID: "local-1",
+		Kind: protocol.KindLauncher}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PickLauncher(); !errors.Is(err, ErrNoLauncher) {
+		t.Fatalf("a local kind=launcher row must not be pickable, got %v", err)
+	}
+	if _, err := s.RegisterRelay(RelayRegistration{Scope: "/r", SessionID: "relay-1",
+		Kind: protocol.KindLauncher, Origin: "relay"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PickLauncher(); !errors.Is(err, ErrNoLauncher) {
+		t.Fatalf("a launcher outside a host: scope must not be pickable, got %v", err)
+	}
+	registerBroker(t, s, "host:BOX", "broker-1")
+	if l, err := s.PickLauncher(); err != nil || l.SessionID != "broker-1" {
+		t.Fatalf("the host broker: %+v (%v)", l, err)
+	}
+}
+
 // A launcher running a task is busy: the pick skips it, and when every live
 // launcher is busy the caller gets ErrEyesBusy rather than "no host launcher".
 func TestPickLauncherSkipsBusyLauncher(t *testing.T) {
 	s := open(t)
 	now := time.Unix(3000000, 0)
 	s.Now = func() time.Time { return now }
-	if _, err := s.RegisterRelay(RelayRegistration{Scope: "host:BOX", SessionID: "broker-1",
-		Kind: protocol.KindLauncher, Origin: "relay"}); err != nil {
-		t.Fatal(err)
-	}
+	registerBroker(t, s, "host:BOX", "broker-1")
 	now = now.Add(time.Second) // broker-2 is the more recently seen launcher
-	if _, err := s.RegisterRelay(RelayRegistration{Scope: "host:BOX", SessionID: "broker-2",
-		Kind: protocol.KindLauncher, Origin: "relay"}); err != nil {
-		t.Fatal(err)
-	}
-	mk := func(taskID, session string) {
-		t.Helper()
-		if _, _, err := s.CreateEyesTask(EyesTask{TaskID: taskID, RequesterScope: "/r",
-			RequesterAgentID: "aid-a", LauncherSession: session, Runtime: "claude"}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	mk("task-1", "broker-2")
+	registerBroker(t, s, "host:BOX", "broker-2")
+	seedTask(t, s, "task-1", "broker-2", "queued", now.Unix())
 	l, err := s.PickLauncher()
 	if err != nil || l.SessionID != "broker-1" {
 		t.Fatalf("a busy launcher must be skipped: %+v (%v)", l, err)
 	}
-	mk("task-2", "broker-1")
+	seedTask(t, s, "task-2", "broker-1", "accepted", now.Unix())
 	if _, err := s.PickLauncher(); !errors.Is(err, ErrEyesBusy) {
 		t.Fatalf("every launcher busy must be ErrEyesBusy, got %v", err)
 	}
-	if err := s.SetEyesTaskState("task-1", "done"); err != nil {
+	if _, err := s.db.Exec(`UPDATE eyes_tasks SET state='done' WHERE task_id='task-1'`); err != nil {
 		t.Fatal(err)
 	}
 	if l, err := s.PickLauncher(); err != nil || l.SessionID != "broker-2" {
 		t.Fatalf("a finished task frees its launcher: %+v (%v)", l, err)
+	}
+}
+
+// A task nobody has advanced for half an hour is abandoned, not in flight: it
+// must not pin its launcher out of service for the 24h ledger retention.
+func TestPickLauncherIgnoresStaleTasks(t *testing.T) {
+	s := open(t)
+	now := time.Unix(4000000, 0)
+	s.Now = func() time.Time { return now }
+	registerBroker(t, s, "host:BOX", "broker-1")
+	seedTask(t, s, "task-fresh", "broker-1", "accepted", now.Unix()-1799)
+	if _, err := s.PickLauncher(); !errors.Is(err, ErrEyesBusy) {
+		t.Fatalf("a task touched within 1800s still holds its launcher, got %v", err)
+	}
+	if _, err := s.db.Exec(`UPDATE eyes_tasks SET updated_at=? WHERE task_id='task-fresh'`, now.Unix()-1801); err != nil {
+		t.Fatal(err)
+	}
+	if l, err := s.PickLauncher(); err != nil || l.SessionID != "broker-1" {
+		t.Fatalf("a stale task must not block the launcher: %+v (%v)", l, err)
 	}
 }
 
@@ -356,6 +469,292 @@ func TestRegisterRelayReRegisterNeedsTheSecret(t *testing.T) {
 	}
 }
 
+// A relay session id names exactly one row: holding its secret does not let a
+// caller move it to another scope, change what it is, or shed its origin.
+func TestRegisterRelayHoldsIdentityImmutable(t *testing.T) {
+	s := open(t)
+	first := registerBroker(t, s, "host:BOX", "broker-1")
+	for _, c := range []struct {
+		what string
+		reg  RelayRegistration
+	}{
+		{"a second scope", RelayRegistration{Scope: "/repo-a", SessionID: "broker-1",
+			Kind: protocol.KindLauncher, Origin: "relay", Secret: first.Secret}},
+		{"a new kind", RelayRegistration{Scope: "host:BOX", SessionID: "broker-1",
+			Kind: protocol.KindEyes, Origin: "relay", Secret: first.Secret}},
+		{"a dropped origin", RelayRegistration{Scope: "host:BOX", SessionID: "broker-1",
+			Kind: protocol.KindLauncher, Secret: first.Secret}},
+	} {
+		if _, err := s.RegisterRelay(c.reg); !errors.Is(err, ErrForeignSession) {
+			t.Fatalf("%s must be ErrForeignSession, got %v", c.what, err)
+		}
+	}
+	if n := count(t, s, `SELECT COUNT(*) FROM agents WHERE session_id='broker-1'`); n != 1 {
+		t.Fatalf("a relay session must own exactly one row, got %d", n)
+	}
+	var kind, origin string
+	if err := s.db.QueryRow(`SELECT kind, origin FROM agents WHERE session_id='broker-1'`).Scan(&kind, &origin); err != nil {
+		t.Fatal(err)
+	}
+	if kind != protocol.KindLauncher || origin != "relay" {
+		t.Fatalf("row after the refused re-registers: kind=%q origin=%q", kind, origin)
+	}
+}
+
+// Registration is one transaction: a failed metadata write must leave no row
+// at all, because a half-registered row can never be re-claimed.
+func TestRegisterRelayIsOneTransaction(t *testing.T) {
+	s := open(t)
+	if _, err := s.db.Exec(`CREATE TRIGGER fail_meta BEFORE UPDATE OF relay_secret_hash ON agents
+		BEGIN SELECT RAISE(ABORT, 'boom'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RegisterRelay(RelayRegistration{Scope: "host:BOX", SessionID: "broker-1",
+		Kind: protocol.KindLauncher, Origin: "relay"}); err == nil {
+		t.Fatal("a failing metadata write must fail the registration")
+	}
+	if n := count(t, s, `SELECT COUNT(*) FROM agents WHERE session_id='broker-1'`); n != 0 {
+		t.Fatalf("a failed registration must leave no row, got %d", n)
+	}
+	if _, err := s.db.Exec(`DROP TRIGGER fail_meta`); err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.RegisterRelay(RelayRegistration{Scope: "host:BOX", SessionID: "broker-1",
+		Kind: protocol.KindLauncher, Origin: "relay"})
+	if err != nil || len(r.Secret) != 64 {
+		t.Fatalf("the retry must register cleanly: %+v (%v)", r, err)
+	}
+}
+
+// The launcher holding a live task may re-mint its child session: without it,
+// one lost register response strands the task with nobody able to report.
+func TestReissueEyesChild(t *testing.T) {
+	s := open(t)
+	registerBroker(t, s, "host:BOX", "broker-1")
+	seedTask(t, s, "task-1", "broker-1", "queued", s.Now().Unix())
+
+	child, err := s.ReissueEyesChild("task-1", "broker-1")
+	if err != nil || child.Name == "" || len(child.Secret) != 64 {
+		t.Fatalf("first reissue: %+v (%v)", child, err)
+	}
+	id, err := s.VerifyRelaySecret("eyes-task-1", child.Secret)
+	if err != nil || id.Scope != "/r" || id.Kind != protocol.KindEyes || id.Origin != "relay" {
+		t.Fatalf("the child must be an eyes row in the requester scope: %+v (%v)", id, err)
+	}
+	// A second reissue replaces the secret: the lost one stops working.
+	again, err := s.ReissueEyesChild("task-1", "broker-1")
+	if err != nil || again.Name != child.Name || again.Secret == child.Secret {
+		t.Fatalf("second reissue: %+v (%v)", again, err)
+	}
+	if _, err := s.VerifyRelaySecret("eyes-task-1", child.Secret); !errors.Is(err, ErrRelayAuth) {
+		t.Fatalf("the replaced secret must stop working, got %v", err)
+	}
+	if _, err := s.VerifyRelaySecret("eyes-task-1", again.Secret); err != nil {
+		t.Fatalf("the fresh secret must work: %v", err)
+	}
+	if n := count(t, s, `SELECT COUNT(*) FROM agents WHERE session_id='eyes-task-1'`); n != 1 {
+		t.Fatalf("reissuing must not clone the child row, got %d", n)
+	}
+
+	seedTask(t, s, "task-2", "broker-2", "queued", s.Now().Unix())
+	if _, err := s.ReissueEyesChild("task-2", "broker-1"); !errors.Is(err, ErrNotYourTask) {
+		t.Fatalf("another launcher's task must be ErrNotYourTask, got %v", err)
+	}
+	if _, err := s.ReissueEyesChild("task-nope", "broker-1"); !errors.Is(err, ErrUnknownTask) {
+		t.Fatalf("unknown task: %v", err)
+	}
+	seedTask(t, s, "task-3", "broker-1", "done", s.Now().Unix())
+	if _, err := s.ReissueEyesChild("task-3", "broker-1"); !errors.Is(err, ErrTaskNotLive) {
+		t.Fatalf("a settled task must mint no child, got %v", err)
+	}
+	seedTask(t, s, "task-4", "broker-1", "accepted", s.Now().Unix())
+	if _, err := s.ReissueEyesChild("task-4", "broker-1"); err != nil {
+		t.Fatalf("an accepted task is still live: %v", err)
+	}
+}
+
+// One request_eyes is one transaction: reserve the launcher, queue the task
+// and deliver task.launch, or do none of it.
+func TestAssignEyesTaskQueuesAndDelivers(t *testing.T) {
+	s := open(t)
+	now := time.Unix(5000000, 0)
+	s.Now = func() time.Time { return now }
+	requester, _ := s.Register("/r", "s-a", "hook")
+	broker := registerBroker(t, s, "host:BOX", "broker-1")
+	ref := protocol.AgentRef{Name: requester, AgentID: agentID("s-a"), Scope: "/r"}
+
+	task, launcher, err := s.AssignEyesTask(EyesRequest{Requester: ref, Runtime: "claude", Brief: "read the page"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(task.TaskID, "task-") || len(task.TaskID) != len("task-")+12 {
+		t.Fatalf("task id %q must be task- plus 12 hex", task.TaskID)
+	}
+	if _, err := hex.DecodeString(task.TaskID[len("task-"):]); err != nil {
+		t.Fatalf("task id %q must be hex: %v", task.TaskID, err)
+	}
+	if task.State != "queued" || task.LauncherSession != "broker-1" || task.RequesterScope != "/r" ||
+		task.RequesterAgentID != ref.AgentID || task.Runtime != "claude" || task.UpdatedAt != now.Unix() {
+		t.Fatalf("queued task: %+v", task)
+	}
+	if launcher.Name != broker.Name || launcher.Scope != "host:BOX" {
+		t.Fatalf("launcher ref: %+v", launcher)
+	}
+	msgs, err := s.Read("host:BOX", broker.Name)
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("launcher inbox: %d (%v)", len(msgs), err)
+	}
+	m := msgs[0]
+	if m.TaskID != task.TaskID || m.From != requester || m.FromScope != "/r" || m.ReplyTo == nil || m.ReplyTo.AgentID != ref.AgentID {
+		t.Fatalf("launch mail: %+v (reply_to %+v)", m, m.ReplyTo)
+	}
+	var body protocol.TaskLaunchMsg
+	if err := json.Unmarshal([]byte(m.Body), &body); err != nil {
+		t.Fatalf("launch body %q: %v", m.Body, err)
+	}
+	if body.Type != protocol.TaskLaunch || body.TaskID != task.TaskID || body.Runtime != "claude" ||
+		body.Scope != "/r" || body.Brief != "read the page" || body.DeadlineS != 300 || body.ReplyTo.AgentID != ref.AgentID {
+		t.Fatalf("launch body: %+v", body)
+	}
+	// The launcher now holds a live task, so a second request is refused and
+	// writes nothing.
+	if _, _, err := s.AssignEyesTask(EyesRequest{Requester: ref, Brief: "again"}); !errors.Is(err, ErrEyesBusy) {
+		t.Fatalf("a busy launcher must be ErrEyesBusy, got %v", err)
+	}
+	if n := count(t, s, `SELECT COUNT(*) FROM eyes_tasks`); n != 1 {
+		t.Fatalf("a refused request must queue nothing, got %d tasks", n)
+	}
+	if n := count(t, s, `SELECT COUNT(*) FROM messages`); n != 1 {
+		t.Fatalf("a refused request must send nothing, got %d messages", n)
+	}
+}
+
+// deadline_s defaults to 300 and is capped at 1800 - the requester's bound on
+// a host job, applied where the launch body is built.
+func TestAssignEyesTaskCapsDeadline(t *testing.T) {
+	s := open(t)
+	requester, _ := s.Register("/r", "s-a", "hook")
+	broker := registerBroker(t, s, "host:BOX", "broker-1")
+	ref := protocol.AgentRef{Name: requester, AgentID: agentID("s-a"), Scope: "/r"}
+	if _, _, err := s.AssignEyesTask(EyesRequest{Requester: ref, Brief: "b", DeadlineS: 9999}); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := s.Read("host:BOX", broker.Name)
+	var body protocol.TaskLaunchMsg
+	if len(msgs) != 1 || json.Unmarshal([]byte(msgs[0].Body), &body) != nil || body.DeadlineS != 1800 {
+		t.Fatalf("deadline must be capped at 1800: %+v", body)
+	}
+}
+
+// No broker means no task and no mail: the caller has to say the host is not
+// running rather than silently queue work nobody will see.
+func TestAssignEyesTaskWithoutLauncherWritesNothing(t *testing.T) {
+	s := open(t)
+	requester, _ := s.Register("/r", "s-a", "hook")
+	ref := protocol.AgentRef{Name: requester, AgentID: agentID("s-a"), Scope: "/r"}
+	if _, _, err := s.AssignEyesTask(EyesRequest{Requester: ref, Brief: "b"}); !errors.Is(err, ErrNoLauncher) {
+		t.Fatalf("no launcher: %v", err)
+	}
+	if n := count(t, s, `SELECT COUNT(*) FROM eyes_tasks`); n != 0 {
+		t.Fatalf("nothing must be queued, got %d tasks", n)
+	}
+	if n := count(t, s, `SELECT COUNT(*) FROM messages`); n != 0 {
+		t.Fatalf("nothing must be sent, got %d messages", n)
+	}
+}
+
+// Transitions are validated against the actor and the current state, and the
+// state change plus the requester's mail are one write - so a re-sent report
+// is a no-op, not a second message.
+func TestTransitionEyesTaskEdgesActorsAndIdempotency(t *testing.T) {
+	s := open(t)
+	requester, _ := s.Register("/r", "s-a", "hook")
+	broker := registerBroker(t, s, "host:BOX", "broker-1")
+	ref := protocol.AgentRef{Name: requester, AgentID: agentID("s-a"), Scope: "/r"}
+	task, _, err := s.AssignEyesTask(EyesRequest{Requester: ref, Brief: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	childSession := "eyes-" + task.TaskID
+	child, err := s.ReissueEyesChild(task.TaskID, "broker-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := s.TransitionEyesTask("task-nope", "broker-1", "accepted", "{}"); !errors.Is(err, ErrUnknownTask) {
+		t.Fatalf("unknown task: %v", err)
+	}
+	if _, _, err := s.TransitionEyesTask(task.TaskID, childSession, "accepted", "{}"); !errors.Is(err, ErrNotYourTask) {
+		t.Fatalf("only the assigned launcher may accept, got %v", err)
+	}
+	if _, _, err := s.TransitionEyesTask(task.TaskID, "broker-1", "queued", "{}"); !errors.Is(err, ErrBadTransition) {
+		t.Fatalf("queued is not a target state, got %v", err)
+	}
+	if _, _, err := s.TransitionEyesTask(task.TaskID, "broker-1", "done", "{}"); !errors.Is(err, ErrNotYourTask) {
+		t.Fatalf("only the child reports done, got %v", err)
+	}
+
+	accepted, ok, err := s.TransitionEyesTask(task.TaskID, "broker-1", "accepted",
+		`{"type":"task.accepted","task_id":"`+task.TaskID+`"}`)
+	if err != nil || !ok || accepted.State != "accepted" {
+		t.Fatalf("accept: %+v ok=%v (%v)", accepted, ok, err)
+	}
+	if n, _ := s.UnreadCount("/r", requester); n != 1 {
+		t.Fatalf("the requester must be told once, unread=%d", n)
+	}
+	if _, ok, err := s.TransitionEyesTask(task.TaskID, "broker-1", "accepted", "{}"); err != nil || ok {
+		t.Fatalf("a repeated accept must be a quiet no-op: ok=%v (%v)", ok, err)
+	}
+	if n, _ := s.UnreadCount("/r", requester); n != 1 {
+		t.Fatalf("a repeat must not send a second mail, unread=%d", n)
+	}
+
+	report := `{"type":"task.result","task_id":"` + task.TaskID + `","status":"ok"}`
+	done, ok, err := s.TransitionEyesTask(task.TaskID, childSession, "done", report)
+	if err != nil || !ok || done.State != "done" {
+		t.Fatalf("done: %+v ok=%v (%v)", done, ok, err)
+	}
+	if _, _, err := s.TransitionEyesTask(task.TaskID, childSession, "failed", "{}"); !errors.Is(err, ErrBadTransition) {
+		t.Fatalf("done is terminal, got %v", err)
+	}
+	msgs, err := s.Read("/r", requester)
+	if err != nil || len(msgs) != 2 {
+		t.Fatalf("requester mail: %d (%v)", len(msgs), err)
+	}
+	if msgs[0].From != broker.Name || msgs[0].FromScope != "host:BOX" || msgs[0].Kind != protocol.KindLauncher ||
+		msgs[0].TaskID != task.TaskID {
+		t.Fatalf("the accept mail comes from the launcher: %+v", msgs[0])
+	}
+	if msgs[1].From != child.Name || msgs[1].Kind != protocol.KindEyes || msgs[1].Body != report ||
+		msgs[1].ReplyTo == nil || msgs[1].ReplyTo.Name != child.Name {
+		t.Fatalf("the report comes from the child: %+v (reply_to %+v)", msgs[1], msgs[1].ReplyTo)
+	}
+	// A settled task frees its launcher for the next brief.
+	if l, err := s.PickLauncher(); err != nil || l.SessionID != "broker-1" {
+		t.Fatalf("a finished task frees the launcher: %+v (%v)", l, err)
+	}
+}
+
+// A launcher that never accepted can still fail its task cleanly.
+func TestTransitionEyesTaskLauncherMayFailQueued(t *testing.T) {
+	s := open(t)
+	requester, _ := s.Register("/r", "s-a", "hook")
+	registerBroker(t, s, "host:BOX", "broker-1")
+	ref := protocol.AgentRef{Name: requester, AgentID: agentID("s-a"), Scope: "/r"}
+	task, _, err := s.AssignEyesTask(EyesRequest{Requester: ref, Brief: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed, ok, err := s.TransitionEyesTask(task.TaskID, "broker-1", "failed",
+		`{"type":"task.failed","task_id":"`+task.TaskID+`","error":"no provider"}`)
+	if err != nil || !ok || failed.State != "failed" {
+		t.Fatalf("queued -> failed by the launcher: %+v ok=%v (%v)", failed, ok, err)
+	}
+	if n, _ := s.UnreadCount("/r", requester); n != 1 {
+		t.Fatalf("the requester must hear about the failure, unread=%d", n)
+	}
+}
+
 // A task is owned by its requester (or one of that agent's bound children),
 // and Housekeep sweeps it after a day.
 func TestEyesTaskOwnershipAndHousekeep(t *testing.T) {
@@ -368,16 +767,13 @@ func TestEyesTaskOwnershipAndHousekeep(t *testing.T) {
 		t.Fatal(err)
 	}
 	nB, _ := s.Register("/r", "s-b", "hook")
+	registerBroker(t, s, "host:BOX", "broker-1")
 	requester := protocol.AgentRef{Name: nA, AgentID: agentID("s-a"), Scope: "/r"}
-	newTask := EyesTask{TaskID: "task-1", RequesterScope: "/r",
-		RequesterAgentID: requester.AgentID, LauncherSession: "broker-1", Runtime: "claude"}
-	if _, created, err := s.CreateEyesTask(newTask); err != nil || !created {
-		t.Fatalf("first create: created=%v (%v)", created, err)
+	task, _, err := s.AssignEyesTask(EyesRequest{Requester: requester, Runtime: "claude", Brief: "b"})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if live, created, err := s.CreateEyesTask(newTask); err != nil || created || live.State != "queued" {
-		t.Fatalf("a repeat create must return the live row, not launch again: %+v created=%v (%v)", live, created, err)
-	}
-	got, err := s.EyesTask("task-1")
+	got, err := s.EyesTask(task.TaskID)
 	if err != nil || got.State != "queued" || got.LauncherSession != "broker-1" || got.CreatedAt != now.Unix() {
 		t.Fatalf("stored task: %+v (%v)", got, err)
 	}
@@ -385,11 +781,11 @@ func TestEyesTaskOwnershipAndHousekeep(t *testing.T) {
 		t.Fatalf("unknown task: %v", err)
 	}
 	stranger := protocol.AgentRef{Name: nB, AgentID: agentID("s-b"), Scope: "/r"}
-	if _, err := s.CancelEyesTask("task-1", stranger); !errors.Is(err, ErrNotYourTask) {
+	if _, err := s.CancelEyesTask(task.TaskID, stranger); !errors.Is(err, ErrNotYourTask) {
 		t.Fatalf("a stranger must not cancel: %v", err)
 	}
 	child := protocol.AgentRef{Name: childName, AgentID: agentID(ChildSessionID("s-a", "sub1")), Scope: "/r"}
-	cancelled, err := s.CancelEyesTask("task-1", child)
+	cancelled, err := s.CancelEyesTask(task.TaskID, child)
 	if err != nil || cancelled.State != "cancelled" || cancelled.LauncherSession != "broker-1" {
 		t.Fatalf("a bound child may cancel its parent's task: %+v (%v)", cancelled, err)
 	}
@@ -397,7 +793,7 @@ func TestEyesTaskOwnershipAndHousekeep(t *testing.T) {
 	if err := s.Housekeep(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.EyesTask("task-1"); !errors.Is(err, ErrUnknownTask) {
+	if _, err := s.EyesTask(task.TaskID); !errors.Is(err, ErrUnknownTask) {
 		t.Fatalf("a task older than 24h must be purged, got %v", err)
 	}
 }

@@ -3,11 +3,14 @@ package paths
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
 // The relay is opt-in, defaults to 127.0.0.1:7400, accepts an explicit
-// loopback host:port, and refuses anything reachable from the network.
+// loopback host:port with a numeric port, and refuses anything reachable from
+// the network. "localhost" is normalised to a literal address so the loopback
+// guarantee holds against the bind target, not against a resolver.
 func TestRelayListen(t *testing.T) {
 	cases := []struct {
 		env, want string
@@ -18,12 +21,17 @@ func TestRelayListen(t *testing.T) {
 		{env: "true", want: "127.0.0.1:7400"},
 		{env: "TRUE", want: "127.0.0.1:7400"},
 		{env: "127.0.0.1:0", want: "127.0.0.1:0"},
-		{env: "localhost:7401", want: "localhost:7401"},
+		{env: "localhost:7401", want: "127.0.0.1:7401"},
+		{env: "LocalHost:7401", want: "127.0.0.1:7401"},
 		{env: "[::1]:7402", want: "[::1]:7402"},
 		{env: "0.0.0.0:7400", wantErr: true},
 		{env: "192.168.1.10:7400", wantErr: true},
 		{env: ":7400", wantErr: true},
 		{env: "7400", wantErr: true},
+		{env: "127.0.0.1:http", wantErr: true},
+		{env: "127.0.0.1:-1", wantErr: true},
+		{env: "127.0.0.1:65536", wantErr: true},
+		{env: "127.0.0.1:99999", wantErr: true},
 	}
 	for _, c := range cases {
 		t.Setenv("AC_RELAY_LISTEN", c.env)
@@ -68,6 +76,67 @@ func TestRelayTokenCreateThenReuse(t *testing.T) {
 	t.Setenv("AC_TOKEN", "from-env")
 	if got, _ := RelayToken(); got != "from-env" {
 		t.Fatalf("AC_TOKEN must win, got %q", got)
+	}
+}
+
+// Concurrent first uses must settle on ONE token: the file is published
+// whole, so a racer never reads a half-written or empty secret, and no
+// temporary file is left behind.
+func TestRelayTokenConcurrentCreation(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("AC_DB", filepath.Join(dir, "coordinator.db"))
+	t.Setenv("AC_TOKEN", "")
+	const n = 12
+	tokens := make([]string, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			tokens[i], errs[i] = RelayToken()
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil || len(tokens[i]) != 64 {
+			t.Fatalf("goroutine %d: token %q (%v)", i, tokens[i], err)
+		}
+		if tokens[i] != tokens[0] {
+			t.Fatalf("goroutine %d got %q, goroutine 0 got %q: one token only", i, tokens[i], tokens[0])
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != "relay.token" && e.Name() != "coordinator.db" {
+			t.Fatalf("publishing must leave no temporary behind, found %q", e.Name())
+		}
+	}
+}
+
+// ClientAddr is what a client dials: AC_ADDR verbatim when set, otherwise
+// today's unix socket.
+func TestClientAddr(t *testing.T) {
+	t.Setenv("AC_SOCKET", "/tmp/ac-test.sock")
+	t.Setenv("AC_ADDR", "")
+	if got, want := ClientAddr(), "unix:///tmp/ac-test.sock"; got != want {
+		t.Fatalf("unset AC_ADDR -> %q, want %q", got, want)
+	}
+	for _, c := range []struct{ env, want string }{
+		{"tcp://127.0.0.1:7400", "tcp://127.0.0.1:7400"},
+		{"unix:///run/other.sock", "unix:///run/other.sock"},
+		{"  tcp://127.0.0.1:7400  ", "tcp://127.0.0.1:7400"},
+	} {
+		t.Setenv("AC_ADDR", c.env)
+		if got := ClientAddr(); got != c.want {
+			t.Fatalf("AC_ADDR=%q -> %q, want %q", c.env, got, c.want)
+		}
 	}
 }
 

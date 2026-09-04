@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -15,20 +16,31 @@ import (
 )
 
 // hostScopePrefix marks the reserved broker scopes (host:<COMPUTERNAME>).
-// They are plumbing, not workspaces, so the workspace directory hides them
-// and ListEyes surfaces them instead.
+// They are plumbing, not workspaces, so the workspace directory hides them,
+// ListEyes surfaces them instead, and only a launcher living in one can be
+// handed a brief.
 const hostScopePrefix = "host:"
 
-// launcherWindow is how stale a launcher may be and still be handed a task.
-// A healthy launcher polls its inbox at least every 5s, so 30s means "still
-// polling" - much tighter than the 2 minute presence window.
-const launcherWindow = 30 * time.Second
+const (
+	// launcherWindow is how stale a launcher may be and still be handed a
+	// task. A healthy launcher polls its inbox at least every 5s, so 30s
+	// means "still polling" - much tighter than the 2 minute presence window.
+	launcherWindow = 30 * time.Second
+	// staleTaskWindow is how long an unfinished task keeps its launcher
+	// reserved. Past it the broker has died or lost the job, and the ledger
+	// row must not hold the host out of service until the 24h purge.
+	staleTaskWindow = 30 * time.Minute
+	// The requester's bound on one host job, applied where the launch body is
+	// built so every caller gets the same rule.
+	eyesDeadlineDefault = 300
+	eyesDeadlineMax     = 1800
+)
 
 var (
 	// ErrNoSession: no agent row exists for that session id at all.
 	ErrNoSession = errors.New("no session")
-	// ErrForeignSession: the row exists but did not come in over the relay,
-	// so no relay client may act as it.
+	// ErrForeignSession: the row exists but is not this caller's to act as -
+	// it came in locally, or it names another scope, kind or origin.
 	ErrForeignSession = errors.New("foreign session")
 	// ErrRelayAuth: the presented session secret did not match.
 	ErrRelayAuth = errors.New("unauthorized")
@@ -39,10 +51,14 @@ var (
 	// ErrUnknownTask / ErrNotYourTask guard the eyes task ledger.
 	ErrUnknownTask = errors.New("unknown task")
 	ErrNotYourTask = errors.New("not your task")
+	// ErrTaskNotLive: the task has settled, so it can gain no child.
+	ErrTaskNotLive = errors.New("task is not live")
+	// ErrBadTransition: the requested state move is not one the lifecycle has.
+	ErrBadTransition = errors.New("invalid task transition")
 )
 
 // secretHex returns n CSPRNG bytes as hex - the shape used for per-session
-// relay secrets.
+// relay secrets and for task ids.
 func secretHex(n int) (string, error) {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
@@ -77,33 +93,36 @@ type RelayRegistration struct {
 // when the relay row is created.
 type RelayResult struct{ Name, Secret string }
 
-// RegisterRelay registers a kind-bearing agent. Such a row is always its own
-// identity - it never binds to a hook agent - and a row created over the
-// relay gets a secret whose sha256 is all the store keeps. A broker keeps one
-// session across reconnects, so re-registering means presenting that secret.
+// RegisterRelay registers a kind-bearing agent. A relay session id names
+// exactly ONE row: scope, kind and origin are fixed when it is created, and a
+// re-register refreshes only platform and caps, so holding a secret can never
+// move or clone an identity. Row and metadata are written in one transaction
+// - a half-registered row could never be re-claimed. A row created over the
+// relay gets a secret whose sha256 is all the store keeps; re-registering it
+// means presenting that secret, which is how a restarted broker resumes.
 func (s *Store) RegisterRelay(r RelayRegistration) (RelayResult, error) {
 	if r.Kind != protocol.KindEyes && r.Kind != protocol.KindLauncher {
 		return RelayResult{}, errors.New("register: kind must be eyes or launcher")
 	}
-	prior, err := s.AgentBySession(r.SessionID)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return RelayResult{}, err
+	}
+	defer tx.Rollback()
+	// Read the prior row inside the tx: with the checks and the write in one
+	// transaction, two racing registrations cannot both believe they minted
+	// this session's secret.
+	prior, err := s.agentBySession(tx, r.SessionID)
 	switch {
 	case errors.Is(err, ErrNoSession): // a brand new session needs no proof
 	case err != nil:
 		return RelayResult{}, err
-	case prior.secretHash != "": // an existing relay row is re-claimed only by its holder
-		if _, err := s.VerifyRelaySecret(r.SessionID, r.Secret); err != nil {
-			return RelayResult{}, err
-		}
-	case r.Origin == "relay": // a session minted locally is not the relay's to take
+	case prior.Scope != r.Scope, prior.Origin != r.Origin, prior.Kind != "" && prior.Kind != r.Kind:
 		return RelayResult{}, ErrForeignSession
-	}
-	source := "join"
-	if r.Origin == "relay" {
-		source = "relay"
-	}
-	name, err := s.Register(r.Scope, r.SessionID, source)
-	if err != nil {
-		return RelayResult{}, err
+	case prior.secretHash != "": // an existing relay row is re-claimed only by its holder
+		if subtle.ConstantTimeCompare([]byte(sha256Hex(r.Secret)), []byte(prior.secretHash)) != 1 {
+			return RelayResult{}, ErrRelayAuth
+		}
 	}
 	caps := r.Capabilities
 	if caps == nil {
@@ -120,9 +139,71 @@ func (s *Store) RegisterRelay(r RelayRegistration) (RelayResult, error) {
 		}
 		hash = sha256Hex(secret)
 	}
-	if _, err := s.db.Exec(`UPDATE agents SET kind=?, origin=?, platform=?, caps=?, relay_secret_hash=?
+	source := "join"
+	if r.Origin == "relay" {
+		source = "relay"
+	}
+	name, err := s.register(tx, r.Scope, r.SessionID, source)
+	if err != nil {
+		return RelayResult{}, err
+	}
+	if _, err := tx.Exec(`UPDATE agents SET kind=?, origin=?, platform=?, caps=?, relay_secret_hash=?
 		WHERE scope=? AND session_id=?`, r.Kind, r.Origin, r.Platform, string(capsJSON), hash,
 		r.Scope, r.SessionID); err != nil {
+		return RelayResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return RelayResult{}, err
+	}
+	return RelayResult{Name: name, Secret: secret}, nil
+}
+
+// ReissueEyesChild re-mints the child session of a live task on its assigned
+// launcher's authority: session "eyes-<task_id>" in the task's requester
+// scope, with a fresh secret that replaces any earlier one. Without it a lost
+// register response strands the task - only the child may report, and only
+// the launcher knows its secret. The CALLER proves the launcher first
+// (VerifyRelaySecret on launcherSession); this is the store half.
+func (s *Store) ReissueEyesChild(taskID, launcherSession string) (RelayResult, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return RelayResult{}, err
+	}
+	defer tx.Rollback()
+	t, err := s.eyesTask(tx, taskID)
+	if err != nil {
+		return RelayResult{}, err
+	}
+	if t.LauncherSession != launcherSession {
+		return RelayResult{}, ErrNotYourTask
+	}
+	if t.State != "queued" && t.State != "accepted" {
+		return RelayResult{}, ErrTaskNotLive
+	}
+	session := "eyes-" + taskID
+	// The child belongs to the requester's workspace and nowhere else; a row
+	// for that session in another scope is somebody else's identity.
+	var scope string
+	switch err := tx.QueryRow(`SELECT scope FROM agents WHERE session_id=?`, session).Scan(&scope); {
+	case err == sql.ErrNoRows:
+	case err != nil:
+		return RelayResult{}, err
+	case scope != t.RequesterScope:
+		return RelayResult{}, ErrForeignSession
+	}
+	secret, err := secretHex(32)
+	if err != nil {
+		return RelayResult{}, err
+	}
+	name, err := s.register(tx, t.RequesterScope, session, "relay")
+	if err != nil {
+		return RelayResult{}, err
+	}
+	if _, err := tx.Exec(`UPDATE agents SET kind=?, origin='relay', relay_secret_hash=?
+		WHERE scope=? AND session_id=?`, protocol.KindEyes, sha256Hex(secret), t.RequesterScope, session); err != nil {
+		return RelayResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return RelayResult{}, err
 	}
 	return RelayResult{Name: name, Secret: secret}, nil
@@ -137,10 +218,14 @@ type RelayIdentity struct {
 
 // AgentBySession finds a row by session id across scopes - the relay's one
 // non-scoped identity read. A relay session id is minted per broker and per
-// child, so it names exactly one row.
+// child and cannot change scope, so it names exactly one row.
 func (s *Store) AgentBySession(sessionID string) (RelayIdentity, error) {
+	return s.agentBySession(s.db, sessionID)
+}
+
+func (s *Store) agentBySession(q execQuerier, sessionID string) (RelayIdentity, error) {
 	var id RelayIdentity
-	err := s.db.QueryRow(`SELECT scope, name, agent_id, kind, origin, relay_secret_hash FROM agents
+	err := q.QueryRow(`SELECT scope, name, agent_id, kind, origin, relay_secret_hash FROM agents
 		WHERE session_id=? ORDER BY registered_at LIMIT 1`, sessionID).
 		Scan(&id.Scope, &id.Name, &id.AgentID, &id.Kind, &id.Origin, &id.secretHash)
 	if err == sql.ErrNoRows {
@@ -246,20 +331,31 @@ func (s *Store) ListEyes() ([]protocol.AgentInfo, error) {
 // LauncherRef addresses the host broker chosen for a task.
 type LauncherRef struct{ SessionID, Scope, Name, AgentID string }
 
-// PickLauncher returns a launcher that is still polling and not already
-// running a job. The freshness window is 30s rather than the 2 minute
-// presence window, because a launcher that went quiet cannot pick a task up.
+// PickLauncher returns a broker that is still polling and not already running
+// a job. A broker is a relay-registered launcher in a reserved host: scope -
+// a local agent calling itself a launcher is not one. The freshness window is
+// 30s rather than the 2 minute presence window, because a launcher that went
+// quiet cannot pick a task up.
 func (s *Store) PickLauncher() (LauncherRef, error) {
+	return s.pickLauncher(s.db)
+}
+
+func (s *Store) pickLauncher(q execQuerier) (LauncherRef, error) {
 	var l LauncherRef
 	var busy bool
+	now := s.Now()
 	// Free launchers sort first, so a busy row coming back means every live
 	// launcher is busy - which the caller must report differently from "none".
-	err := s.db.QueryRow(`SELECT a.session_id, a.scope, a.name, a.agent_id,
+	// A task nobody has advanced for staleTaskWindow is abandoned, not in
+	// flight, and stops reserving its launcher.
+	err := q.QueryRow(`SELECT a.session_id, a.scope, a.name, a.agent_id,
 		EXISTS(SELECT 1 FROM eyes_tasks t WHERE t.launcher_session = a.session_id
-		       AND t.state IN ('queued','accepted')) AS busy
-		FROM agents a WHERE a.kind=? AND a.status != 'gone' AND a.last_seen >= ?
+		       AND t.state IN ('queued','accepted') AND t.updated_at >= ?) AS busy
+		FROM agents a WHERE a.kind=? AND a.origin='relay' AND a.scope LIKE ?
+		AND a.status != 'gone' AND a.last_seen >= ?
 		ORDER BY busy, a.last_seen DESC LIMIT 1`,
-		protocol.KindLauncher, s.Now().Add(-launcherWindow).Unix()).
+		now.Add(-staleTaskWindow).Unix(), protocol.KindLauncher, hostScopePrefix+"%",
+		now.Add(-launcherWindow).Unix()).
 		Scan(&l.SessionID, &l.Scope, &l.Name, &l.AgentID, &busy)
 	switch {
 	case err == sql.ErrNoRows:
@@ -279,32 +375,89 @@ type EyesTask struct {
 	CreatedAt, UpdatedAt                                                      int64
 }
 
-// CreateEyesTask records a newly minted task as queued and reports whether
-// this call is the one that created it. task_id is the primary key, so a
-// repeat is not a second launch: the live row comes back with created false
-// and the caller must not send another task.launch - browser actions have
-// side effects.
-func (s *Store) CreateEyesTask(t EyesTask) (EyesTask, bool, error) {
-	now := s.Now().Unix()
-	res, err := s.db.Exec(`INSERT INTO eyes_tasks
-		(task_id, requester_scope, requester_agent_id, launcher_session, runtime, state, created_at, updated_at)
-		VALUES (?,?,?,?,?,'queued',?,?) ON CONFLICT(task_id) DO NOTHING`,
-		t.TaskID, t.RequesterScope, t.RequesterAgentID, t.LauncherSession, t.Runtime, now, now)
+// EyesRequest is one request_eyes: who is asking (stamped by the daemon from
+// the authenticated session), what to run and how long it may take.
+type EyesRequest struct {
+	Requester protocol.AgentRef
+	Runtime   string
+	Brief     string
+	DeadlineS int
+}
+
+// AssignEyesTask reserves a launcher, queues the task and delivers
+// task.launch to that launcher in ONE transaction, so two concurrent requests
+// cannot take the same broker and a queued task always has the mail that
+// starts it. The task id is minted here, so there is no id a caller could
+// replay: every accepted call is a new task by construction.
+func (s *Store) AssignEyesTask(req EyesRequest) (EyesTask, protocol.AgentRef, error) {
+	suffix, err := secretHex(6) // "task-" + 12 lowercase hex
 	if err != nil {
-		return EyesTask{}, false, err
+		return EyesTask{}, protocol.AgentRef{}, err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		live, err := s.EyesTask(t.TaskID)
-		return live, false, err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return EyesTask{}, protocol.AgentRef{}, err
 	}
-	t.State, t.CreatedAt, t.UpdatedAt = "queued", now, now
-	return t, true, nil
+	defer tx.Rollback()
+	l, err := s.pickLauncher(tx)
+	if err != nil {
+		return EyesTask{}, protocol.AgentRef{}, err
+	}
+	now := s.Now().Unix()
+	t := EyesTask{TaskID: "task-" + suffix, RequesterScope: req.Requester.Scope,
+		RequesterAgentID: req.Requester.AgentID, LauncherSession: l.SessionID,
+		Runtime: req.Runtime, State: "queued", CreatedAt: now, UpdatedAt: now}
+	if _, err := tx.Exec(`INSERT INTO eyes_tasks
+		(task_id, requester_scope, requester_agent_id, launcher_session, runtime, state, created_at, updated_at)
+		VALUES (?,?,?,?,?,'queued',?,?)`,
+		t.TaskID, t.RequesterScope, t.RequesterAgentID, t.LauncherSession, t.Runtime, now, now); err != nil {
+		return EyesTask{}, protocol.AgentRef{}, err
+	}
+	body, err := json.Marshal(protocol.TaskLaunchMsg{Type: protocol.TaskLaunch, TaskID: t.TaskID,
+		Runtime: req.Runtime, Scope: req.Requester.Scope, Brief: req.Brief,
+		ReplyTo: req.Requester, DeadlineS: eyesDeadline(req.DeadlineS)})
+	if err != nil {
+		return EyesTask{}, protocol.AgentRef{}, err
+	}
+	if err := s.sendToScope(tx, Delivery{FromScope: req.Requester.Scope, FromName: senderKey(req.Requester),
+		ToScope: l.Scope, ToName: l.AgentID, Body: string(body), ReplyTo: &req.Requester,
+		TaskID: t.TaskID}); err != nil {
+		return EyesTask{}, protocol.AgentRef{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return EyesTask{}, protocol.AgentRef{}, err
+	}
+	return t, protocol.AgentRef{Name: l.Name, AgentID: l.AgentID, Scope: l.Scope}, nil
+}
+
+// senderKey addresses an agent by its id when there is one - the name is the
+// fallback for refs a caller built by name.
+func senderKey(ref protocol.AgentRef) string {
+	if ref.AgentID != "" {
+		return ref.AgentID
+	}
+	return ref.Name
+}
+
+// eyesDeadline bounds one host job: 300s unless asked otherwise, 1800s max.
+func eyesDeadline(d int) int {
+	switch {
+	case d <= 0:
+		return eyesDeadlineDefault
+	case d > eyesDeadlineMax:
+		return eyesDeadlineMax
+	}
+	return d
 }
 
 // EyesTask reads one task; an id nobody minted is ErrUnknownTask.
 func (s *Store) EyesTask(taskID string) (EyesTask, error) {
+	return s.eyesTask(s.db, taskID)
+}
+
+func (s *Store) eyesTask(q execQuerier, taskID string) (EyesTask, error) {
 	var t EyesTask
-	err := s.db.QueryRow(`SELECT task_id, requester_scope, requester_agent_id, launcher_session,
+	err := q.QueryRow(`SELECT task_id, requester_scope, requester_agent_id, launcher_session,
 		runtime, state, created_at, updated_at FROM eyes_tasks WHERE task_id=?`, taskID).
 		Scan(&t.TaskID, &t.RequesterScope, &t.RequesterAgentID, &t.LauncherSession,
 			&t.Runtime, &t.State, &t.CreatedAt, &t.UpdatedAt)
@@ -314,17 +467,66 @@ func (s *Store) EyesTask(taskID string) (EyesTask, error) {
 	return t, err
 }
 
-// SetEyesTaskState advances a task through queued|accepted|done|failed|cancelled.
-func (s *Store) SetEyesTaskState(taskID, state string) error {
-	res, err := s.db.Exec(`UPDATE eyes_tasks SET state=?, updated_at=? WHERE task_id=?`,
-		state, s.Now().Unix(), taskID)
+// TransitionEyesTask applies one validated lifecycle move and tells the
+// requester in the SAME transaction, so a re-sent report can never leave a
+// state change without its mail or add a second copy of it. The edges are
+// queued -> accepted by the assigned launcher, and queued|accepted -> done by
+// the child ("eyes-" + task_id) or -> failed by either. A repeat of a move
+// already made returns ok=false and writes nothing.
+func (s *Store) TransitionEyesTask(taskID, actorSession, to, body string) (EyesTask, bool, error) {
+	tx, err := s.db.Begin()
 	if err != nil {
-		return err
+		return EyesTask{}, false, err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrUnknownTask
+	defer tx.Rollback()
+	t, err := s.eyesTask(tx, taskID)
+	if err != nil {
+		return EyesTask{}, false, err
 	}
-	return nil
+	// Who may make this move at all: accepted is the assigned launcher's ack,
+	// done is the child's report, and either of them may fail the task.
+	child := "eyes-" + taskID
+	var mayAct bool
+	switch to {
+	case "accepted":
+		mayAct = actorSession == t.LauncherSession
+	case "done":
+		mayAct = actorSession == child
+	case "failed":
+		mayAct = actorSession == child || actorSession == t.LauncherSession
+	default:
+		return EyesTask{}, false, fmt.Errorf("%w: %q is not a task state", ErrBadTransition, to)
+	}
+	if !mayAct {
+		return EyesTask{}, false, ErrNotYourTask
+	}
+	if t.State == to {
+		return t, false, nil // the ack was lost, not the transition
+	}
+	// queued -> accepted -> done|failed, plus queued -> failed for a launcher
+	// that never accepted. A settled task moves nowhere.
+	if live := t.State == "queued" || t.State == "accepted"; !live || (to == "accepted" && t.State != "queued") {
+		return EyesTask{}, false, fmt.Errorf("%w: %s -> %s", ErrBadTransition, t.State, to)
+	}
+	actor, err := s.agentBySession(tx, actorSession)
+	if err != nil {
+		return EyesTask{}, false, err
+	}
+	now := s.Now().Unix()
+	if _, err := tx.Exec(`UPDATE eyes_tasks SET state=?, updated_at=? WHERE task_id=?`, to, now, taskID); err != nil {
+		return EyesTask{}, false, err
+	}
+	ref := protocol.AgentRef{Name: actor.Name, AgentID: actor.AgentID, Scope: actor.Scope}
+	if err := s.sendToScope(tx, Delivery{FromScope: actor.Scope, FromName: actor.AgentID,
+		ToScope: t.RequesterScope, ToName: t.RequesterAgentID, Body: body, ReplyTo: &ref,
+		TaskID: taskID}); err != nil {
+		return EyesTask{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return EyesTask{}, false, err
+	}
+	t.State, t.UpdatedAt = to, now
+	return t, true, nil
 }
 
 // CancelEyesTask authorizes a cancel against the recorded requester and
@@ -337,7 +539,9 @@ func (s *Store) CancelEyesTask(taskID string, caller protocol.AgentRef) (EyesTas
 	if !s.actsFor(t.RequesterScope, caller.AgentID, t.RequesterAgentID) {
 		return EyesTask{}, ErrNotYourTask
 	}
-	if err := s.SetEyesTaskState(taskID, "cancelled"); err != nil {
+	t.UpdatedAt = s.Now().Unix()
+	if _, err := s.db.Exec(`UPDATE eyes_tasks SET state='cancelled', updated_at=? WHERE task_id=?`,
+		t.UpdatedAt, taskID); err != nil {
 		return EyesTask{}, err
 	}
 	t.State = "cancelled"

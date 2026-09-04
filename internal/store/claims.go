@@ -47,7 +47,7 @@ func (s *Store) Claim(scope, name, path, note string) (ClaimResult, error) {
 	if path == "" {
 		return ClaimResult{}, errors.New("claim: path required")
 	}
-	aid, _, err := s.resolveAgent(scope, name)
+	aid, _, err := s.resolveAgent(s.db, scope, name)
 	if err != nil {
 		return ClaimResult{}, err
 	}
@@ -117,7 +117,7 @@ func (s *Store) holderLiveness(scope, holderID string) (name string, live bool, 
 // no-op success; releasing someone else's claim is refused.
 func (s *Store) Release(scope, name, path string) error {
 	path = strings.TrimSpace(path)
-	aid, _, err := s.resolveAgent(scope, name)
+	aid, _, err := s.resolveAgent(s.db, scope, name)
 	if err != nil {
 		return err
 	}

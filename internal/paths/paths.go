@@ -3,6 +3,7 @@ package paths
 import (
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Socket returns the coordinator socket path: AC_SOCKET wins, then the
@@ -32,4 +33,13 @@ func BindDir() (string, error) {
 	}
 	dir := filepath.Join(filepath.Dir(db), "bind")
 	return dir, os.MkdirAll(dir, 0o700)
+}
+
+// ClientAddr is where a client should reach the daemon: AC_ADDR when set
+// ("unix:///path" or "tcp://host:port"), otherwise today's unix socket.
+func ClientAddr() string {
+	if a := strings.TrimSpace(os.Getenv("AC_ADDR")); a != "" {
+		return a
+	}
+	return "unix://" + Socket()
 }

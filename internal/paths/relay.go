@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -33,19 +34,23 @@ func RelayListen() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("AC_RELAY_LISTEN %q: want host:port", v)
 	}
-	if !loopback(host) {
+	// Bind a literal address, never a name: "localhost" is whatever the
+	// resolver decides, so the loopback guarantee has to hold on the address
+	// that actually gets bound.
+	if strings.EqualFold(host, "localhost") {
+		host = "127.0.0.1"
+	}
+	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
 		return "", fmt.Errorf("AC_RELAY_LISTEN %q: the relay must listen on loopback", v)
 	}
-	return net.JoinHostPort(host, port), nil
-}
-
-// loopback reports whether a host string names this machine and nothing else.
-func loopback(host string) bool {
-	if strings.EqualFold(host, "localhost") {
-		return true
+	// A service name or a junk port would otherwise surface only as a bind
+	// failure, which degrades to unix-only in silence. 0 stays legal: it is
+	// "any free port", which is what tests bind.
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 0 || n > 65535 {
+		return "", fmt.Errorf("AC_RELAY_LISTEN %q: port must be a number in 0-65535", v)
 	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return net.JoinHostPort(host, strconv.Itoa(n)), nil
 }
 
 // RelayTokenPath is the shared relay token's file, next to the state
@@ -78,17 +83,35 @@ func RelayToken() (string, error) {
 		return "", err
 	}
 	token = hex.EncodeToString(b)
-	// O_EXCL settles a race between two creators on one token rather than two.
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if errors.Is(err, os.ErrExist) {
-		return readToken(path) // a racing creator won; use its token
-	}
+	return publishToken(path, token)
+}
+
+// publishToken makes the token file appear whole or not at all: a 0600
+// temporary in the same directory is written and flushed first, then linked
+// into place. First writer wins, so a racer reads the published token rather
+// than an empty file, and a crash leaves nothing to unwedge by hand.
+func publishToken(path, token string) (string, error) {
+	f, err := os.CreateTemp(filepath.Dir(path), ".relay.token-")
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer os.Remove(f.Name())
 	if _, err := f.WriteString(token + "\n"); err != nil {
+		f.Close()
 		return "", err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	if err := os.Link(f.Name(), path); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return "", err
+		}
+		return readToken(path) // a racing creator won; use its token
 	}
 	return token, nil
 }

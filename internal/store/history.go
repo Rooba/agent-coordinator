@@ -10,7 +10,7 @@ import (
 // agent; limit defaults to 20 and caps at 100. Purely read-only over the
 // retained messages+deliveries rows.
 func (s *Store) MessageHistory(scope, name, peer string, limit int) ([]protocol.HistoryInfo, error) {
-	aid, _, err := s.resolveAgent(scope, name)
+	aid, _, err := s.resolveAgent(s.db, scope, name)
 	if err != nil {
 		return nil, err
 	}
@@ -22,7 +22,7 @@ func (s *Store) MessageHistory(scope, name, peer string, limit int) ([]protocol.
 	}
 	cond, args := `(m.from_agent = ? OR d.agent_id = ?)`, []any{scope, aid, aid}
 	if peer != "" {
-		peerID, _, err := s.resolveAgent(scope, peer)
+		peerID, _, err := s.resolveAgent(s.db, scope, peer)
 		if err != nil {
 			return nil, err
 		}

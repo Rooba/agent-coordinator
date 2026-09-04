@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS eyes_tasks (
   state TEXT NOT NULL DEFAULT 'queued',
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_eyes_tasks_launcher_state ON eyes_tasks(launcher_session, state);
 `
 
 const (
@@ -76,6 +77,16 @@ const (
 type Store struct {
 	db  *sql.DB
 	Now func() time.Time
+}
+
+// execQuerier is *sql.DB or *sql.Tx. Writes that must be atomic take one, so
+// there is a single implementation whether or not a caller already holds a
+// transaction. With SetMaxOpenConns(1) a tx owns the only connection, so code
+// running inside one must never reach for s.db.
+type execQuerier interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	Query(query string, args ...any) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
 }
 
 func Open(path string) (*Store, error) {
@@ -123,11 +134,15 @@ func agentID(sessionID string) string {
 }
 
 func (s *Store) Register(scope, sessionID, source string) (string, error) {
+	return s.register(s.db, scope, sessionID, source)
+}
+
+func (s *Store) register(q execQuerier, scope, sessionID, source string) (string, error) {
 	now := s.Now().Unix()
 	var name string
-	err := s.db.QueryRow(`SELECT name FROM agents WHERE scope=? AND session_id=?`, scope, sessionID).Scan(&name)
+	err := q.QueryRow(`SELECT name FROM agents WHERE scope=? AND session_id=?`, scope, sessionID).Scan(&name)
 	if err == nil {
-		_, err = s.db.Exec(`UPDATE agents SET status='active', last_seen=? WHERE scope=? AND session_id=?`, now, scope, sessionID)
+		_, err = q.Exec(`UPDATE agents SET status='active', last_seen=? WHERE scope=? AND session_id=?`, now, scope, sessionID)
 		return name, err
 	}
 	if err != sql.ErrNoRows {
@@ -137,11 +152,11 @@ func (s *Store) Register(scope, sessionID, source string) (string, error) {
 	name = base
 	for n := 2; n <= 50; n++ {
 		var count int
-		if err := s.db.QueryRow(`SELECT COUNT(*) FROM agents WHERE scope=? AND name=?`, scope, name).Scan(&count); err != nil {
+		if err := q.QueryRow(`SELECT COUNT(*) FROM agents WHERE scope=? AND name=?`, scope, name).Scan(&count); err != nil {
 			return "", err
 		}
 		if count == 0 {
-			_, err := s.db.Exec(`INSERT INTO agents (scope, session_id, agent_id, name, status, registered_at, last_seen, source)
+			_, err := q.Exec(`INSERT INTO agents (scope, session_id, agent_id, name, status, registered_at, last_seen, source)
 				VALUES (?,?,?,?,'active',?,?,?)`, scope, sessionID, agentID(sessionID), name, now, now, source)
 			if err == nil {
 				return name, nil
@@ -151,7 +166,7 @@ func (s *Store) Register(scope, sessionID, source string) (string, error) {
 			}
 			// Unique race: either a concurrent Register won this session's PK
 			// (return its name) or took this name (try the next suffix).
-			if e := s.db.QueryRow(`SELECT name FROM agents WHERE scope=? AND session_id=?`, scope, sessionID).Scan(&name); e == nil {
+			if e := q.QueryRow(`SELECT name FROM agents WHERE scope=? AND session_id=?`, scope, sessionID).Scan(&name); e == nil {
 				return name, nil
 			}
 		}
@@ -391,8 +406,8 @@ func (s *Store) RecordEvent(scope, sessionID string, req protocol.Request) ([]st
 
 const conflictWindow = 30 * time.Minute
 
-func (s *Store) resolveAgent(scope, nameOrID string) (aid, name string, err error) {
-	err = s.db.QueryRow(`SELECT agent_id, name FROM agents WHERE scope=? AND (name=? OR agent_id=?)`,
+func (s *Store) resolveAgent(q execQuerier, scope, nameOrID string) (aid, name string, err error) {
+	err = q.QueryRow(`SELECT agent_id, name FROM agents WHERE scope=? AND (name=? OR agent_id=?)`,
 		scope, nameOrID, nameOrID).Scan(&aid, &name)
 	if err == sql.ErrNoRows {
 		return "", "", fmt.Errorf("no agent %q in this workspace", nameOrID)
@@ -412,18 +427,33 @@ type Delivery struct {
 	TaskID    string
 }
 
-// SendToScope is the one write path for mail: unicast when ToName is set,
-// otherwise a broadcast to everyone else live in the target scope. The row
-// lands in the RECIPIENT's scope, so peek, read, wait and history keep
-// working untouched, and from_scope appears only when the sender is
-// somewhere else.
+// SendToScope is the one write path for mail, and one transaction: unicast
+// when ToName is set, otherwise a broadcast to everyone else live in the
+// target scope. The row lands in the RECIPIENT's scope, so peek, read, wait
+// and history keep working untouched, and from_scope appears only when the
+// sender is somewhere else.
 func (s *Store) SendToScope(d Delivery) error {
-	fromID, _, err := s.resolveAgent(d.FromScope, d.FromName)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := s.sendToScope(tx, d); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// sendToScope writes one message and its deliveries through q. Callers that
+// already hold a transaction (assigning an eyes task, advancing one) pass it
+// in, so a task never exists without the mail that announces it.
+func (s *Store) sendToScope(q execQuerier, d Delivery) error {
+	fromID, _, err := s.resolveAgent(q, d.FromScope, d.FromName)
 	if err != nil {
 		return err
 	}
 	var kind string
-	s.db.QueryRow(`SELECT kind FROM agents WHERE scope=? AND agent_id=?`, d.FromScope, fromID).Scan(&kind)
+	q.QueryRow(`SELECT kind FROM agents WHERE scope=? AND agent_id=?`, d.FromScope, fromID).Scan(&kind)
 	toScope, fromScope := d.ToScope, ""
 	if toScope == "" {
 		toScope = d.FromScope
@@ -434,12 +464,12 @@ func (s *Store) SendToScope(d Delivery) error {
 	var toID any // NULL addresses everyone live in the scope
 	var targets []string
 	if d.ToName != "" {
-		id, _, err := s.resolveAgent(toScope, d.ToName)
+		id, _, err := s.resolveAgent(q, toScope, d.ToName)
 		if err != nil {
 			return err
 		}
 		toID, targets = id, []string{id}
-	} else if targets, err = s.liveAgents(toScope, fromID); err != nil {
+	} else if targets, err = s.liveAgents(q, toScope, fromID); err != nil {
 		return err
 	}
 	replyTo := ""
@@ -450,7 +480,7 @@ func (s *Store) SendToScope(d Delivery) error {
 		}
 		replyTo = string(b)
 	}
-	res, err := s.db.Exec(`INSERT INTO messages
+	res, err := q.Exec(`INSERT INTO messages
 		(scope, from_agent, to_agent, body, created_at, from_scope, reply_to, task_id, kind)
 		VALUES (?,?,?,?,?,?,?,?,?)`,
 		toScope, fromID, toID, d.Body, s.Now().Unix(), fromScope, replyTo, d.TaskID, kind)
@@ -459,7 +489,7 @@ func (s *Store) SendToScope(d Delivery) error {
 	}
 	mid, _ := res.LastInsertId()
 	for _, aid := range targets {
-		if _, err := s.db.Exec(`INSERT INTO deliveries (message_id, agent_id) VALUES (?,?)`, mid, aid); err != nil {
+		if _, err := q.Exec(`INSERT INTO deliveries (message_id, agent_id) VALUES (?,?)`, mid, aid); err != nil {
 			return err
 		}
 	}
@@ -469,8 +499,8 @@ func (s *Store) SendToScope(d Delivery) error {
 // liveAgents lists the active or idle agent ids in a scope, minus the
 // sender. Collected before any write: with SetMaxOpenConns(1) an open cursor
 // holds the sole connection.
-func (s *Store) liveAgents(scope, exceptID string) ([]string, error) {
-	rows, err := s.db.Query(`SELECT agent_id, status, last_seen FROM agents WHERE scope=? AND agent_id != ?`, scope, exceptID)
+func (s *Store) liveAgents(q execQuerier, scope, exceptID string) ([]string, error) {
+	rows, err := q.Query(`SELECT agent_id, status, last_seen FROM agents WHERE scope=? AND agent_id != ?`, scope, exceptID)
 	if err != nil {
 		return nil, err
 	}
@@ -500,7 +530,7 @@ func (s *Store) Broadcast(scope, fromName, body string) error {
 }
 
 func (s *Store) Read(scope, name string) ([]protocol.Message, error) {
-	aid, _, err := s.resolveAgent(scope, name)
+	aid, _, err := s.resolveAgent(s.db, scope, name)
 	if err != nil {
 		return nil, err
 	}
@@ -582,7 +612,7 @@ type PeekInfo struct {
 // agent's high-water mark (max delivered message id, read or unread).
 // Strictly read-only - never touches notice_sent_at or read_at.
 func (s *Store) PeekMail(scope, name string, afterID int64) (PeekInfo, error) {
-	aid, _, err := s.resolveAgent(scope, name)
+	aid, _, err := s.resolveAgent(s.db, scope, name)
 	if err != nil {
 		return PeekInfo{}, err
 	}
