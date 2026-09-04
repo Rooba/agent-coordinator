@@ -86,6 +86,22 @@ func doJoin(args []string, stdout, stderr io.Writer) error {
 	if sessionID == "" {
 		sessionID = fmt.Sprintf("join-%d-%d", os.Getpid(), time.Now().UnixNano())
 	}
+	secret := strings.TrimSpace(os.Getenv("AC_SESSION_SECRET"))
+	if secret == "" {
+		secret = loaded.SessionSecret
+	}
+	if isTCPAddr(addr) {
+		if secret == "" {
+			s, err := generateSessionSecret()
+			if err != nil {
+				return err
+			}
+			secret = s
+		}
+		if err := saveCred(credPath, sessionCred{SessionID: sessionID, SessionSecret: secret}); err != nil {
+			return fmt.Errorf("write cred file: %w", err)
+		}
+	}
 	req := protocol.Request{
 		Op:        protocol.OpRegister,
 		Scope:     sc,
@@ -100,6 +116,9 @@ func doJoin(args []string, stdout, stderr io.Writer) error {
 	if err := applyRelayAuth(&req, addr, credPath); err != nil {
 		return err
 	}
+	if secret != "" {
+		req.SessionSecret = secret
+	}
 	resp, err := once(addr, req)
 	if err != nil || resp.Name == "" {
 		errMsg := resp.Error
@@ -110,19 +129,6 @@ func doJoin(args []string, stdout, stderr io.Writer) error {
 			errMsg = "register failed"
 		}
 		return fmt.Errorf("%s", errMsg)
-	}
-	if credPath != "" {
-		secret := resp.SessionSecret
-		if secret == "" {
-			secret = loaded.SessionSecret
-		}
-		if err := saveCred(credPath, sessionCred{SessionID: sessionID, SessionSecret: secret}); err != nil {
-			dereg := protocol.Request{Op: protocol.OpDeregister, Scope: sc, SessionID: sessionID, SessionSecret: resp.SessionSecret}
-			_ = applyRelayAuth(&dereg, addr, credPath)
-			dereg.SessionSecret = resp.SessionSecret
-			_, _ = once(addr, dereg)
-			return fmt.Errorf("write cred file: %w", err)
-		}
 	}
 	fmt.Fprintf(stdout, "[coordinator] you are '%s' in this workspace. Peer tools (MCP agent-coordinator): status_board, list_agents, send_message, read_messages, broadcast. "+
 		"To be wakeable while waiting or delegating, arm a background task first: agent-coordinator wait '%s' - it exits the moment new mail arrives and the harness re-invokes you.\n",

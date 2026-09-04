@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -70,6 +72,14 @@ func applyRelayAuth(req *protocol.Request, addr, credFile string) error {
 	req.Token = token
 	req.SessionSecret = secret
 	return nil
+}
+
+func generateSessionSecret() (string, error) {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 func loadCred(path string) (sessionCred, error) {

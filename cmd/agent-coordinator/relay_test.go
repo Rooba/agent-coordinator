@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net"
@@ -104,8 +105,14 @@ func TestJoinTCPDoesNotLeakSecret(t *testing.T) {
 		t.Fatalf("stdout: %s", stdout.String())
 	}
 	stored, err := loadCred(cred)
-	if err != nil || stored.SessionSecret != secret || stored.SessionID != "join-test-1" {
+	if err != nil || stored.SessionID != "join-test-1" {
 		t.Fatalf("cred file: %+v %v", stored, err)
+	}
+	if _, err := hex.DecodeString(stored.SessionSecret); err != nil || len(stored.SessionSecret) != 64 {
+		t.Fatalf("generated secret must be 64 hex: %q", stored.SessionSecret)
+	}
+	if strings.Contains(out, stored.SessionSecret) {
+		t.Fatalf("generated secret leaked: %s", out)
 	}
 	st, err := os.Stat(cred)
 	if err != nil || st.Mode().Perm() != 0o600 {
@@ -113,8 +120,9 @@ func TestJoinTCPDoesNotLeakSecret(t *testing.T) {
 	}
 	seen := <-got
 	if seen.Token != token || seen.Kind != protocol.KindEyes || seen.Platform != "windows" ||
-		len(seen.Capabilities) != 1 || seen.Capabilities[0] != "browser.chrome" {
-		t.Fatalf("register: %+v", seen)
+		len(seen.Capabilities) != 1 || seen.Capabilities[0] != "browser.chrome" ||
+		seen.SessionSecret != stored.SessionSecret {
+		t.Fatalf("register: %+v want secret %s", seen, stored.SessionSecret)
 	}
 }
 
@@ -170,18 +178,10 @@ func TestJoinPersistFailBeforeSuccess(t *testing.T) {
 	if stdout.Len() != 0 {
 		t.Fatalf("success printed before persist: %s", stdout.String())
 	}
-	// register then best-effort deregister
-	first := <-dereg
-	if first.Op != protocol.OpRegister {
-		t.Fatalf("first op %s", first.Op)
-	}
 	select {
-	case second := <-dereg:
-		if second.Op != protocol.OpDeregister || second.SessionSecret != "sec" || second.SessionID != "join-fail-1" {
-			t.Fatalf("deregister must carry session secret: %+v", second)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("expected deregister after persist fail")
+	case req := <-dereg:
+		t.Fatalf("persist fail must not register: %+v", req)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 
@@ -227,8 +227,8 @@ func TestJoinReusesCredSessionID(t *testing.T) {
 		t.Fatalf("want reused session id, got %s", seen.SessionID)
 	}
 	stored, err := loadCred(cred)
-	if err != nil || stored.SessionID != "saved-session" || stored.SessionSecret != "new-secret" {
-		t.Fatalf("updated cred: %+v %v", stored, err)
+	if err != nil || stored.SessionID != "saved-session" || stored.SessionSecret != "old-secret" {
+		t.Fatalf("existing secret must be reused: %+v %v", stored, err)
 	}
 }
 
