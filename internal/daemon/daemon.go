@@ -86,15 +86,80 @@ var fromOps = map[string]bool{
 	protocol.OpHistory: true,
 }
 
+// relayReady is a test seam: a test binds 127.0.0.1:0 and needs the port the
+// OS picked. Production ignores it.
+var relayReady = func(string) {}
+
+// relayListener binds the opt-in loopback TCP relay. Anything that stops it -
+// no AC_RELAY_LISTEN, a non-loopback address, a taken port, an unreadable
+// token - logs and returns nil: a missing relay must never take down local
+// coordination.
+func relayListener(st *store.Store) (net.Listener, *relayGate) {
+	addr, err := paths.RelayListen()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "relay: %v\n", err)
+		return nil, nil
+	}
+	if addr == "" {
+		return nil, nil
+	}
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "relay: listen %s: %v\n", addr, err)
+		return nil, nil
+	}
+	// The token is resolved once the relay is really up, so a daemon that
+	// never listens leaves no secret lying around.
+	gate := &relayGate{st: st}
+	if paths.RelayInsecure() {
+		fmt.Fprintf(os.Stderr, "relay: WARNING AC_RELAY_INSECURE is set - the shared token is NOT checked\n")
+	} else if gate.token, err = paths.RelayToken(); err != nil {
+		fmt.Fprintf(os.Stderr, "relay: token: %v\n", err)
+		l.Close()
+		return nil, nil
+	}
+	fmt.Fprintf(os.Stderr, "relay: listening on %s\n", l.Addr())
+	relayReady(l.Addr().String())
+	return l, gate
+}
+
+// accept runs one listener's loop until it closes, handing each connection
+// its own goroutine. gate is nil for the unix listener: only relay
+// connections are authenticated.
+func accept(l net.Listener, st *store.Store, gate *relayGate, lastActivity *atomic.Int64, wg *sync.WaitGroup) error {
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			return err
+		}
+		lastActivity.Store(time.Now().UnixNano())
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			handle(conn, st, gate)
+		}()
+	}
+}
+
 func Serve(l net.Listener, st *store.Store, idleTimeout time.Duration) error {
 	st.Housekeep()
+	relay, gate := relayListener(st)
 
 	var lastActivity atomic.Int64
 	lastActivity.Store(time.Now().UnixNano())
-	done := make(chan struct{})         // closed when the accept loop ends
+	done := make(chan struct{})         // closed when the accept loops end
 	watchdogDone := make(chan struct{}) // closed when the watchdog goroutine exits
 	sigC := make(chan os.Signal, 1)
 	signal.Notify(sigC, syscall.SIGTERM, syscall.SIGINT)
+	closeListeners := func() {
+		l.Close()
+		if relay != nil {
+			relay.Close()
+		}
+	}
 
 	go func() {
 		defer close(watchdogDone)
@@ -106,13 +171,13 @@ func Serve(l net.Listener, st *store.Store, idleTimeout time.Duration) error {
 			select {
 			case <-tick.C:
 				if time.Since(time.Unix(0, lastActivity.Load())) > idleTimeout {
-					l.Close()
+					closeListeners()
 					return
 				}
 			case <-house.C:
 				st.Housekeep()
 			case <-sigC:
-				l.Close()
+				closeListeners()
 				return
 			case <-done:
 				return
@@ -120,37 +185,37 @@ func Serve(l net.Listener, st *store.Store, idleTimeout time.Duration) error {
 		}
 	}()
 
-	// Closing the listener - idle timeout, signal, or an external shutdown
-	// (tests, socket handover) - is the one clean way to end the accept loop.
+	// Closing the listeners - idle timeout, signal, or an external shutdown
+	// (tests, socket handover) - is the one clean way to end the accept loops.
+	// The relay loop holds a wait-group token of its own, so its
+	// per-connection Add can never race the Wait below.
 	var wg sync.WaitGroup
-	var serveErr error
-	for {
-		conn, err := l.Accept()
-		if err != nil {
-			if !errors.Is(err, net.ErrClosed) {
-				serveErr = err
-			}
-			break
-		}
-		lastActivity.Store(time.Now().UnixNano())
+	if relay != nil {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			handle(conn, st)
+			if err := accept(relay, st, gate, &lastActivity, &wg); err != nil {
+				fmt.Fprintf(os.Stderr, "relay: accept: %v\n", err)
+			}
 		}()
 	}
+	serveErr := accept(l, st, nil, &lastActivity, &wg)
 	// Deterministic teardown: join the watchdog, drain in-flight handlers,
 	// then close the store, so no goroutine or handle outlives Serve.
 	close(done)
 	signal.Stop(sigC)
-	l.Close()
+	closeListeners()
 	<-watchdogDone
 	wg.Wait()
 	st.Close()
 	return serveErr
 }
 
-func handle(conn net.Conn, st *store.Store) {
+// handle answers one framed request. The gate is nil on the unix socket,
+// where the socket directory's permissions are the trust boundary; on the
+// relay it authenticates the caller and rewrites the request before dispatch
+// ever sees it.
+func handle(conn net.Conn, st *store.Store, gate *relayGate) {
 	defer func() { _ = recover() }() // a panicking handler must not kill the daemon
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
@@ -162,6 +227,8 @@ func handle(conn net.Conn, st *store.Store) {
 	var resp protocol.Response
 	if err := json.Unmarshal(line, &req); err != nil {
 		resp = protocol.Response{Error: "bad request: " + err.Error()}
+	} else if gated, final := gate.check(&req); final {
+		resp = gated
 	} else {
 		resp = dispatch(st, req)
 	}
