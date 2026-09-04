@@ -281,6 +281,12 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 			}
 		}
 	}
+	// A task.* body is the eyes lifecycle reporting in, not mail: the store
+	// moves the task and delivers the requester's copy in one transaction, so a
+	// state change never exists without the message that announces it.
+	if resp, isReport := taskReport(st, req); isReport {
+		return resp
+	}
 	switch req.Op {
 	case protocol.OpRegister:
 		register := st.Register
@@ -341,8 +347,7 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 		}
 		return protocol.Response{OK: true, Agents: agents}
 	case protocol.OpSend:
-		if err := st.SendToScope(store.Delivery{FromScope: req.Scope, FromName: req.From,
-			ToName: req.To, Body: req.Body, TaskID: req.TaskID}); err != nil {
+		if err := st.Send(req.Scope, req.From, req.To, req.Body); err != nil {
 			return fail(err)
 		}
 	case protocol.OpRead:
@@ -350,12 +355,21 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 		if err != nil {
 			return fail(err)
 		}
-		return protocol.Response{OK: true, Messages: msgs}
+		launches, err := pendingLaunches(st, req)
+		if err != nil {
+			return fail(err)
+		}
+		return protocol.Response{OK: true, Messages: prependLaunches(launches, msgs)}
 	case protocol.OpPeek:
 		info, err := st.PeekMail(req.Scope, req.From, req.AfterID)
 		if err != nil {
 			return fail(err)
 		}
+		launches, err := pendingLaunches(st, req)
+		if err != nil {
+			return fail(err)
+		}
+		info = mergeLaunches(launches, info)
 		return protocol.Response{
 			OK: true, Unread: info.Unread, HighWater: info.HighWater,
 			PeekIDs: info.IDs, PeekFroms: info.Froms,
@@ -415,6 +429,10 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 		if err := st.SendToScope(d); err != nil {
 			return fail(err)
 		}
+	case protocol.OpRequestEyes:
+		return requestEyes(st, req, actor)
+	case protocol.OpCancelEyes:
+		return cancelEyes(st, req, actor)
 	default:
 		return fail(errors.New("unknown op " + req.Op))
 	}

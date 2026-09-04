@@ -39,7 +39,8 @@ var relayOps = map[string]bool{
 // logged here and answered "internal error".
 var relayWireErrors = []error{
 	store.ErrRelayAuth, store.ErrForeignSession, store.ErrEyesBusy, store.ErrNoLauncher,
-	store.ErrUnknownTask, store.ErrNotYourTask, store.ErrTaskNotLive, store.ErrBadTransition,
+	store.ErrNoProvider, store.ErrBadRuntime, store.ErrUnknownTask, store.ErrNotYourTask,
+	store.ErrTaskNotLive, store.ErrBadTransition,
 }
 
 // relayGate authenticates TCP requests and rewrites their identity from the
@@ -101,10 +102,10 @@ func (g *relayGate) decide(req *protocol.Request) (protocol.Response, bool) {
 	if err != nil {
 		return refuse(relayError(err))
 	}
-	// The row, never the caller, says who this is - and a relay client has no
-	// subagents, so an agent_id it sent would mint or retarget a child row in
-	// somebody else's workspace.
-	req.Scope, req.From, req.AgentID = id.Scope, id.Name, ""
+	// The row, never the caller, says who this is - its scope, its name and its
+	// role. A relay client has no subagents, so an agent_id it sent would mint
+	// or retarget a child row in somebody else's workspace.
+	req.Scope, req.From, req.Kind, req.AgentID = id.Scope, id.Name, id.Kind, ""
 	// A task id belongs to the eyes lifecycle, so ordinary mail never carries
 	// one a relay client chose.
 	switch req.Op {
