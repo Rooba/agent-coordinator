@@ -349,6 +349,13 @@ func TestPickLauncherRequiresRelayOriginAndHostScope(t *testing.T) {
 	if _, err := s.PickLauncher(); !errors.Is(err, ErrNoLauncher) {
 		t.Fatalf("a launcher outside a host: scope must not be pickable, got %v", err)
 	}
+	if _, err := s.RegisterRelay(RelayRegistration{Scope: "Host:BOX", SessionID: "case-1",
+		Kind: protocol.KindLauncher, Origin: "relay"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PickLauncher(); !errors.Is(err, ErrNoLauncher) {
+		t.Fatalf("host: is one exact prefix - a scope ListWorkspaces lists must not be pickable, got %v", err)
+	}
 	registerBroker(t, s, "host:BOX", "broker-1")
 	if l, err := s.PickLauncher(); err != nil || l.SessionID != "broker-1" {
 		t.Fatalf("the host broker: %+v (%v)", l, err)
@@ -530,10 +537,10 @@ func TestRegisterRelayIsOneTransaction(t *testing.T) {
 // one lost register response strands the task with nobody able to report.
 func TestReissueEyesChild(t *testing.T) {
 	s := open(t)
-	registerBroker(t, s, "host:BOX", "broker-1")
+	broker := registerBroker(t, s, "host:BOX", "broker-1")
 	seedTask(t, s, "task-1", "broker-1", "queued", s.Now().Unix())
 
-	child, err := s.ReissueEyesChild("task-1", "broker-1")
+	child, err := s.ReissueEyesChild("task-1", "broker-1", broker.Secret)
 	if err != nil || child.Name == "" || len(child.Secret) != 64 {
 		t.Fatalf("first reissue: %+v (%v)", child, err)
 	}
@@ -542,7 +549,7 @@ func TestReissueEyesChild(t *testing.T) {
 		t.Fatalf("the child must be an eyes row in the requester scope: %+v (%v)", id, err)
 	}
 	// A second reissue replaces the secret: the lost one stops working.
-	again, err := s.ReissueEyesChild("task-1", "broker-1")
+	again, err := s.ReissueEyesChild("task-1", "broker-1", broker.Secret)
 	if err != nil || again.Name != child.Name || again.Secret == child.Secret {
 		t.Fatalf("second reissue: %+v (%v)", again, err)
 	}
@@ -556,19 +563,37 @@ func TestReissueEyesChild(t *testing.T) {
 		t.Fatalf("reissuing must not clone the child row, got %d", n)
 	}
 
+	// Minting a credential takes the launcher's own secret, not just its name.
+	for _, bad := range []string{"", "wrong"} {
+		if _, err := s.ReissueEyesChild("task-1", "broker-1", bad); !errors.Is(err, ErrRelayAuth) {
+			t.Fatalf("launcher secret %q must be ErrRelayAuth, got %v", bad, err)
+		}
+	}
+	// A relay row that is not a launcher cannot mint a child even holding its
+	// own valid secret.
+	imposter, err := s.RegisterRelay(RelayRegistration{Scope: "/r", SessionID: "imposter-1",
+		Kind: protocol.KindEyes, Origin: "relay"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedTask(t, s, "task-5", "imposter-1", "queued", s.Now().Unix())
+	if _, err := s.ReissueEyesChild("task-5", "imposter-1", imposter.Secret); !errors.Is(err, ErrForeignSession) {
+		t.Fatalf("a non-launcher row must not mint a child, got %v", err)
+	}
+
 	seedTask(t, s, "task-2", "broker-2", "queued", s.Now().Unix())
-	if _, err := s.ReissueEyesChild("task-2", "broker-1"); !errors.Is(err, ErrNotYourTask) {
+	if _, err := s.ReissueEyesChild("task-2", "broker-1", broker.Secret); !errors.Is(err, ErrNotYourTask) {
 		t.Fatalf("another launcher's task must be ErrNotYourTask, got %v", err)
 	}
-	if _, err := s.ReissueEyesChild("task-nope", "broker-1"); !errors.Is(err, ErrUnknownTask) {
+	if _, err := s.ReissueEyesChild("task-nope", "broker-1", broker.Secret); !errors.Is(err, ErrUnknownTask) {
 		t.Fatalf("unknown task: %v", err)
 	}
 	seedTask(t, s, "task-3", "broker-1", "done", s.Now().Unix())
-	if _, err := s.ReissueEyesChild("task-3", "broker-1"); !errors.Is(err, ErrTaskNotLive) {
+	if _, err := s.ReissueEyesChild("task-3", "broker-1", broker.Secret); !errors.Is(err, ErrTaskNotLive) {
 		t.Fatalf("a settled task must mint no child, got %v", err)
 	}
 	seedTask(t, s, "task-4", "broker-1", "accepted", s.Now().Unix())
-	if _, err := s.ReissueEyesChild("task-4", "broker-1"); err != nil {
+	if _, err := s.ReissueEyesChild("task-4", "broker-1", broker.Secret); err != nil {
 		t.Fatalf("an accepted task is still live: %v", err)
 	}
 }
@@ -676,7 +701,7 @@ func TestTransitionEyesTaskEdgesActorsAndIdempotency(t *testing.T) {
 		t.Fatal(err)
 	}
 	childSession := "eyes-" + task.TaskID
-	child, err := s.ReissueEyesChild(task.TaskID, "broker-1")
+	child, err := s.ReissueEyesChild(task.TaskID, "broker-1", broker.Secret)
 	if err != nil {
 		t.Fatal(err)
 	}

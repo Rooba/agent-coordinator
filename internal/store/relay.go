@@ -162,9 +162,10 @@ func (s *Store) RegisterRelay(r RelayRegistration) (RelayResult, error) {
 // launcher's authority: session "eyes-<task_id>" in the task's requester
 // scope, with a fresh secret that replaces any earlier one. Without it a lost
 // register response strands the task - only the child may report, and only
-// the launcher knows its secret. The CALLER proves the launcher first
-// (VerifyRelaySecret on launcherSession); this is the store half.
-func (s *Store) ReissueEyesChild(taskID, launcherSession string) (RelayResult, error) {
+// the launcher knows its secret. The launcher proves itself here, in the same
+// transaction that mints the credential, so no gate check can go stale
+// between the two.
+func (s *Store) ReissueEyesChild(taskID, launcherSession, launcherSecret string) (RelayResult, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return RelayResult{}, err
@@ -179,6 +180,16 @@ func (s *Store) ReissueEyesChild(taskID, launcherSession string) (RelayResult, e
 	}
 	if t.State != "queued" && t.State != "accepted" {
 		return RelayResult{}, ErrTaskNotLive
+	}
+	launcher, err := s.agentBySession(tx, launcherSession)
+	if err != nil {
+		return RelayResult{}, err
+	}
+	if launcher.Origin != "relay" || launcher.Kind != protocol.KindLauncher {
+		return RelayResult{}, ErrForeignSession
+	}
+	if subtle.ConstantTimeCompare([]byte(sha256Hex(launcherSecret)), []byte(launcher.secretHash)) != 1 {
+		return RelayResult{}, ErrRelayAuth
 	}
 	session := "eyes-" + taskID
 	// The child belongs to the requester's workspace and nowhere else; a row
@@ -347,15 +358,16 @@ func (s *Store) pickLauncher(q execQuerier) (LauncherRef, error) {
 	// Free launchers sort first, so a busy row coming back means every live
 	// launcher is busy - which the caller must report differently from "none".
 	// A task nobody has advanced for staleTaskWindow is abandoned, not in
-	// flight, and stops reserving its launcher.
+	// flight, and stops reserving its launcher. substr rather than LIKE keeps
+	// host: one case-sensitive rule, the same one ListWorkspaces hides by.
 	err := q.QueryRow(`SELECT a.session_id, a.scope, a.name, a.agent_id,
 		EXISTS(SELECT 1 FROM eyes_tasks t WHERE t.launcher_session = a.session_id
 		       AND t.state IN ('queued','accepted') AND t.updated_at >= ?) AS busy
-		FROM agents a WHERE a.kind=? AND a.origin='relay' AND a.scope LIKE ?
+		FROM agents a WHERE a.kind=? AND a.origin='relay' AND substr(a.scope,1,?)=?
 		AND a.status != 'gone' AND a.last_seen >= ?
 		ORDER BY busy, a.last_seen DESC LIMIT 1`,
-		now.Add(-staleTaskWindow).Unix(), protocol.KindLauncher, hostScopePrefix+"%",
-		now.Add(-launcherWindow).Unix()).
+		now.Add(-staleTaskWindow).Unix(), protocol.KindLauncher,
+		len(hostScopePrefix), hostScopePrefix, now.Add(-launcherWindow).Unix()).
 		Scan(&l.SessionID, &l.Scope, &l.Name, &l.AgentID, &busy)
 	switch {
 	case err == sql.ErrNoRows:
@@ -517,7 +529,7 @@ func (s *Store) TransitionEyesTask(taskID, actorSession, to, body string) (EyesT
 		return EyesTask{}, false, err
 	}
 	ref := protocol.AgentRef{Name: actor.Name, AgentID: actor.AgentID, Scope: actor.Scope}
-	if err := s.sendToScope(tx, Delivery{FromScope: actor.Scope, FromName: actor.AgentID,
+	if err := s.sendToScope(tx, Delivery{FromScope: actor.Scope, FromName: senderKey(ref),
 		ToScope: t.RequesterScope, ToName: t.RequesterAgentID, Body: body, ReplyTo: &ref,
 		TaskID: taskID}); err != nil {
 		return EyesTask{}, false, err
