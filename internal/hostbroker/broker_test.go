@@ -22,11 +22,9 @@ var (
 )
 
 type memoryCredentials struct {
-	mu             sync.Mutex
-	value          Credential
-	saves          int
-	failSaves      int
-	tokenOnFailure string
+	mu    sync.Mutex
+	value Credential
+	saves int
 }
 
 func (s *memoryCredentials) Load(context.Context) (Credential, error) {
@@ -39,13 +37,6 @@ func (s *memoryCredentials) Update(_ context.Context, update func(*Credential) e
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.saves++
-	if s.failSaves > 0 {
-		s.failSaves--
-		if s.tokenOnFailure != "" {
-			s.value.Token = s.tokenOnFailure
-		}
-		return errors.New("credential store unavailable")
-	}
 	return update(&s.value)
 }
 
@@ -234,7 +225,7 @@ func TestBrokerResultAndFailureUseOwnedIdentities(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			launch := launchMessage("task-000000000001")
-			store := &memoryCredentials{value: Credential{Token: testToken, LauncherSession: "launcher-fixed"}}
+			store := &memoryCredentials{value: Credential{Token: testToken, LauncherSession: "launcher-fixed", SessionSecret: testLauncherSecret}}
 			journal, runner := newMemoryJournal(), &fakeRunner{result: test.result, err: test.err}
 			journal.failState = recordTerminal
 			if test.name == "invalid report" {
@@ -247,7 +238,7 @@ func TestBrokerResultAndFailureUseOwnedIdentities(t *testing.T) {
 				request protocol.Request
 			}
 			var terminalBodies []string
-			rotatedToken := strings.Repeat("z", 64)
+			rotatedToken := strings.Repeat("c", 64)
 			read := false
 			relay := relayFunc(func(_ context.Context, session Session, request protocol.Request) (protocol.Response, error) {
 				mu.Lock()
@@ -258,7 +249,7 @@ func TestBrokerResultAndFailureUseOwnedIdentities(t *testing.T) {
 				defer mu.Unlock()
 				switch {
 				case request.Op == protocol.OpRegister && request.Kind == protocol.KindLauncher:
-					return protocol.Response{OK: true, Name: "host-one", AgentID: "launcher-agent", SessionSecret: testLauncherSecret}, nil
+					return protocol.Response{OK: true, Name: "host-one", AgentID: "launcher-agent"}, nil
 				case request.Op == protocol.OpRead && !read:
 					read = true
 					return protocol.Response{OK: true, Messages: []protocol.Message{launchEnvelope(t, launch)}}, nil
@@ -336,7 +327,7 @@ func TestBrokerResultAndFailureUseOwnedIdentities(t *testing.T) {
 					}
 				}
 			}
-			if !accepted || !terminal || store.saves != 1 {
+			if !accepted || !terminal || store.saves != 0 {
 				t.Fatalf("accepted=%v terminal=%v credential saves=%d", accepted, terminal, store.saves)
 			}
 			if len(terminalBodies) != 2 || terminalBodies[0] != terminalBodies[1] {
@@ -399,7 +390,7 @@ func TestBrokerReconnectsWithStableIdentity(t *testing.T) {
 func TestBrokerReloadsRotatedTokenWhileRunning(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	rotated := strings.Repeat("z", 64)
+	rotated := strings.Repeat("c", 64)
 	store := &memoryCredentials{value: Credential{Token: testToken, LauncherSession: "launcher-fixed", SessionSecret: testLauncherSecret}}
 	registrations := 0
 	relay := relayFunc(func(_ context.Context, session Session, request protocol.Request) (protocol.Response, error) {
@@ -440,18 +431,17 @@ func TestBrokerReloadsRotatedTokenWhileRunning(t *testing.T) {
 	}
 }
 
-func TestBrokerRetainsMintedSecretAcrossCredentialSaveRetry(t *testing.T) {
+func TestBrokerRetriesLostInitialRegistrationWithPremintedSecret(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	rotated := strings.Repeat("z", 64)
-	store := &memoryCredentials{value: Credential{Token: testToken, LauncherSession: "launcher-fixed"}, failSaves: 1, tokenOnFailure: rotated}
+	store := &memoryCredentials{value: Credential{Token: testToken, LauncherSession: "launcher-fixed", SessionSecret: testLauncherSecret}}
 	var registrations []Session
 	relay := relayFunc(func(_ context.Context, session Session, request protocol.Request) (protocol.Response, error) {
 		switch request.Op {
 		case protocol.OpRegister:
 			registrations = append(registrations, session)
 			if len(registrations) == 1 {
-				return protocol.Response{OK: true, Name: "host", SessionSecret: testLauncherSecret}, nil
+				return protocol.Response{}, errors.New("registration response lost")
 			}
 			return protocol.Response{OK: true, Name: "host"}, nil
 		case protocol.OpRead:
@@ -466,8 +456,7 @@ func TestBrokerRetainsMintedSecretAcrossCredentialSaveRetry(t *testing.T) {
 	if err := broker.Run(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run error = %v", err)
 	}
-	if len(registrations) != 2 || registrations[0].Secret != "" || registrations[1].Secret != testLauncherSecret || registrations[1].Token != rotated ||
-		store.value.SessionSecret != testLauncherSecret || store.value.Token != rotated {
+	if len(registrations) != 2 || registrations[0] != registrations[1] || registrations[0].Secret != testLauncherSecret || store.saves != 0 {
 		t.Fatalf("registrations=%+v stored=%+v", registrations, store.value)
 	}
 }
@@ -487,6 +476,21 @@ func TestBrokerDoesNotRegisterBeforeReadinessProbe(t *testing.T) {
 	}
 	if calls != 0 {
 		t.Fatalf("relay called %d times before readiness", calls)
+	}
+}
+
+func TestBrokerRejectsMissingPremintedSecretBeforeRegistration(t *testing.T) {
+	calls := 0
+	broker, err := New(relayFunc(func(context.Context, Session, protocol.Request) (protocol.Response, error) {
+		calls++
+		return protocol.Response{OK: true}, nil
+	}), &memoryCredentials{value: Credential{Token: testToken, LauncherSession: "launcher"}}, newMemoryJournal(), &fakeRunner{},
+		func(context.Context) ([]string, error) { return nil, nil }, testOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.Run(context.Background()); err == nil || calls != 0 {
+		t.Fatalf("Run = %v, relay calls = %d", err, calls)
 	}
 }
 

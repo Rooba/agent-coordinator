@@ -99,7 +99,11 @@ func hostInstall(ctx context.Context, args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if _, err := store.Load(ctx); err != nil {
+	credential, err := store.Load(ctx)
+	if err == nil {
+		err = credential.Validate()
+	}
+	if err != nil {
 		return fmt.Errorf("host must be paired before install: %w", err)
 	}
 	if !*dryRun {

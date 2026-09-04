@@ -77,7 +77,7 @@ func TestHostInstallDryRunAndUnpairedAreSideEffectFree(t *testing.T) {
 		{name: "dry run", dryRun: true, wantManage: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			credentials := &hostTestCredentials{value: hostbroker.Credential{Token: strings.Repeat("t", 64), LauncherSession: "launcher-fixed"}, err: test.credential}
+			credentials := &hostTestCredentials{value: hostbroker.Credential{Token: strings.Repeat("c", 64), LauncherSession: "launcher-fixed", SessionSecret: strings.Repeat("d", 64)}, err: test.credential}
 			configs := &hostTestConfigStore{}
 			previousStore, previousConfigs, previousManage, previousExecutable := openHostCredentialStore, openHostConfigStore, manageHostAutostart, currentExecutable
 			openHostCredentialStore = func() (hostbroker.CredentialStore, error) { return credentials, nil }
@@ -109,7 +109,7 @@ func TestHostPairRejectsAndNeverPrintsTokens(t *testing.T) {
 	openHostCredentialStore = func() (hostbroker.CredentialStore, error) { return store, nil }
 	defer func() { openHostCredentialStore = previous }()
 
-	for _, token := range []string{"secret token", strings.Repeat("x", 64)} {
+	for _, token := range []string{"secret token", strings.Repeat("c", 64)} {
 		var stdout bytes.Buffer
 		err := hostCommand(context.Background(), []string{"pair"}, strings.NewReader(token), &stdout)
 		if stdout.Len() != 0 || err != nil && strings.Contains(err.Error(), token) {
@@ -131,7 +131,7 @@ func TestHostInstallPersistsRunnableClaudeConfigBeforeScheduling(t *testing.T) {
 	}
 	workingDir, configDir := t.TempDir(), t.TempDir()
 	store := &hostTestCredentials{value: hostbroker.Credential{
-		Token: strings.Repeat("t", 64), LauncherSession: "launcher-fixed", SessionSecret: strings.Repeat("s", 64),
+		Token: strings.Repeat("c", 64), LauncherSession: "launcher-fixed", SessionSecret: strings.Repeat("d", 64),
 	}}
 	configs := &hostTestConfigStore{}
 	previousStore, previousConfigs, previousManage, previousExecutable := openHostCredentialStore, openHostConfigStore, manageHostAutostart, currentExecutable

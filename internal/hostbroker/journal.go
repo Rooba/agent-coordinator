@@ -52,13 +52,14 @@ type FileJournal struct {
 	path      string
 	protector Protector
 	records   map[string]TaskRecord
+	limit     int
 }
 
 func NewFileJournal(path string, protector Protector) (*FileJournal, error) {
 	if !filepath.IsAbs(path) || protector == nil {
 		return nil, errors.New("journal requires an absolute path and protector")
 	}
-	journal := &FileJournal{path: path, protector: protector, records: make(map[string]TaskRecord)}
+	journal := &FileJournal{path: path, protector: protector, records: make(map[string]TaskRecord), limit: journalLimit}
 	sealed, err := readRegular(path, journalLimit)
 	if errors.Is(err, os.ErrNotExist) {
 		return journal, nil
@@ -117,41 +118,60 @@ func (j *FileJournal) Put(record TaskRecord) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	previous, existed := j.records[record.Launch.TaskID]
-	var evictedID string
-	var evicted TaskRecord
-	if !existed && len(j.records) >= maxJournalRecords {
-		for _, id := range slices.Sorted(maps.Keys(j.records)) {
-			if j.records[id].State == recordDelivered {
-				evictedID, evicted = id, j.records[id]
-				delete(j.records, id)
-				break
-			}
+	evicted := make(map[string]TaskRecord)
+	if !existed && len(j.records) >= maxJournalRecords && !j.evictDelivered(record.Launch.TaskID, evicted) {
+		return errors.New("host journal is full")
+	}
+	j.records[record.Launch.TaskID] = record
+	var sealed []byte
+	for {
+		plain, err := json.Marshal(j.records)
+		if err == nil {
+			sealed, err = j.protector.Seal(plain)
 		}
-		if evictedID == "" {
+		if err != nil {
+			j.restore(record.Launch.TaskID, previous, existed, evicted)
+			return fmt.Errorf("persist host journal: %w", err)
+		}
+		limit := j.limit
+		if limit == 0 {
+			limit = journalLimit
+		}
+		if len(sealed) <= limit {
+			break
+		}
+		if !j.evictDelivered(record.Launch.TaskID, evicted) {
+			j.restore(record.Launch.TaskID, previous, existed, evicted)
 			return errors.New("host journal is full")
 		}
 	}
-	j.records[record.Launch.TaskID] = record
-	plain, err := json.Marshal(j.records)
-	if err == nil {
-		var sealed []byte
-		sealed, err = j.protector.Seal(plain)
-		if err == nil {
-			err = writeProtected(j.path, sealed)
-		}
-	}
+	err := writeProtected(j.path, sealed)
 	if err != nil {
-		if existed {
-			j.records[record.Launch.TaskID] = previous
-		} else {
-			delete(j.records, record.Launch.TaskID)
-		}
-		if evictedID != "" {
-			j.records[evictedID] = evicted
-		}
+		j.restore(record.Launch.TaskID, previous, existed, evicted)
 		return fmt.Errorf("persist host journal: %w", err)
 	}
 	return nil
+}
+
+func (j *FileJournal) evictDelivered(except string, evicted map[string]TaskRecord) bool {
+	for _, id := range slices.Sorted(maps.Keys(j.records)) {
+		if id != except && j.records[id].State == recordDelivered {
+			evicted[id] = j.records[id]
+			delete(j.records, id)
+			return true
+		}
+	}
+	return false
+}
+
+func (j *FileJournal) restore(id string, previous TaskRecord, existed bool, evicted map[string]TaskRecord) {
+	delete(j.records, id)
+	if existed {
+		j.records[id] = previous
+	}
+	for taskID, record := range evicted {
+		j.records[taskID] = record
+	}
 }
 
 func validateRecord(id string, record TaskRecord) error {

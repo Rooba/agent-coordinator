@@ -80,7 +80,7 @@ func TestClientCancellationInterruptsStalledRead(t *testing.T) {
 }
 
 func TestClientRejectsUnsafeAddressTokenAndOversizedResponse(t *testing.T) {
-	for _, address := range []string{"192.0.2.10:7400", "localhost:7400"} {
+	for _, address := range []string{"192.0.2.10:7400", "localhost:7400", "127.0.0.1:http", "127.0.0.1:0", "127.0.0.1:65536"} {
 		if _, err := NewClient(address); err == nil {
 			t.Fatalf("unpinned relay address %q accepted", address)
 		}

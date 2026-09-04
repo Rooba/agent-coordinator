@@ -54,14 +54,13 @@ type Broker struct {
 	probe   Probe
 	opts    Options
 
-	mu              sync.Mutex
-	credential      Credential
-	credentialDirty bool
-	launcher        protocol.AgentRef
-	capabilities    []string
-	activeID        string
-	activeCancel    context.CancelFunc
-	workers         sync.WaitGroup
+	mu           sync.Mutex
+	credential   Credential
+	launcher     protocol.AgentRef
+	capabilities []string
+	activeID     string
+	activeCancel context.CancelFunc
+	workers      sync.WaitGroup
 }
 
 func New(relay Relay, store CredentialStore, journal Journal, runner Runner, probe Probe, opts Options) (*Broker, error) {
@@ -171,20 +170,11 @@ func (b *Broker) registerLauncher(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if response.Name == "" || response.SessionSecret != "" && len(response.SessionSecret) < 32 {
+	if response.Name == "" {
 		return errors.New("relay returned an incomplete launcher identity")
 	}
 	if response.SessionSecret != "" && response.SessionSecret != current.Secret {
-		b.mu.Lock()
-		b.credential.SessionSecret = response.SessionSecret
-		b.credentialDirty = true
-		b.mu.Unlock()
-		if err := b.flushCredential(ctx); err != nil {
-			return err
-		}
-	}
-	if b.launcherSession().Secret == "" {
-		return errors.New("relay returned no launcher session secret")
+		return errors.New("relay returned a conflicting launcher secret")
 	}
 	b.mu.Lock()
 	b.launcher = protocol.AgentRef{Name: response.Name, AgentID: response.AgentID, Scope: b.hostScope()}
@@ -363,7 +353,7 @@ func (b *Broker) registerChild(ctx context.Context, launch protocol.TaskLaunchMs
 	if err != nil {
 		return childIdentity{}, err
 	}
-	if response.Name == "" || len(response.SessionSecret) < 32 || len(response.SessionSecret) > 512 || strings.ContainsAny(response.SessionSecret, "\x00\r\n \t") {
+	if response.Name == "" || !validLowerHex(response.SessionSecret, 32) {
 		return childIdentity{}, errors.New("relay returned incomplete eyes identity")
 	}
 	return childIdentity{
@@ -520,9 +510,6 @@ func (b *Broker) withFreshToken(ctx context.Context, operation func(Session) err
 }
 
 func (b *Broker) refreshCredential(ctx context.Context) error {
-	if err := b.flushCredential(ctx); err != nil {
-		return err
-	}
 	stored, err := b.store.Load(ctx)
 	if err != nil {
 		return err
@@ -540,33 +527,6 @@ func (b *Broker) refreshCredential(ctx context.Context) error {
 		return errors.New("stored launcher identity changed while broker was running")
 	}
 	b.credential.Token = stored.Token
-	return nil
-}
-
-func (b *Broker) flushCredential(ctx context.Context) error {
-	b.mu.Lock()
-	credential, dirty := b.credential, b.credentialDirty
-	b.mu.Unlock()
-	if !dirty {
-		return nil
-	}
-	err := b.store.Update(ctx, func(stored *Credential) error {
-		if stored.LauncherSession != credential.LauncherSession || stored.SessionSecret != "" && stored.SessionSecret != credential.SessionSecret {
-			return errors.New("stored launcher identity changed while broker was running")
-		}
-		credential.Token = stored.Token
-		*stored = credential
-		return stored.Validate()
-	})
-	if err != nil {
-		return fmt.Errorf("persist launcher credential: %w", err)
-	}
-	b.mu.Lock()
-	if b.credential.LauncherSession == credential.LauncherSession && b.credential.SessionSecret == credential.SessionSecret {
-		b.credential.Token = credential.Token
-		b.credentialDirty = false
-	}
-	b.mu.Unlock()
 	return nil
 }
 

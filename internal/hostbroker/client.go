@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,13 +47,17 @@ func NewClient(addr string) (*Client, error) {
 	if addr == "" {
 		addr = DefaultAddr
 	}
-	host, _, err := net.SplitHostPort(addr)
+	host, portText, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid relay address: %w", err)
 	}
 	ip := net.ParseIP(strings.Trim(host, "[]"))
 	if ip == nil || !ip.IsLoopback() {
 		return nil, errors.New("relay address must use a numeric loopback IP")
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 || strings.Trim(portText, "0123456789") != "" {
+		return nil, errors.New("relay port must be numeric and between 1 and 65535")
 	}
 	return &Client{addr: addr, limit: defaultWireLimit}, nil
 }

@@ -47,7 +47,7 @@ func TestPairAndCredentialFileNeverStorePlainToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if credential.Token != testToken || !strings.HasPrefix(credential.LauncherSession, "launcher-") {
+	if credential.Token != testToken || !strings.HasPrefix(credential.LauncherSession, "launcher-") || len(credential.SessionSecret) != 64 {
 		t.Fatalf("credential = %+v", credential)
 	}
 	raw, _ := os.ReadFile(path)
@@ -57,7 +57,6 @@ func TestPairAndCredentialFileNeverStorePlainToken(t *testing.T) {
 	if info, _ := os.Stat(path); info.Mode().Perm() != 0o600 {
 		t.Fatalf("credential mode = %o", info.Mode().Perm())
 	}
-	credential.SessionSecret = testLauncherSecret
 	if err := store.Save(context.Background(), credential); err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +67,7 @@ func TestPairAndCredentialFileNeverStorePlainToken(t *testing.T) {
 	if repaired.LauncherSession != credential.LauncherSession || repaired.SessionSecret != credential.SessionSecret {
 		t.Fatal("pairing replaced stable launcher identity")
 	}
-	if err := Pair(context.Background(), store, strings.NewReader(strings.Repeat("z", 64))); err != nil {
+	if err := Pair(context.Background(), store, strings.NewReader(strings.Repeat("c", 64))); err != nil {
 		t.Fatal(err)
 	}
 	rotated, _ := store.Load(context.Background())
@@ -79,9 +78,19 @@ func TestPairAndCredentialFileNeverStorePlainToken(t *testing.T) {
 
 func TestPairRejectsInvalidToken(t *testing.T) {
 	store := &memoryCredentials{}
-	for _, token := range []string{"short", strings.Repeat("x", 32) + " bad", strings.Repeat("x", 513)} {
+	for _, token := range []string{"short", strings.Repeat("a", 63), strings.Repeat("A", 64), strings.Repeat("x", 64), strings.Repeat("a", 65)} {
 		if err := Pair(context.Background(), store, strings.NewReader(token)); err == nil {
 			t.Fatalf("accepted token %q", token[:min(len(token), 16)])
+		}
+	}
+}
+
+func TestCredentialRequiresStrictPremintedSecret(t *testing.T) {
+	credential := Credential{Token: testToken, LauncherSession: "launcher-fixed", SessionSecret: testLauncherSecret}
+	for _, secret := range []string{"", strings.Repeat("a", 63), strings.Repeat("A", 64), strings.Repeat("g", 64)} {
+		credential.SessionSecret = secret
+		if err := credential.Validate(); err == nil {
+			t.Fatalf("accepted launcher secret %q", secret[:min(len(secret), 8)])
 		}
 	}
 }
@@ -149,5 +158,47 @@ func TestFileJournalBoundsRecordsByEvictingDeliveredTombstone(t *testing.T) {
 	}
 	if record, exists := journal.Get(launch.TaskID); !exists || record.State != recordReceived {
 		t.Fatalf("new record = %+v, exists=%v", record, exists)
+	}
+}
+
+func TestFileJournalEvictsDeliveredTombstonesUnderBytePressure(t *testing.T) {
+	records := make(map[string]TaskRecord)
+	for index := range 8 {
+		id := fmt.Sprintf("task-%012x", index)
+		records[id] = TaskRecord{Launch: protocol.TaskLaunchMsg{Type: protocol.TaskLaunch, TaskID: id}, State: recordDelivered}
+	}
+	initial := len(records)
+	journal := &FileJournal{path: filepath.Join(t.TempDir(), "journal"), protector: testProtector{}, records: records, limit: 300}
+	launch := protocol.TaskLaunchMsg{Type: protocol.TaskLaunch, TaskID: "task-ffffffffffff"}
+	if err := journal.Put(TaskRecord{Launch: launch, State: recordReceived}); err != nil {
+		t.Fatal(err)
+	}
+	if len(journal.Records()) >= initial+1 {
+		t.Fatal("journal did not evict delivered tombstones to satisfy its byte limit")
+	}
+	if record, exists := journal.Get(launch.TaskID); !exists || record.State != recordReceived {
+		t.Fatalf("new record = %+v, exists=%v", record, exists)
+	}
+	sealed, err := os.ReadFile(journal.path)
+	if err != nil || len(sealed) > journal.limit {
+		t.Fatalf("sealed journal size = %d, err = %v", len(sealed), err)
+	}
+}
+
+func TestFileJournalNeverEvictsUndeliveredWorkForSpace(t *testing.T) {
+	existing := protocol.TaskLaunchMsg{Type: protocol.TaskLaunch, TaskID: "task-000000000001"}
+	journal := &FileJournal{
+		path: filepath.Join(t.TempDir(), "journal"), protector: testProtector{}, limit: 1,
+		records: map[string]TaskRecord{existing.TaskID: {Launch: existing, State: recordReceived}},
+	}
+	incoming := protocol.TaskLaunchMsg{Type: protocol.TaskLaunch, TaskID: "task-000000000002"}
+	if err := journal.Put(TaskRecord{Launch: incoming, State: recordReceived}); err == nil {
+		t.Fatal("oversized undelivered journal was accepted")
+	}
+	if _, exists := journal.Get(existing.TaskID); !exists {
+		t.Fatal("undelivered record was evicted")
+	}
+	if _, exists := journal.Get(incoming.TaskID); exists {
+		t.Fatal("failed incoming record was retained")
 	}
 }

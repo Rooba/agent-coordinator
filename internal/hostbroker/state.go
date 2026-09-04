@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"unicode"
 )
 
 var ErrUnsupported = errors.New("host integration is supported only on Windows")
@@ -115,7 +114,7 @@ func (c Credential) Validate() error {
 	if c.LauncherSession == "" || len(c.LauncherSession) > 128 || strings.ContainsAny(c.LauncherSession, "\x00\r\n \t") {
 		return errors.New("invalid launcher session identity")
 	}
-	if c.SessionSecret != "" && (len(c.SessionSecret) < 32 || len(c.SessionSecret) > 512 || strings.ContainsAny(c.SessionSecret, "\x00\r\n \t")) {
+	if !validLowerHex(c.SessionSecret, 32) {
 		return errors.New("invalid launcher session secret")
 	}
 	return nil
@@ -140,6 +139,12 @@ func Pair(ctx context.Context, store CredentialStore, source io.Reader) error {
 				return err
 			}
 		}
+		if credential.SessionSecret == "" {
+			credential.SessionSecret, err = newSessionSecret()
+			if err != nil {
+				return err
+			}
+		}
 		credential.Token = value
 		return credential.Validate()
 	})
@@ -148,21 +153,40 @@ func Pair(ctx context.Context, store CredentialStore, source io.Reader) error {
 var ErrCredentialNotFound = errors.New("host relay is not paired")
 
 func validateToken(token string) error {
-	if len(token) < 32 || len(token) > 512 {
-		return errors.New("relay token must contain 32 to 512 characters")
-	}
-	for _, char := range token {
-		if unicode.IsSpace(char) || unicode.IsControl(char) {
-			return errors.New("relay token contains whitespace or control characters")
-		}
+	if !validLowerHex(token, 32) {
+		return errors.New("relay token must be 64 lowercase hexadecimal characters")
 	}
 	return nil
 }
 
+func validLowerHex(value string, bytes int) bool {
+	if len(value) != bytes*2 || strings.ToLower(value) != value {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
 func newLauncherSession() (string, error) {
-	bytes := make([]byte, 12)
-	if _, err := rand.Read(bytes); err != nil {
+	value, err := randomHex(12)
+	if err != nil {
 		return "", fmt.Errorf("generate launcher identity: %w", err)
 	}
-	return "launcher-" + hex.EncodeToString(bytes), nil
+	return "launcher-" + value, nil
+}
+
+func newSessionSecret() (string, error) {
+	value, err := randomHex(32)
+	if err != nil {
+		return "", fmt.Errorf("generate launcher secret: %w", err)
+	}
+	return value, nil
+}
+
+func randomHex(size int) (string, error) {
+	value := make([]byte, size)
+	if _, err := rand.Read(value); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(value), nil
 }
