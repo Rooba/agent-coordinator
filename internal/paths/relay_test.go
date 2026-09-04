@@ -75,8 +75,8 @@ func TestRelayTokenCreateThenReuse(t *testing.T) {
 	if err != nil || again != first {
 		t.Fatalf("token must be stable: %q then %q (%v)", first, again, err)
 	}
-	t.Setenv("AC_TOKEN", "from-env")
-	if got, _ := RelayToken(); got != "from-env" {
+	t.Setenv("AC_TOKEN", hexToken)
+	if got, _ := RelayToken(); got != hexToken {
 		t.Fatalf("AC_TOKEN must win, got %q", got)
 	}
 }
@@ -232,16 +232,27 @@ func TestRelayTokenRejectsLooseFileMode(t *testing.T) {
 	}
 }
 
-// AC_TOKEN is the client's pairing override, not a minted file: it is taken
-// as given, even while a broken file sits next to the database.
-func TestRelayTokenEnvOverrideIsFreeForm(t *testing.T) {
+// AC_TOKEN is the client's pairing override, so it wins over the file - but
+// it guards the same relay and must be the same 64 lowercase hex characters.
+// A hand-typed token is refused rather than quietly weakening the boundary.
+func TestRelayTokenEnvOverrideMustBeMinted(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("AC_DB", filepath.Join(dir, "coordinator.db"))
 	if err := os.WriteFile(filepath.Join(dir, "relay.token"), []byte("junk\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("AC_TOKEN", "  paired-by-hand  ")
-	if got, err := RelayToken(); err != nil || got != "paired-by-hand" {
-		t.Fatalf("AC_TOKEN must win verbatim: %q (%v)", got, err)
+	t.Setenv("AC_TOKEN", "  "+hexToken+"  ")
+	if got, err := RelayToken(); err != nil || got != hexToken {
+		t.Fatalf("a minted AC_TOKEN must win over the file: %q (%v)", got, err)
+	}
+	for _, bad := range []string{"paired-by-hand", hexToken[:63], hexToken + "0", strings.ToUpper(hexToken)} {
+		t.Setenv("AC_TOKEN", bad)
+		got, err := RelayToken()
+		if err == nil {
+			t.Fatalf("AC_TOKEN %q must be refused, got %q", bad, got)
+		}
+		if !strings.Contains(err.Error(), "AC_TOKEN") {
+			t.Fatalf("the error must name the variable: %v", err)
+		}
 	}
 }

@@ -120,6 +120,9 @@ func Open(path string) (*Store, error) {
 		// A task carries the deadline it was created with, so expiring it is a
 		// property of the row rather than of whoever happens to sweep.
 		`ALTER TABLE eyes_tasks ADD COLUMN deadline_s INTEGER NOT NULL DEFAULT 300`,
+		// A cancel is durable only once the broker answers it, so the task
+		// records whether that answer has arrived.
+		`ALTER TABLE eyes_tasks ADD COLUMN cancel_acked INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := db.Exec(alter); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()

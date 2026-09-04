@@ -214,12 +214,26 @@ func (s *Store) AssignEyesTask(req EyesRequest) (EyesTask, protocol.AgentRef, er
 }
 
 // PendingLaunches lists the launch mail of every task still queued on this
-// broker, oldest task first, whether or not the broker already read it.
-// Delivery is at-least-once on purpose: a broker that lost a read asks again,
-// and dropping a duplicate by task id is its job. Only launch bodies count -
-// other mail about the same task is not work to run - and one launcher
-// session resolves to one row, so a squatted id cannot fan the queue out.
+// broker: work it has not acked yet.
 func (s *Store) PendingLaunches(launcherSession string) ([]protocol.Message, error) {
+	return s.pendingTaskMail(launcherSession, "queued", protocol.TaskLaunch)
+}
+
+// PendingCancels lists the cancel mail of every cancelled task this broker
+// has not answered. A cancel is only durable once the broker reports back:
+// until then the provider may still be running, so the notice is redelivered.
+func (s *Store) PendingCancels(launcherSession string) ([]protocol.Message, error) {
+	return s.pendingTaskMail(launcherSession, "cancelled", protocol.TaskCancel)
+}
+
+// pendingTaskMail is the redelivery queue both of those read: the daemon's own
+// mail of one body type for this broker's tasks in one state, oldest task
+// first, whether or not the broker already read it. Delivery is at-least-once
+// on purpose - a broker that lost a read asks again, and dropping a duplicate
+// by task id is its job. Only that one body type counts, an acked cancel
+// leaves the queue, and one launcher session resolves to one row, so a
+// squatted id cannot fan the queue out.
+func (s *Store) pendingTaskMail(launcherSession, state, bodyType string) ([]protocol.Message, error) {
 	rows, err := s.db.Query(`
 		SELECT m.id, COALESCE(a.name, m.from_agent), m.body, m.created_at,
 		       m.reply_to, m.from_scope, m.kind, m.task_id
@@ -227,10 +241,10 @@ func (s *Store) PendingLaunches(launcherSession string) ([]protocol.Message, err
 		JOIN agents l ON l.rowid = (SELECT l2.rowid FROM agents l2
 			WHERE l2.session_id = t.launcher_session ORDER BY l2.registered_at, l2.scope LIMIT 1)
 		JOIN messages m ON m.task_id = t.task_id AND m.scope = l.scope AND m.to_agent = l.agent_id
-			AND m.body LIKE '{"type":"task.launch"%'
+			AND m.body LIKE ?
 		LEFT JOIN agents a ON a.scope = COALESCE(NULLIF(m.from_scope, ''), m.scope) AND a.agent_id = m.from_agent
-		WHERE t.launcher_session = ? AND t.state = 'queued'
-		ORDER BY t.created_at, m.id`, launcherSession)
+		WHERE t.launcher_session = ? AND t.state = ? AND t.cancel_acked = 0
+		ORDER BY t.created_at, m.id`, `{"type":"`+bodyType+`"%`, launcherSession, state)
 	if err != nil {
 		return nil, err
 	}
@@ -344,6 +358,9 @@ func (s *Store) moveEyesTask(taskID, to string, a eyesActor, msg string) (EyesTa
 	if !ok {
 		return EyesTask{}, false, fmt.Errorf("%w: %q is not a task state", ErrBadTransition, to)
 	}
+	// One timestamp for the whole move, read before the transaction opens so
+	// nothing inside it waits on the clock.
+	now := s.Now().Unix()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return EyesTask{}, false, err
@@ -361,6 +378,19 @@ func (s *Store) moveEyesTask(taskID, to string, a eyesActor, msg string) (EyesTa
 	if t.State == to {
 		return t, false, nil // the ack was lost, not the transition
 	}
+	// A cancelled task still gets a terminal report, once the broker has
+	// killed the provider. That report IS the cancel's acknowledgement:
+	// record it so the notice stops being redelivered, rather than refusing
+	// it and leaving the broker to retry forever.
+	if t.State == "cancelled" && s.acksCancel(tx, t, role, to) {
+		if _, err := tx.Exec(`UPDATE eyes_tasks SET cancel_acked=1 WHERE task_id=?`, taskID); err != nil {
+			return EyesTask{}, false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return EyesTask{}, false, err
+		}
+		return t, false, nil
+	}
 	if !slices.Contains(from, t.State) {
 		return EyesTask{}, false, fmt.Errorf("%w: %s -> %s", ErrBadTransition, t.State, to)
 	}
@@ -368,7 +398,6 @@ func (s *Store) moveEyesTask(taskID, to string, a eyesActor, msg string) (EyesTa
 	if err != nil {
 		return EyesTask{}, false, err
 	}
-	now := s.Now().Unix()
 	if _, err := tx.Exec(`UPDATE eyes_tasks SET state=?, updated_at=? WHERE task_id=?`, to, now, taskID); err != nil {
 		return EyesTask{}, false, err
 	}
@@ -385,21 +414,45 @@ func (s *Store) moveEyesTask(taskID, to string, a eyesActor, msg string) (EyesTa
 }
 
 // eyesRole says which side of this task the actor is, or "" for a caller with
-// no standing in it.
+// no standing in it. An agent id is derived from a session id alone, so the
+// requester's workspace is half of that identity and is checked with it; the
+// launcher and its child exist only over the relay.
 func (s *Store) eyesRole(q execQuerier, t EyesTask, a eyesActor) eyesRole {
 	switch {
 	case a.System:
 		return roleSystem
 	case a.Session == "":
-		if s.actsFor(q, t.RequesterScope, a.Ref.AgentID, t.RequesterAgentID) {
+		if a.Ref.Scope == t.RequesterScope && s.actsFor(q, t.RequesterScope, a.Ref.AgentID, t.RequesterAgentID) {
 			return roleRequester
 		}
+	case !s.relaySpeaker(q, a.Session):
+		return "" // a local row wearing a relay session id is not that session
 	case a.Session == "eyes-"+t.TaskID:
 		return roleChild
 	case a.Session == t.LauncherSession:
 		return roleLauncher
 	}
 	return ""
+}
+
+// relaySpeaker reports whether a session id names a row created over the
+// relay - the only kind that can speak for a task's launcher or its child.
+func (s *Store) relaySpeaker(q execQuerier, session string) bool {
+	id, err := s.agentBySession(q, session)
+	return err == nil && id.Origin == "relay"
+}
+
+// acksCancel reports whether a terminal report on a cancelled task is the
+// answer to its cancel: the child the broker killed, or - when the task never
+// got a child to speak for it - the broker's own failure.
+func (s *Store) acksCancel(q execQuerier, t EyesTask, role eyesRole, to string) bool {
+	switch role {
+	case roleChild:
+		return to == "done" || to == "failed"
+	case roleLauncher:
+		return to == "failed" && !s.relaySpeaker(q, "eyes-"+t.TaskID)
+	}
+	return false
 }
 
 // eyesMail addresses the message a move implies: a cancel goes to the broker
@@ -478,6 +531,9 @@ func (s *Store) ExpireEyesTasks(now time.Time) (int, error) {
 		}
 		_, moved, err := s.moveEyesTask(id, "failed", eyesActor{System: true}, string(body))
 		switch {
+		// Somebody reported between the snapshot and the move - which is
+		// exactly what the deadline was waiting for, so it is not a failure.
+		case errors.Is(err, ErrBadTransition), errors.Is(err, ErrTaskNotLive):
 		case err != nil:
 			last = err
 		case moved:

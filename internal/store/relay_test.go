@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Rooba/agent-coordinator/internal/protocol"
 )
@@ -147,11 +148,14 @@ func TestMigrationsIdempotentAndEyesTasksTable(t *testing.T) {
 		t.Fatalf("eyes_tasks insert: %v", err)
 	}
 	var state, runtime string
-	if err := s.db.QueryRow(`SELECT state, runtime FROM eyes_tasks WHERE task_id='task-abc'`).Scan(&state, &runtime); err != nil {
+	var acked int
+	if err := s.db.QueryRow(`SELECT state, runtime, cancel_acked FROM eyes_tasks WHERE task_id='task-abc'`).
+		Scan(&state, &runtime, &acked); err != nil {
 		t.Fatal(err)
 	}
-	if state != "queued" || runtime != "" {
-		t.Fatalf("eyes_tasks defaults: state=%q runtime=%q, want queued and \"\"", state, runtime)
+	if state != "queued" || runtime != "" || acked != 0 {
+		t.Fatalf("eyes_tasks defaults: state=%q runtime=%q cancel_acked=%d, want queued, \"\" and 0",
+			state, runtime, acked)
 	}
 }
 
@@ -666,5 +670,30 @@ func TestResolveActorNeedsTheCallersOwnRow(t *testing.T) {
 	}
 	if _, err := s.ResolveActor("/r", "s-a", child); !errors.Is(err, ErrForeignSession) {
 		t.Fatalf("a purged parent must not act as its child, got %v", err)
+	}
+}
+
+// A relay session authenticates against its relay row and nothing else. A
+// local row may legitimately share the session id in another workspace, and
+// registering in the same second used to sort it ahead of the broker's row -
+// which locked the broker out of its own identity.
+func TestVerifyRelaySecretIgnoresALocalRowWithTheSameSessionID(t *testing.T) {
+	s := open(t)
+	now := time.Unix(9100000, 0)
+	s.Now = func() time.Time { return now }
+	broker := registerBroker(t, s, "host:BOX", "broker-1")
+	if _, err := s.Register("/r", "broker-1", "hook"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := s.VerifyRelaySecret("broker-1", brokerSecret("broker-1"))
+	if err != nil || id.Scope != "host:BOX" || id.Name != broker.Name || id.Kind != protocol.KindLauncher {
+		t.Fatalf("the relay row must answer for a relay session: %+v (%v)", id, err)
+	}
+	// A session that has no relay row at all is still foreign, not missing.
+	if _, err := s.Register("/r", "hook-only", "hook"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.VerifyRelaySecret("hook-only", ""); !errors.Is(err, ErrForeignSession) {
+		t.Fatalf("a hook session must stay ErrForeignSession, got %v", err)
 	}
 }

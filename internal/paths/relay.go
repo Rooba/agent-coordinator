@@ -63,12 +63,15 @@ func RelayTokenPath() (string, error) {
 	return filepath.Join(filepath.Dir(db), "relay.token"), nil
 }
 
-// RelayToken returns the shared relay secret: AC_TOKEN wins for clients and
-// is taken as given (pairing may hand it over by hand), otherwise the token
-// file, created 0600 with 32 CSPRNG bytes on first use (the daemon's first
-// relay listen) and validated on every read.
+// RelayToken returns the shared relay secret: AC_TOKEN wins for clients,
+// otherwise the token file, created 0600 with 32 CSPRNG bytes on first use
+// (the daemon's first relay listen). Both are held to the minted shape - a
+// hand-typed secret opens the whole relay wherever it came from.
 func RelayToken() (string, error) {
 	if t := strings.TrimSpace(os.Getenv("AC_TOKEN")); t != "" {
+		if !mintedToken(t) {
+			return "", fmt.Errorf("AC_TOKEN must hold 64 lowercase hex characters")
+		}
 		return t, nil
 	}
 	path, err := RelayTokenPath()

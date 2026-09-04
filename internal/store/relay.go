@@ -223,14 +223,14 @@ type RelayIdentity struct {
 
 // agentBySession finds a row by session id across scopes - the relay's one
 // non-scoped identity read, because the gate must authenticate a caller
-// before it knows which workspace answers for it. A relay session id names
-// exactly one row (RegisterRelay refuses a second scope for one, and
-// ReissueEyesChild refuses a child whose id is already taken), and the order
-// is fixed anyway so a squatted id resolves the same way every time.
+// before it knows which workspace answers for it. A relay row always wins:
+// every caller of this is asking about a relay identity, and a local session
+// that happens to share the id must not be able to shadow one. The rest of
+// the order is fixed so a squatted id resolves the same way every time.
 func (s *Store) agentBySession(q execQuerier, sessionID string) (RelayIdentity, error) {
 	var id RelayIdentity
 	err := q.QueryRow(`SELECT scope, name, agent_id, kind, origin, relay_secret_hash FROM agents
-		WHERE session_id=? ORDER BY registered_at, scope LIMIT 1`, sessionID).
+		WHERE session_id=? ORDER BY origin='relay' DESC, registered_at, scope LIMIT 1`, sessionID).
 		Scan(&id.Scope, &id.Name, &id.AgentID, &id.Kind, &id.Origin, &id.secretHash)
 	if err == sql.ErrNoRows {
 		return RelayIdentity{}, ErrNoSession
@@ -241,8 +241,9 @@ func (s *Store) agentBySession(q execQuerier, sessionID string) (RelayIdentity, 
 // VerifyRelaySecret authenticates a relay session: the row must exist, must
 // have been created over the relay, and must match the presented secret. The
 // gate calls this before it knows the caller's workspace, which is sound
-// because one relay session id names one row (see agentBySession). The
-// compare is constant time so a wrong secret leaks no prefix.
+// because the relay row is the one that answers (see agentBySession) - a
+// local session sharing the id is reported as foreign, not authenticated in
+// its place. The compare is constant time so a wrong secret leaks no prefix.
 func (s *Store) VerifyRelaySecret(sessionID, secret string) (RelayIdentity, error) {
 	id, err := s.agentBySession(s.db, sessionID)
 	if err != nil {

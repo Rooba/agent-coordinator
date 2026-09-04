@@ -457,8 +457,10 @@ func TestCancelEyesTaskIsATransition(t *testing.T) {
 	if got, err := s2.CancelEyesTask(task2.TaskID, requester2); err != nil || got.State != "cancelled" {
 		t.Fatalf("an accepted task is still cancellable: %+v (%v)", got, err)
 	}
-	if _, ok, err := s2.TransitionEyesTask(task2.TaskID, "eyes-"+task2.TaskID, "done", "{}"); !errors.Is(err, ErrBadTransition) {
-		t.Fatalf("a cancelled task is settled: ok=%v (%v)", ok, err)
+	// A cancelled task is settled, so the child's report moves nothing - it
+	// acknowledges the cancel instead of reopening the lifecycle.
+	if got, ok, err := s2.TransitionEyesTask(task2.TaskID, "eyes-"+task2.TaskID, "done", "{}"); err != nil || ok || got.State != "cancelled" {
+		t.Fatalf("a cancelled task is settled: %+v ok=%v (%v)", got, ok, err)
 	}
 }
 
@@ -797,15 +799,16 @@ func TestExpireEyesTasksWithNoVoiceLeft(t *testing.T) {
 	}
 }
 
-// A relay actor speaks for itself: with its row gone the move fails outright,
-// so a state change never exists without the mail it implies.
+// A relay actor speaks for itself: with its row gone it has no standing left,
+// so the move is refused and a state change never exists without the mail it
+// implies.
 func TestTransitionEyesTaskNeedsTheActorsRow(t *testing.T) {
 	s := open(t)
 	requester, _, task, _ := liveTask(t, s)
 	if _, err := s.db.Exec(`DELETE FROM agents WHERE session_id='broker-1'`); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, err := s.TransitionEyesTask(task.TaskID, "broker-1", "accepted", "{}"); ok || !errors.Is(err, ErrNoSession) {
+	if _, ok, err := s.TransitionEyesTask(task.TaskID, "broker-1", "accepted", "{}"); ok || !errors.Is(err, ErrNotYourTask) {
 		t.Fatalf("a purged launcher must not settle a move: ok=%v (%v)", ok, err)
 	}
 	if got, _ := s.EyesTask(task.TaskID); got.State != "queued" {
@@ -860,5 +863,175 @@ func TestCancelEyesTaskAfterDoneIsRefused(t *testing.T) {
 	}
 	if _, err := s.CancelEyesTask(task.TaskID, requester); !errors.Is(err, ErrBadTransition) {
 		t.Fatalf("a done task must not be cancellable, got %v", err)
+	}
+}
+
+// A requester is a workspace AND a session: an agent id is derived from the
+// session id alone, so the same session in another workspace is a stranger to
+// this task, not its owner.
+func TestCancelEyesTaskIsBoundToTheRequestersScope(t *testing.T) {
+	s := open(t)
+	requester, _, task, _ := liveTask(t, s)
+	elsewhere := protocol.AgentRef{Name: requester.Name, AgentID: requester.AgentID, Scope: "/other"}
+	if _, err := s.CancelEyesTask(task.TaskID, elsewhere); !errors.Is(err, ErrNotYourTask) {
+		t.Fatalf("another workspace must not cancel, got %v", err)
+	}
+	if got, _ := s.EyesTask(task.TaskID); got.State != "queued" {
+		t.Fatalf("a refused cancel must leave the task alone: %+v", got)
+	}
+}
+
+// A report that lands between the sweep's snapshot and its move leaves
+// nothing to expire: the task is already settled, so the sweep skips it
+// instead of counting it or reporting it as a failure. The clock hook is the
+// race, fired once before the sweep opens its transaction.
+func TestExpireEyesTasksToleratesAConcurrentReport(t *testing.T) {
+	s := open(t)
+	now := time.Unix(7600000, 0)
+	s.Now = func() time.Time { return now }
+	_, _, task, _ := liveTask(t, s)
+	if _, ok, err := s.TransitionEyesTask(task.TaskID, "broker-1", "accepted", "{}"); err != nil || !ok {
+		t.Fatalf("accept: ok=%v (%v)", ok, err)
+	}
+	if _, err := s.db.Exec(`UPDATE eyes_tasks SET created_at=? WHERE task_id=?`,
+		now.Unix()-301, task.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	racing := true
+	s.Now = func() time.Time {
+		if racing {
+			racing = false
+			if _, ok, err := s.TransitionEyesTask(task.TaskID, "eyes-"+task.TaskID, "done",
+				`{"type":"task.result","task_id":"`+task.TaskID+`"}`); err != nil || !ok {
+				t.Errorf("the racing report: ok=%v (%v)", ok, err)
+			}
+		}
+		return now
+	}
+	if n, err := s.ExpireEyesTasks(now); err != nil || n != 0 {
+		t.Fatalf("a task settled under the sweep is skipped, not reported: %d (%v)", n, err)
+	}
+	if got, _ := s.EyesTask(task.TaskID); got.State != "done" {
+		t.Fatalf("the report wins: %+v", got)
+	}
+}
+
+// A cancel is durable only once the broker answers it: until then the notice
+// is redelivered, and the terminal report the broker sends after killing the
+// provider is what ends that - not a refusal it would retry forever.
+func TestCancelAckStopsRedelivery(t *testing.T) {
+	s := open(t)
+	requester, _, task, _ := liveTask(t, s)
+	if _, ok, err := s.TransitionEyesTask(task.TaskID, "broker-1", "accepted", "{}"); err != nil || !ok {
+		t.Fatalf("accept: ok=%v (%v)", ok, err)
+	}
+	if _, err := s.CancelEyesTask(task.TaskID, requester); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := s.PendingCancels("broker-1")
+	if err != nil || len(pending) != 1 || pending[0].TaskID != task.TaskID {
+		t.Fatalf("an unanswered cancel is redelivered: %+v (%v)", pending, err)
+	}
+	var body protocol.TaskCancelMsg
+	if err := json.Unmarshal([]byte(pending[0].Body), &body); err != nil || body.Type != protocol.TaskCancel {
+		t.Fatalf("cancel body %q: %v", pending[0].Body, err)
+	}
+	if only, err := s.PendingLaunches("broker-1"); err != nil || len(only) != 0 {
+		t.Fatalf("a cancelled task is no longer work to run: %+v (%v)", only, err)
+	}
+	before := count(t, s, `SELECT COUNT(*) FROM messages WHERE task_id=?`, task.TaskID)
+
+	child := "eyes-" + task.TaskID
+	got, ok, err := s.TransitionEyesTask(task.TaskID, child, "failed",
+		`{"type":"task.failed","task_id":"`+task.TaskID+`","error":"cancelled"}`)
+	if err != nil || ok || got.State != "cancelled" {
+		t.Fatalf("the child's report acks the cancel: %+v ok=%v (%v)", got, ok, err)
+	}
+	if n := count(t, s, `SELECT cancel_acked FROM eyes_tasks WHERE task_id=?`, task.TaskID); n != 1 {
+		t.Fatalf("the ack must be recorded, cancel_acked=%d", n)
+	}
+	if left, err := s.PendingCancels("broker-1"); err != nil || len(left) != 0 {
+		t.Fatalf("an acked cancel leaves the queue: %+v (%v)", left, err)
+	}
+	if n := count(t, s, `SELECT COUNT(*) FROM messages WHERE task_id=?`, task.TaskID); n != before {
+		t.Fatalf("an ack is not news for the requester: %d task messages, was %d", n, before)
+	}
+	// A broker that lost the response says it again, on either terminal body.
+	if again, ok, err := s.TransitionEyesTask(task.TaskID, child, "done", "{}"); err != nil || ok || again.State != "cancelled" {
+		t.Fatalf("a repeated ack stays ok: %+v ok=%v (%v)", again, ok, err)
+	}
+}
+
+// Who answers a cancel is who could have been running it: the child when the
+// task has one, the broker itself when it never got that far. Anyone else is
+// refused exactly as before, so a stranger cannot retire somebody's task.
+func TestCancelAckSpeaker(t *testing.T) {
+	s := open(t)
+	name, _ := s.Register("/r", "s-a", "hook")
+	registerBroker(t, s, "host:BOX", "broker-1")
+	requester := protocol.AgentRef{Name: name, AgentID: agentID("s-a"), Scope: "/r"}
+	task, _, err := s.AssignEyesTask(EyesRequest{Requester: requester, Brief: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CancelEyesTask(task.TaskID, requester); err != nil {
+		t.Fatal(err)
+	}
+	// No child was ever minted, so the broker's own failure is the answer.
+	got, ok, err := s.TransitionEyesTask(task.TaskID, "broker-1", "failed",
+		`{"type":"task.failed","task_id":"`+task.TaskID+`","error":"cancelled"}`)
+	if err != nil || ok || got.State != "cancelled" {
+		t.Fatalf("the launcher acks a childless cancel: %+v ok=%v (%v)", got, ok, err)
+	}
+	if n := count(t, s, `SELECT cancel_acked FROM eyes_tasks WHERE task_id=?`, task.TaskID); n != 1 {
+		t.Fatalf("the ack must be recorded, cancel_acked=%d", n)
+	}
+
+	s2 := open(t)
+	requester2, _, task2, _ := liveTask(t, s2)
+	registerBroker(t, s2, "host:BOX", "broker-2")
+	if _, err := s2.CancelEyesTask(task2.TaskID, requester2); err != nil {
+		t.Fatal(err)
+	}
+	// This task has a child, so the child is the only thing that can answer.
+	if _, _, err := s2.TransitionEyesTask(task2.TaskID, "broker-1", "failed", "{}"); !errors.Is(err, ErrBadTransition) {
+		t.Fatalf("the launcher must not speak over its child, got %v", err)
+	}
+	if _, _, err := s2.TransitionEyesTask(task2.TaskID, "broker-2", "failed", "{}"); !errors.Is(err, ErrNotYourTask) {
+		t.Fatalf("another broker has no standing, got %v", err)
+	}
+	if n := count(t, s2, `SELECT cancel_acked FROM eyes_tasks WHERE task_id=?`, task2.TaskID); n != 0 {
+		t.Fatalf("a refused report acks nothing, cancel_acked=%d", n)
+	}
+	if left, err := s2.PendingCancels("broker-1"); err != nil || len(left) != 1 {
+		t.Fatalf("the cancel is still owed an answer: %+v (%v)", left, err)
+	}
+}
+
+// A launcher and its child exist only over the relay, so a local session that
+// registered itself under one of their ids speaks for nothing.
+func TestTransitionEyesTaskRefusesALocalActor(t *testing.T) {
+	s := open(t)
+	name, _ := s.Register("/r", "s-a", "hook")
+	registerBroker(t, s, "host:BOX", "broker-1")
+	requester := protocol.AgentRef{Name: name, AgentID: agentID("s-a"), Scope: "/r"}
+	task, _, err := s.AssignEyesTask(EyesRequest{Requester: requester, Brief: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := s.TransitionEyesTask(task.TaskID, "broker-1", "accepted", "{}"); err != nil || !ok {
+		t.Fatalf("accept: ok=%v (%v)", ok, err)
+	}
+	// A hook session in the requester's own workspace, wearing the child's id.
+	child := "eyes-" + task.TaskID
+	if _, err := s.Register("/r", child, "hook"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.TransitionEyesTask(task.TaskID, child, "done",
+		`{"type":"task.result","task_id":"`+task.TaskID+`","status":"ok"}`); !errors.Is(err, ErrNotYourTask) {
+		t.Fatalf("a local session must not report for the task, got %v", err)
+	}
+	if got, _ := s.EyesTask(task.TaskID); got.State != "accepted" {
+		t.Fatalf("a refused report must leave the task alone: %+v", got)
 	}
 }
