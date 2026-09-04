@@ -66,7 +66,7 @@ func TestJoinTCPDoesNotLeakSecret(t *testing.T) {
 	}
 	t.Cleanup(func() { l.Close() })
 	const secret = "super-secret-session"
-	const token = "super-secret-token"
+	const token = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	got := make(chan protocol.Request, 1)
 	go func() {
 		c, err := l.Accept()
@@ -126,6 +126,19 @@ func TestJoinTCPDoesNotLeakSecret(t *testing.T) {
 	}
 }
 
+func TestTCPJoinRejectsBadACToken(t *testing.T) {
+	t.Setenv("AC_TOKEN", "not-hex")
+	err := doJoin([]string{
+		"-addr", "tcp://127.0.0.1:9",
+		"-cred-file", filepath.Join(t.TempDir(), "cred"),
+		"-kind", "eyes",
+		"-session-id", "s1",
+	}, io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "AC_TOKEN") {
+		t.Fatalf("want AC_TOKEN shape error, got %v", err)
+	}
+}
+
 func TestUnixApplyRelayAuthOmitsCreds(t *testing.T) {
 	t.Setenv("AC_TOKEN", "should-not-attach")
 	t.Setenv("AC_SESSION_SECRET", "should-not-attach")
@@ -164,7 +177,7 @@ func TestJoinPersistFailBeforeSuccess(t *testing.T) {
 	if err := os.Mkdir(bad, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("AC_TOKEN", "tok")
+	t.Setenv("AC_TOKEN", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	var stdout, stderr bytes.Buffer
 	err = doJoin([]string{
 		"-addr", "tcp://" + l.Addr().String(),
@@ -209,7 +222,7 @@ func TestJoinReusesCredSessionID(t *testing.T) {
 	if err := saveCred(cred, sessionCred{SessionID: "saved-session", SessionSecret: "old-secret"}); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("AC_TOKEN", "tok")
+	t.Setenv("AC_TOKEN", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	t.Setenv("AC_SESSION_ID", "")
 	t.Setenv("CLAUDE_CODE_SESSION_ID", "")
 	t.Setenv("GROK_SESSION_ID", "")
@@ -252,7 +265,7 @@ func TestJoinPreservesSecretWhenDaemonOmitsIt(t *testing.T) {
 	if err := saveCred(cred, sessionCred{SessionID: "saved-session", SessionSecret: "keep-me"}); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("AC_TOKEN", "tok")
+	t.Setenv("AC_TOKEN", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	t.Setenv("AC_SESSION_ID", "")
 	t.Setenv("CLAUDE_CODE_SESSION_ID", "")
 	t.Setenv("GROK_SESSION_ID", "")

@@ -56,6 +56,9 @@ func applyRelayAuth(req *protocol.Request, addr, credFile string) error {
 		return nil
 	}
 	token := strings.TrimSpace(os.Getenv("AC_TOKEN"))
+	if token != "" && !relayTokenShape(token) {
+		return fmt.Errorf("AC_TOKEN must hold 64 lowercase hex characters")
+	}
 	secret := strings.TrimSpace(os.Getenv("AC_SESSION_SECRET"))
 	if secret == "" && credFile != "" {
 		if fi, err := os.Lstat(credFile); err == nil && fi.Mode().IsRegular() {
@@ -72,6 +75,14 @@ func applyRelayAuth(req *protocol.Request, addr, credFile string) error {
 	req.Token = token
 	req.SessionSecret = secret
 	return nil
+}
+
+func relayTokenShape(t string) bool {
+	if len(t) != 64 || strings.ToLower(t) != t {
+		return false
+	}
+	_, err := hex.DecodeString(t)
+	return err == nil
 }
 
 func generateSessionSecret() (string, error) {
