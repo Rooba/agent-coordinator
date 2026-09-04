@@ -288,3 +288,41 @@ func TestIdleExit(t *testing.T) {
 		t.Fatal("daemon did not idle-exit")
 	}
 }
+
+// The daemon resolves every identity-bearing op's from once, up front: a
+// session cannot act as - or drain the inbox of - an agent that is not its
+// own, while an unidentified unix client keeps working.
+func TestDispatchRefusesForeignFrom(t *testing.T) {
+	sock, _ := startDaemon(t, time.Minute)
+	a := roundTrip(t, sock, protocol.Request{Op: protocol.OpRegister, Scope: "/r", SessionID: "s-a", Source: "hook"})
+	b := roundTrip(t, sock, protocol.Request{Op: protocol.OpRegister, Scope: "/r", SessionID: "s-b", Source: "hook"})
+	if r := roundTrip(t, sock, protocol.Request{Op: protocol.OpSend, Scope: "/r",
+		From: a.Name, To: b.Name, Body: "ping"}); !r.OK {
+		t.Fatalf("seed send: %+v", r)
+	}
+	r := roundTrip(t, sock, protocol.Request{Op: protocol.OpRead, Scope: "/r", SessionID: "s-a", From: b.Name})
+	if r.OK || r.Error != "foreign session" {
+		t.Fatalf("reading a peer's inbox must be refused: %+v", r)
+	}
+	if r := roundTrip(t, sock, protocol.Request{Op: protocol.OpClaim, Scope: "/r", SessionID: "s-a",
+		From: b.Name, Path: "/hub.go"}); r.OK || r.Error != "foreign session" {
+		t.Fatalf("claiming as a peer must be refused: %+v", r)
+	}
+	r = roundTrip(t, sock, protocol.Request{Op: protocol.OpRead, Scope: "/r", SessionID: "s-b", From: b.Name})
+	if !r.OK || len(r.Messages) != 1 {
+		t.Fatalf("the owner still has its mail: %+v", r)
+	}
+	child := roundTrip(t, sock, protocol.Request{Op: protocol.OpRegister, Scope: "/r", SessionID: "s-a",
+		Source: "hook-subagent", AgentID: "a1", AgentType: "Explore"})
+	if r := roundTrip(t, sock, protocol.Request{Op: protocol.OpPeek, Scope: "/r",
+		SessionID: "s-a", From: child.Name}); !r.OK {
+		t.Fatalf("a session may act for its registered child: %+v", r)
+	}
+	if r := roundTrip(t, sock, protocol.Request{Op: protocol.OpPeek, Scope: "/r",
+		SessionID: "s-a", From: a.Name + "/explore-9"}); r.OK {
+		t.Fatalf("an unregistered child name must be refused: %+v", r)
+	}
+	if r := roundTrip(t, sock, protocol.Request{Op: protocol.OpPeek, Scope: "/r", From: a.Name}); !r.OK {
+		t.Fatalf("an unidentified unix caller must still work: %+v", r)
+	}
+}

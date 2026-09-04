@@ -78,6 +78,14 @@ func dialable(sock string) bool {
 	return err == nil
 }
 
+// fromOps are the ops that act AS an agent. Their from is resolved once, up
+// front, instead of being trusted case by case.
+var fromOps = map[string]bool{
+	protocol.OpSend: true, protocol.OpBroadcast: true, protocol.OpRead: true,
+	protocol.OpPeek: true, protocol.OpClaim: true, protocol.OpRelease: true,
+	protocol.OpHistory: true,
+}
+
 func Serve(l net.Listener, st *store.Store, idleTimeout time.Duration) error {
 	st.Housekeep()
 
@@ -191,6 +199,15 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 				return fail(err)
 			}
 		}
+	}
+	// One identity for the whole request: an explicit from must belong to
+	// the calling session, so the cases below can trust req.From.
+	if fromOps[req.Op] {
+		id, err := st.ResolveActor(req.Scope, req.SessionID, req.From)
+		if err != nil {
+			return fail(err)
+		}
+		req.From = id.Name
 	}
 	switch req.Op {
 	case protocol.OpRegister:

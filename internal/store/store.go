@@ -298,6 +298,31 @@ func (s *Store) Identity(scope, sessionID string) (AgentIdentity, error) {
 	return id, nil
 }
 
+// ResolveActor decides which agent a request acts as. An explicit from must
+// name the caller's own row or one of its registered children, so no session
+// can act as - or drain the inbox of - another agent. A caller that names no
+// session is a plain unix client (the CLI, wait): there the socket
+// directory's permissions are the trust boundary, so its name is taken at
+// face value.
+func (s *Store) ResolveActor(scope, callerSessionID, explicitFrom string) (AgentIdentity, error) {
+	if explicitFrom == "" {
+		return s.Identity(scope, callerSessionID)
+	}
+	var sessionID, parentSession string
+	err := s.db.QueryRow(`SELECT session_id, parent_session_id FROM agents WHERE scope=? AND (name=? OR agent_id=?)`,
+		scope, explicitFrom, explicitFrom).Scan(&sessionID, &parentSession)
+	if err == sql.ErrNoRows {
+		return AgentIdentity{}, fmt.Errorf("no agent %q in this workspace", explicitFrom)
+	}
+	if err != nil {
+		return AgentIdentity{}, err
+	}
+	if callerSessionID != "" && callerSessionID != sessionID && callerSessionID != parentSession {
+		return AgentIdentity{}, ErrForeignSession
+	}
+	return s.Identity(scope, sessionID)
+}
+
 func (s *Store) SetStatus(scope, sessionID, status string) error {
 	_, err := s.db.Exec(`UPDATE agents SET status=?, last_seen=? WHERE scope=? AND session_id=?`,
 		status, s.Now().Unix(), scope, sessionID)

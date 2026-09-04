@@ -418,3 +418,39 @@ func TestRelayAgentDoesNotBlockSelfMintedIdentity(t *testing.T) {
 		t.Fatalf("a real hook agent must still block a self-mint, got %v", err)
 	}
 }
+
+// An explicit from must be the caller itself or one of its registered
+// children; a name that merely looks like a child is not one.
+func TestResolveActorAcceptsSelfAndRegisteredChildren(t *testing.T) {
+	s := open(t)
+	parent, _ := s.Register("/r", "s-a", "hook")
+	child, err := s.RegisterChild("/r", "s-a", "sub1", "Explore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, _ := s.Register("/r", "s-b", "hook")
+
+	if id, err := s.ResolveActor("/r", "s-a", ""); err != nil || id.Name != parent {
+		t.Fatalf("no from means the caller: %+v (%v)", id, err)
+	}
+	if id, err := s.ResolveActor("/r", "s-a", parent); err != nil || id.Name != parent || id.AgentID != agentID("s-a") {
+		t.Fatalf("own name: %+v (%v)", id, err)
+	}
+	if id, err := s.ResolveActor("/r", "s-a", agentID("s-a")); err != nil || id.Name != parent {
+		t.Fatalf("own agent id: %+v (%v)", id, err)
+	}
+	if id, err := s.ResolveActor("/r", "s-a", child); err != nil || id.Name != child || id.Parent != parent {
+		t.Fatalf("registered child: %+v (%v)", id, err)
+	}
+	if _, err := s.ResolveActor("/r", "s-a", other); !errors.Is(err, ErrForeignSession) {
+		t.Fatalf("another agent must be refused, got %v", err)
+	}
+	if _, err := s.ResolveActor("/r", "s-a", parent+"/explore-9"); err == nil {
+		t.Fatal("an unregistered child name must be refused")
+	}
+	// A caller that names no session is a plain unix client (the CLI, wait):
+	// the socket directory's permissions are its trust boundary.
+	if id, err := s.ResolveActor("/r", "", other); err != nil || id.Name != other {
+		t.Fatalf("unidentified caller: %+v (%v)", id, err)
+	}
+}
