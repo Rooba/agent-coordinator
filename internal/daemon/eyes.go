@@ -2,7 +2,9 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"slices"
+	"strings"
 
 	"github.com/Rooba/agent-coordinator/internal/protocol"
 	"github.com/Rooba/agent-coordinator/internal/store"
@@ -22,6 +24,15 @@ var taskStates = map[string]string{
 	protocol.TaskFailed:   "failed",
 }
 
+// taskPrefix marks the reserved message family: every task.* body belongs to
+// the eyes lifecycle, so none of them may travel as ordinary mail.
+const taskPrefix = "task."
+
+// errReservedTask answers a task.* body this daemon will not act on: the
+// launch and the cancel are its own to write, and an unknown task.* type is
+// nothing it can honour.
+var errReservedTask = errors.New("reserved task message")
+
 // requestEyes hands one brief to a live host broker. The requester is the
 // authenticated actor, never a name the caller chose, so a report cannot be
 // redirected; the store picks the broker, mints the id and queues the launch
@@ -35,11 +46,18 @@ func requestEyes(st *store.Store, req protocol.Request, actor protocol.AgentRef)
 	return protocol.Response{OK: true, TaskID: task.TaskID, Launcher: &launcher}
 }
 
+// eyesActor is the authenticated caller behind a lifecycle move: the row this
+// request proved, the ref its workspace knows it by, and the provenance the
+// daemon stamped. Nothing here comes from the client's own claims.
+func eyesActor(req protocol.Request, actor protocol.AgentRef) store.EyesActor {
+	return store.EyesActor{Scope: req.Scope, SessionID: req.SessionID, Origin: req.Origin, Ref: actor}
+}
+
 // cancelEyes calls off a task the caller asked for. The store authorizes
 // against the recorded requester and tells the broker in the same transaction,
 // so a repeat is an ok no-op rather than a second task.cancel.
 func cancelEyes(st *store.Store, req protocol.Request, actor protocol.AgentRef) protocol.Response {
-	task, err := st.CancelEyesTask(req.TaskID, actor)
+	task, err := st.CancelEyesTask(req.TaskID, eyesActor(req, actor))
 	if err != nil {
 		return fail(err)
 	}
@@ -50,24 +68,29 @@ func cancelEyes(st *store.Store, req protocol.Request, actor protocol.AgentRef) 
 // and its child's outcome move the task instead of landing as ordinary mail,
 // so the state change and the requester's copy commit together. Anything that
 // is not a task body is left alone for the send it is.
-func taskReport(st *store.Store, req protocol.Request) (protocol.Response, bool) {
+func taskReport(st *store.Store, req protocol.Request, actor protocol.AgentRef) (protocol.Response, bool) {
 	if !sendOps[req.Op] {
 		return protocol.Response{}, false
 	}
+	// The type alone decides whether this is the lifecycle's; only then does
+	// the rest of the body have to be well formed, and a task.* body that is
+	// not a report - or does not decode - is refused rather than delivered.
+	var head struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal([]byte(req.Body), &head) != nil || !strings.HasPrefix(head.Type, taskPrefix) {
+		return protocol.Response{}, false
+	}
 	var body struct {
-		Type   string `json:"type"`
 		TaskID string `json:"task_id"`
 	}
-	if err := json.Unmarshal([]byte(req.Body), &body); err != nil {
-		return protocol.Response{}, false
-	}
-	to, ok := taskStates[body.Type]
-	if !ok {
-		return protocol.Response{}, false
+	to, ok := taskStates[head.Type]
+	if !ok || json.Unmarshal([]byte(req.Body), &body) != nil {
+		return fail(errReservedTask), true
 	}
 	// Who may make this move is the store's call: only the broker holding the
 	// task, or the child it minted for it, has standing in it.
-	if _, _, err := st.TransitionEyesTask(body.TaskID, req.SessionID, to, req.Body); err != nil {
+	if _, _, err := st.TransitionEyesTask(body.TaskID, eyesActor(req, actor), to, req.Body); err != nil {
 		return protocol.Response{Error: relayError(err)}, true
 	}
 	return protocol.Response{OK: true, TaskID: body.TaskID}, true
@@ -78,9 +101,10 @@ func taskReport(st *store.Store, req protocol.Request) (protocol.Response, bool)
 // at-least-once on purpose - a broker that lost a poll must see the work
 // again, and dropping a duplicate by task id is its job.
 func pendingTaskMail(st *store.Store, req protocol.Request) ([]protocol.Message, error) {
-	// The store scopes both queues to the tasks assigned to this session, so
-	// nobody else's work can appear here; the kind check is only a fast path
-	// that keeps an ordinary agent's poll out of the ledger.
+	// Both queues are scoped to the tasks assigned to this session id. Over
+	// the relay the gate has already proved that session; on the unix socket
+	// the caller supplies it, where the socket's permissions are the trust
+	// boundary as they are for every other op.
 	if req.Kind != protocol.KindLauncher {
 		return nil, nil
 	}
@@ -96,32 +120,16 @@ func pendingTaskMail(st *store.Store, req protocol.Request) ([]protocol.Message,
 }
 
 // withPending folds that redelivery queue into a read or a peek reply, ahead
-// of the fresh mail and never twice - whatever this same poll already carries
-// is dropped from it.
+// of the fresh mail. It cannot duplicate anything: a broker's poll leaves the
+// raw launch and cancel rows out, so the queue is the only place it ever sees
+// them - and the only one that knows what is still owed.
 func withPending(st *store.Store, req protocol.Request, resp protocol.Response) protocol.Response {
-	pending, err := pendingTaskMail(st, req)
+	owed, err := pendingTaskMail(st, req)
 	if err != nil {
 		return fail(err)
 	}
-	if len(pending) == 0 {
-		return resp // the ordinary poll, untouched
-	}
-	seen := make(map[int64]bool, len(resp.Messages)+len(resp.PeekIDs))
-	for _, m := range resp.Messages {
-		seen[m.ID] = true
-	}
-	for _, id := range resp.PeekIDs {
-		seen[id] = true
-	}
-	owed := make([]protocol.Message, 0, len(pending))
-	for _, m := range pending {
-		if !seen[m.ID] {
-			seen[m.ID] = true
-			owed = append(owed, m)
-		}
-	}
 	if len(owed) == 0 {
-		return resp // this poll already carries all of it
+		return resp // the ordinary poll, untouched
 	}
 	if req.Op == protocol.OpRead {
 		resp.Messages = append(owed, resp.Messages...)

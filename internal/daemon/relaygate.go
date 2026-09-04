@@ -17,9 +17,10 @@ const (
 	hostScopePrefix = "host:"
 	// eyesSessionPrefix ties a child session to the task it reports on.
 	eyesSessionPrefix = "eyes-"
-	// relayOrigin marks every row created over TCP, so a relay client can
-	// never be mistaken for a hook or MCP session.
-	relayOrigin = "relay"
+	// relayOrigin marks every row created over TCP, and every request that
+	// arrived there, so a relay client can never be mistaken for a hook or
+	// MCP session - nor a local one for a broker.
+	relayOrigin = store.RelayOrigin
 )
 
 // relayOps is everything a relay client may ask for. What is missing is the
@@ -34,13 +35,14 @@ var relayOps = map[string]bool{
 	protocol.OpSendWorkspace: true,
 }
 
-// relayWireErrors are the only store failures whose text may cross the wire.
-// Anything else is this daemon's problem, not the caller's business, so it is
+// relayWireErrors are the only failures whose text may cross the wire: each
+// one is the caller's own mistake, and none of them names anything the caller
+// did not already send. Anything else is this daemon's problem, so it is
 // logged here and answered "internal error".
 var relayWireErrors = []error{
 	store.ErrRelayAuth, store.ErrForeignSession, store.ErrEyesBusy, store.ErrNoLauncher,
 	store.ErrNoProvider, store.ErrBadRuntime, store.ErrUnknownTask, store.ErrNotYourTask,
-	store.ErrTaskNotLive, store.ErrBadTransition,
+	store.ErrTaskNotLive, store.ErrBadTransition, store.ErrNoAgent, errReservedTask,
 }
 
 // relayGate authenticates TCP requests and rewrites their identity from the
@@ -104,8 +106,10 @@ func (g *relayGate) decide(req *protocol.Request) (protocol.Response, bool) {
 	}
 	// The row, never the caller, says who this is - its scope, its name and its
 	// role. A relay client has no subagents, so an agent_id it sent would mint
-	// or retarget a child row in somebody else's workspace.
+	// or retarget a child row in somebody else's workspace. Origin is the
+	// daemon's own stamp: it is what lets this caller speak for a task at all.
 	req.Scope, req.From, req.Kind, req.AgentID = id.Scope, id.Name, id.Kind, ""
+	req.Origin = relayOrigin
 	// A task id belongs to the eyes lifecycle, so ordinary mail never carries
 	// one a relay client chose.
 	if sendOps[req.Op] {
@@ -183,5 +187,18 @@ func relayError(err error) string {
 		}
 	}
 	relayLog("internal: %v", err)
+	return "internal error"
+}
+
+// relayErrorText is the same rule for a failure a dispatch already flattened
+// to text: every op's answer passes it on the way out of the relay, so no
+// store wording reaches a broker just because some op forgot.
+func relayErrorText(msg string) string {
+	for _, wire := range relayWireErrors {
+		if strings.HasPrefix(msg, wire.Error()) {
+			return msg
+		}
+	}
+	relayLog("internal: %s", msg)
 	return "internal error"
 }

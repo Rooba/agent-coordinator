@@ -97,6 +97,10 @@ type Request struct {
 	// AuthSessionID is the launcher session that is minting a kind=eyes child.
 	// SessionID names the new child; AuthSessionID+SessionSecret prove the launcher.
 	AuthSessionID string `json:"auth_session_id,omitempty"`
+	// Origin is where the request arrived - "relay" for an authenticated TCP
+	// caller, empty for the unix socket. The daemon stamps it and it never
+	// travels on the wire, so a client cannot claim provenance it lacks.
+	Origin string `json:"-"`
 }
 
 // AgentRef is a structured address (never a smashed name@path string).

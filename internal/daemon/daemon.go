@@ -98,7 +98,7 @@ var relayReady = func(string) {}
 func relayListener(st *store.Store) (net.Listener, *relayGate) {
 	addr, err := paths.RelayListen()
 	if err != nil {
-		relayLog("%v", err)
+		relayLog("unavailable: %v", err)
 		return nil, nil
 	}
 	if addr == "" {
@@ -106,7 +106,7 @@ func relayListener(st *store.Store) (net.Listener, *relayGate) {
 	}
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
-		relayLog("listen %s: %v", addr, err)
+		relayLog("unavailable: listen %s: %v", addr, err)
 		return nil, nil
 	}
 	// The token is resolved once the relay is really up, so a daemon that
@@ -115,7 +115,7 @@ func relayListener(st *store.Store) (net.Listener, *relayGate) {
 	if gate.insecure {
 		relayLog("WARNING AC_RELAY_INSECURE is set - the shared token is NOT checked")
 	} else if gate.token, err = paths.RelayToken(); err != nil {
-		relayLog("token: %v", err)
+		relayLog("unavailable: token: %v", err)
 		l.Close()
 		return nil, nil
 	}
@@ -226,19 +226,33 @@ func handle(conn net.Conn, st *store.Store, gate *relayGate) {
 	}
 	var req protocol.Request
 	var resp protocol.Response
-	if err := json.Unmarshal(line, &req); err != nil {
-		resp = protocol.Response{Error: "bad request: " + err.Error()}
-	} else if gated, final := gate.check(&req); final {
-		resp = gated
+	if bad := json.Unmarshal(line, &req); bad != nil {
+		resp = protocol.Response{Error: "bad request: " + bad.Error()}
 	} else {
-		resp = dispatch(st, req)
+		// Provenance is the daemon's word, never the client's: whatever the
+		// frame carried is dropped, and only the gate stamps a caller it has
+		// authenticated.
+		req.Origin = ""
+		gated, final := gate.check(&req)
+		resp = gated
+		if !final {
+			resp = dispatch(st, req)
+			// A relay answer says only the documented strings, whatever op
+			// produced it; the unix socket keeps the store's own text.
+			if gate != nil && resp.Error != "" {
+				resp.Error = relayErrorText(resp.Error)
+			}
+		}
 	}
 	out, _ := json.Marshal(resp)
 	conn.Write(append(out, '\n'))
 }
 
 // fail is the one place a failure becomes a response, so every op answers an
-// error the same way.
+// error the same way: the store's own text. That is the unix answer, where
+// the socket's permissions are the trust boundary; anything reachable over
+// the relay is rewritten by relayErrorText on the way out, so only the
+// documented strings leave the daemon.
 func fail(err error) protocol.Response { return protocol.Response{Error: err.Error()} }
 
 func dispatch(st *store.Store, req protocol.Request) protocol.Response {
@@ -287,7 +301,7 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 	// A task.* body is the eyes lifecycle reporting in, not mail: the store
 	// moves the task and delivers the requester's copy in one transaction, so a
 	// state change never exists without the message that announces it.
-	if resp, isReport := taskReport(st, req); isReport {
+	if resp, isReport := taskReport(st, req, actor); isReport {
 		return resp
 	}
 	switch req.Op {
@@ -354,13 +368,23 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 			return fail(err)
 		}
 	case protocol.OpRead:
-		msgs, err := st.Read(req.Scope, req.From)
+		// A broker's poll takes its launches and cancels from the ledger, so
+		// the raw rows are consumed here without being handed back.
+		read := st.Read
+		if req.Kind == protocol.KindLauncher {
+			read = st.ReadBroker
+		}
+		msgs, err := read(req.Scope, req.From)
 		if err != nil {
 			return fail(err)
 		}
 		return withPending(st, req, protocol.Response{OK: true, Messages: msgs})
 	case protocol.OpPeek:
-		info, err := st.PeekMail(req.Scope, req.From, req.AfterID)
+		peek := st.PeekMail
+		if req.Kind == protocol.KindLauncher {
+			peek = st.PeekBrokerMail
+		}
+		info, err := peek(req.Scope, req.From, req.AfterID)
 		if err != nil {
 			return fail(err)
 		}

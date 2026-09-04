@@ -471,6 +471,12 @@ func TestRelayErrorStrings(t *testing.T) {
 			t.Errorf("relayError(%v) = %q, want %q", err, got, want)
 		}
 	}
+	if got := relayErrorText("database is locked: /state/d.db"); got != "internal error" {
+		t.Errorf("a dispatch failure is filtered too: %q", got)
+	}
+	if got := relayErrorText(store.ErrNoLauncher.Error()); got != "no host launcher" {
+		t.Errorf("a documented failure keeps its text: %q", got)
+	}
 	wrapped := fmt.Errorf("%w: done -> accepted", store.ErrBadTransition)
 	if got := relayError(wrapped); got != wrapped.Error() {
 		t.Errorf("a wrapped transition must keep its detail: %q", got)
@@ -857,13 +863,15 @@ func TestCancelEyesAuthorizesAgainstTheRequester(t *testing.T) {
 	if r := cancel("s-a", a.Name, req.TaskID); !r.OK || r.TaskID != req.TaskID {
 		t.Fatalf("a repeat must be a no-op, not an error: %+v", r)
 	}
+	// The cancelled task is no longer work to run, so the queue owes the
+	// cancel and nothing else - the launch it called off is never handed out.
 	inbox := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpRead, SessionID: "broker-1",
 		Token: tok, SessionSecret: secret})
-	if len(inbox.Messages) != 2 {
-		t.Fatalf("the broker holds the launch and exactly one cancel: %+v", inbox.Messages)
+	if len(inbox.Messages) != 1 {
+		t.Fatalf("the broker is owed exactly one cancel: %+v", inbox.Messages)
 	}
 	var body protocol.TaskCancelMsg
-	if err := json.Unmarshal([]byte(inbox.Messages[1].Body), &body); err != nil {
+	if err := json.Unmarshal([]byte(inbox.Messages[0].Body), &body); err != nil {
 		t.Fatal(err)
 	}
 	if body.Type != protocol.TaskCancel || body.TaskID != req.TaskID {
@@ -1144,8 +1152,128 @@ func TestPlainMailCannotSpeakForATask(t *testing.T) {
 	if r := send(`{"type":"note","task_id":"task-000000000000"}`); !r.OK {
 		t.Fatalf("json that is not a task body: %+v", r)
 	}
+	// The launch and the cancel are the daemon's own to write, and an unknown
+	// task.* type is nothing it can honour: none of them is deliverable mail.
+	for _, body := range []string{
+		`{"type":"task.launch","task_id":"` + req.TaskID + `","runtime":"claude"}`,
+		`{"type":"task.cancel","task_id":"` + req.TaskID + `"}`,
+		`{"type":"task.somethingelse","task_id":"` + req.TaskID + `"}`,
+		`{"type":"task.result","task_id":42}`,
+	} {
+		if r := send(body); r.OK || r.Error != "reserved task message" {
+			t.Fatalf("%s must be refused: %+v", body, r)
+		}
+	}
 	read := roundTrip(t, sock, protocol.Request{Op: protocol.OpRead, Scope: "/r", From: a.Name})
 	if len(read.Messages) != 2 || read.Messages[0].Body != "just talking" {
 		t.Fatalf("a refused report must deliver nothing: %+v", read.Messages)
+	}
+}
+
+// A relay port somebody else already holds costs the daemon its relay and
+// nothing else: it says so, and the unix socket keeps serving.
+func TestRelayBindInUseKeepsUnixOnly(t *testing.T) {
+	logged := captureStderr(t)
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
+	t.Setenv("AC_RELAY_LISTEN", busy.Addr().String())
+	sock, _, ready := serveBoth(t)
+	r := roundTrip(t, sock, protocol.Request{Op: protocol.OpRegister, Scope: "/r",
+		SessionID: "s-a", Source: "hook"})
+	if !r.OK || r.Name == "" {
+		t.Fatalf("unix coordination must survive a taken relay port: %+v", r)
+	}
+	select {
+	case addr := <-ready:
+		t.Fatalf("a taken port must not yield a relay listener: %s", addr)
+	default:
+	}
+	if out := logged(); !strings.Contains(out, "unavailable") || !strings.Contains(out, busy.Addr().String()) {
+		t.Fatalf("the daemon must log the relay as unavailable: %q", out)
+	}
+}
+
+// A cancel that lands before the broker's first poll must never be preceded
+// by the launch it called off: the ledger hands out what is still owed, and
+// the raw bodies are not inbox mail at all.
+func TestLauncherNeverReadsALaunchItsCancelKilled(t *testing.T) {
+	sock, addr, tok := startRelayDaemon(t)
+	a := registerUnix(t, sock, "/r", "s-a")
+	_, secret := registerLauncher(t, addr, tok, "broker-1", "host:BOX")
+	req := roundTrip(t, sock, protocol.Request{Op: protocol.OpRequestEyes, Scope: "/r",
+		SessionID: "s-a", From: a.Name, Brief: "look"})
+	if !req.OK {
+		t.Fatalf("request_eyes: %+v", req)
+	}
+	if c := roundTrip(t, sock, protocol.Request{Op: protocol.OpCancelEyes, Scope: "/r",
+		SessionID: "s-a", From: a.Name, TaskID: req.TaskID}); !c.OK {
+		t.Fatalf("cancel_eyes: %+v", c)
+	}
+	poll := func(op string) protocol.Response {
+		return tcpRoundTrip(t, addr, protocol.Request{Op: op, SessionID: "broker-1",
+			Token: tok, SessionSecret: secret})
+	}
+	if p := poll(protocol.OpPeek); p.Unread != 1 || len(p.PeekIDs) != 1 {
+		t.Fatalf("only the cancel is owed: %+v", p)
+	}
+	read := poll(protocol.OpRead)
+	if len(read.Messages) != 1 {
+		t.Fatalf("the broker must never see the launch it lost: %+v", read.Messages)
+	}
+	var body protocol.TaskCancelMsg
+	if err := json.Unmarshal([]byte(read.Messages[0].Body), &body); err != nil ||
+		body.Type != protocol.TaskCancel || body.TaskID != req.TaskID {
+		t.Fatalf("cancel body %q: %v", read.Messages[0].Body, err)
+	}
+}
+
+// Speaking for a task takes a relay row of the right side. The unix socket
+// stamps no provenance at all, and a launcher row wearing the child's session
+// id is still a launcher in its own host scope.
+func TestOnlyARelayRowSpeaksForATask(t *testing.T) {
+	sock, addr, tok := startRelayDaemon(t)
+	a := registerUnix(t, sock, "/r", "s-a")
+	launcher, _ := registerLauncher(t, addr, tok, "broker-1", "host:BOX")
+	req := roundTrip(t, sock, protocol.Request{Op: protocol.OpRequestEyes, Scope: "/r",
+		SessionID: "s-a", From: a.Name, Brief: "look"})
+	if !req.OK {
+		t.Fatalf("request_eyes: %+v", req)
+	}
+	accepted, err := json.Marshal(protocol.TaskAcceptedMsg{Type: protocol.TaskAccepted, TaskID: req.TaskID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The broker's own session id, presented over the unix socket.
+	if r := roundTrip(t, sock, protocol.Request{Op: protocol.OpSend, Scope: "host:BOX",
+		SessionID: "broker-1", From: launcher.Name, To: launcher.Name,
+		Body: string(accepted)}); r.OK || r.Error != "not your task" {
+		t.Fatalf("a unix caller has no standing in the ledger: %+v", r)
+	}
+	// A second broker registering under the child's session id: its row lives
+	// in its own host scope, so it is not the requester's child.
+	other, otherSecret := registerLauncher(t, addr, tok, "eyes-"+req.TaskID, "host:BOX2")
+	result, err := json.Marshal(protocol.TaskResultMsg{Type: protocol.TaskResult,
+		TaskID: req.TaskID, Status: "ok"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpSend, SessionID: "eyes-" + req.TaskID,
+		Token: tok, SessionSecret: otherSecret, To: other.Name,
+		Body: string(result)}); r.OK || r.Error != "not your task" {
+		t.Fatalf("a launcher row must not report as the child: %+v", r)
+	}
+}
+
+// Nothing but the documented strings leaves the relay, whatever op failed.
+func TestRelayAnswersDocumentedErrorsForEveryOp(t *testing.T) {
+	_, addr, tok := startRelayDaemon(t)
+	_, secret := registerLauncher(t, addr, tok, "broker-1", "host:BOX")
+	r := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpSend, SessionID: "broker-1",
+		Token: tok, SessionSecret: secret, To: "nobody", Body: "hi"})
+	if r.OK || r.Error != `no agent "nobody" in this workspace` {
+		t.Fatalf("a caller's own bad address is its own to see: %+v", r)
 	}
 }
