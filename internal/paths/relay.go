@@ -155,9 +155,10 @@ func readToken(path string) (string, error) {
 	if err := checkTokenPerm(path, after); err != nil {
 		return "", err
 	}
-	// One byte past the longest token file this daemon has ever written, so
-	// an oversized file is refused instead of read into memory.
-	b, err := io.ReadAll(io.LimitReader(f, 66))
+	// One byte past the longest legal file (64 hex plus a CRLF), so anything
+	// bigger comes back too long to be a token rather than being silently
+	// truncated to one - and no file is ever read into memory whole.
+	b, err := io.ReadAll(io.LimitReader(f, 67))
 	if err != nil {
 		return "", err
 	}

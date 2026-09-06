@@ -203,14 +203,15 @@ func TestRelayTokenRejectsMalformedFile(t *testing.T) {
 // silently turning the relay off - and nothing else about the file is.
 func TestRelayTokenForgivesOneLegacyNewline(t *testing.T) {
 	for body, want := range map[string]string{
-		hexToken:             hexToken,
-		hexToken + "\n":      hexToken, // minted before this daemon dropped the newline
-		hexToken + "\r\n":    hexToken, // the same file copied through Windows
-		hexToken + "\n\n":    "",
-		hexToken + "\r":      "",
-		" " + hexToken:       "",
-		"\n" + hexToken:      "",
-		hexToken[:63] + "\n": "",
+		hexToken:                hexToken,
+		hexToken + "\n":         hexToken, // minted before this daemon dropped the newline
+		hexToken + "\r\n":       hexToken, // the same file copied through Windows
+		hexToken + "\n\n":       "",
+		hexToken + "\r":         "",
+		hexToken + "\r\njunk\n": "", // the read must outrun the longest legal file
+		" " + hexToken:          "",
+		"\n" + hexToken:         "",
+		hexToken[:63] + "\n":    "",
 	} {
 		dir := t.TempDir()
 		t.Setenv("AC_DB", filepath.Join(dir, "coordinator.db"))
