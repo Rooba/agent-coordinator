@@ -1,5 +1,58 @@
 # agent-coordinator - findings, fixes, and improvements
 
+## 2026-09-06 - open items from the WSL<->Windows eyes relay build
+
+Source: the three-session relay build (bold-ibis/Claude core, eager-crane/Grok CLI+MCP,
+solid-mole broker), landed on main through 8ec17b6. Full ruling ledger and review reports are
+archived (git-ignored) under `.ignore/coordination/bold-ibis-sdd-archive/`.
+
+### Coordinator bugs
+- P1 - `register_agent` on a resumed MCP connection does not bind. After a ~2 day idle gap the
+  session's row had decayed; `register_agent` answered "registered as bold-ibis" but every
+  following call (`claim`, `send_message`, `whoami`) failed with "no agent ... in this
+  workspace". Repro: let a session's agent row age out, then call `register_agent` from the
+  same MCP connection. Fix: bind the freshly registered row to the calling connection (the
+  same bind-file/anchor path the SessionStart hook uses) and make `whoami` reflect it; a
+  registration that returns a name the caller cannot use is worse than an error.
+- P2 - `agent-coordinator wait` is a long-lived subprocess, so a host low-memory watchdog
+  kills it first (observed twice on 2026-09-06 with 13 GB free; the kill came from the Claude
+  Code harness, not the OS). Consider a wake mechanism that does not hold a process per
+  waiting agent, or document that the wait may be killed and must be re-armed.
+
+### Relay polish (parked with rulings, not blocking)
+- `eyesRole` launcher arm compares session only; add the scope compare so a re-registered
+  launcher session in another `host:` scope can never take the role (safe today because
+  `RegisterRelay` refuses a second scope for a relay session id and the deadline sweep settles
+  orphaned tasks).
+- `validTaskID` is now implemented three times (`internal/daemon/eyes.go`,
+  `internal/hostbroker`, `internal/hostrunner`); one shared helper.
+- The cancel path resolves the requester once in `eyesMail` and again in `sendToScope`; thread
+  the resolved id through `Delivery` if the cancel path ever matters for latency.
+- `taskMessageType` treats any duplicate top-level `"type"` as reserved only when a value has
+  the `task.` prefix (fixed in 43b1ba9); keep a test if the classifier changes again.
+- Spec drift to close in `docs/superpowers/specs/2026-09-03-wsl-host-relay-design.md`:
+  section 4 should say the eyes-registration gate answers only `unauthorized` (all
+  ownership/state failures collapse), and section 7 should name the `task.result` status
+  enum the daemon enforces.
+
+### Deployment caveats (v1 shipped without exercising these)
+- The Windows Task Scheduler logon task and Credential Manager pairing were implemented but not
+  executed on the real host; run `agent-coordinator host install` / `host pair` once and record
+  the outcome.
+- No live paid Claude+Chrome turn was executed end to end; the broker advertises Claude only
+  and gates `browser.chrome` on a readiness probe. Do one real turn before relying on it.
+- Codex runner is internal-only (non-interactive `codex exec` shape documented); Grok absent.
+
+### Deferred by design (revisit when needed)
+- v1.1 bidirectional eyes: broker keeps the model's stdin open (`--input-format stream-json`),
+  forwards inbound DMs as user turns and assistant finals as DMs, still with zero credentials in
+  the child. Needs a Chrome-tool-in-stream-json probe first.
+- Per-task minted relay tokens and TLS on the loopback listener (spec section 12 deferrals).
+- Windows `C:\` <-> `/mnt/c` scope mapping (eyes join by explicit WSL scope in v1).
+- Manual `join -kind eyes` over TCP (eyes rows are minted only by a launcher's reissue).
+
+---
+
 **Status 2026-08-05: retro backlog IMPLEMENTED** (pair: solid-mole/Claude + nimble-raven/Grok).
 All P0 (subagent identities + drain guard, hook/MCP identity unification via bind files,
 Grok bootstrap + join + whoami, wait high-water baseline), all P1 (board hides gone + 2h GC,
