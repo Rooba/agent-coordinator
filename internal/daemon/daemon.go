@@ -229,11 +229,13 @@ func handle(conn net.Conn, st *store.Store, gate *relayGate) {
 	if bad := json.Unmarshal(line, &req); bad != nil {
 		resp = protocol.Response{Error: "bad request: " + bad.Error()}
 	} else {
-		// Provenance is the daemon's word, never the client's: whatever the
-		// frame carried is dropped, and only the gate stamps a caller it has
-		// authenticated.
-		req.Origin = ""
-		gated, final := gate.check(&req)
+		// Kind and origin are provenance the daemon stamps, never the client's
+		// word: whatever the frame carried is dropped here, and only the gate
+		// stamps a caller it has authenticated. The kind a relay register asks
+		// to be is a claim, so it travels to the gate as one.
+		claimedKind := req.Kind
+		req.Origin, req.Kind = "", ""
+		gated, final := gate.check(&req, claimedKind)
 		resp = gated
 		if !final {
 			resp = dispatch(st, req)
@@ -256,6 +258,17 @@ func handle(conn net.Conn, st *store.Store, gate *relayGate) {
 func fail(err error) protocol.Response { return protocol.Response{Error: err.Error()} }
 
 func dispatch(st *store.Store, req protocol.Request) protocol.Response {
+	// A relay-owned row is usable only through the gate that proved its
+	// per-session secret, whatever the op: the unix socket may know a broker's
+	// exact scope and session, but that is not authority to act as it, refresh
+	// it or retire it. The caller's row is resolved here, before anything acts
+	// on it. A session with no row yet is a register joining, and every other
+	// op still answers for itself below.
+	if req.SessionID != "" && req.Origin != relayOrigin {
+		if caller, err := st.Identity(req.Scope, req.SessionID); err == nil && caller.Origin == store.RelayOrigin {
+			return fail(store.ErrRelayAuth)
+		}
+	}
 	// Requests carrying the subagent AgentID target the CHILD row derived from
 	// the parent SessionID: register/refresh it up front and retarget the op.
 	childSession := ""
@@ -278,21 +291,25 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 	// calling session, so the cases below can trust req.From - and the ops that
 	// stamp a return address use this ref, never a client's.
 	var actor protocol.AgentRef
-	var actorID store.AgentIdentity
+	var actorIsBroker bool
 	if fromOps[req.Op] {
 		id, err := st.ResolveActor(req.Scope, req.SessionID, req.From)
 		if err != nil {
 			return fail(err)
 		}
-		// A relay-owned row is usable only through the gate that proved its
-		// per-session secret. The unix socket may know its exact scope, session
-		// and name, but that is not authority to touch or act as it.
+		// A from may name a row other than the caller's own, so the same relay
+		// rule applies again here: knowing a relay row's name is not authority
+		// to act as it.
 		if id.Origin == store.RelayOrigin && req.Origin != relayOrigin {
 			return fail(store.ErrRelayAuth)
 		}
-		actorID = id
 		req.From = id.Name
 		actor = protocol.AgentRef{Name: id.Name, AgentID: id.AgentID, Scope: req.Scope}
+		// A broker's poll takes its launches and cancels from the ledger
+		// instead of its inbox. That is decided by the authenticated row and
+		// daemon-stamped provenance, never by the client's wire-level kind.
+		actorIsBroker = req.Origin == relayOrigin && id.Origin == store.RelayOrigin &&
+			id.Kind == protocol.KindLauncher
 	}
 	// Any identified call is a heartbeat that keeps the row fresh and lifts
 	// sticky idle. The exceptions set their own freshness (register, event,
@@ -376,34 +393,27 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 			return fail(err)
 		}
 	case protocol.OpRead:
-		// A broker's poll takes its launches and cancels from the ledger, so
-		// the raw rows are consumed here without being handed back. Broker is
-		// decided by the authenticated row and daemon-stamped provenance, never
-		// by the client's wire-level kind claim.
-		broker := req.Origin == relayOrigin && actorID.Origin == store.RelayOrigin &&
-			actorID.Kind == protocol.KindLauncher
+		// The raw ledger rows are consumed by a broker's poll without being
+		// handed back; what it still owes comes from the queue instead.
 		read := st.Read
-		if broker {
+		if actorIsBroker {
 			read = st.ReadBroker
 		}
 		msgs, err := read(req.Scope, req.From)
 		if err != nil {
 			return fail(err)
 		}
-		return withPending(st, req.SessionID, broker, protocol.OpRead,
-			protocol.Response{OK: true, Messages: msgs})
+		return withPending(st, req, actorIsBroker, protocol.Response{OK: true, Messages: msgs})
 	case protocol.OpPeek:
-		broker := req.Origin == relayOrigin && actorID.Origin == store.RelayOrigin &&
-			actorID.Kind == protocol.KindLauncher
 		peek := st.PeekMail
-		if broker {
+		if actorIsBroker {
 			peek = st.PeekBrokerMail
 		}
 		info, err := peek(req.Scope, req.From, req.AfterID)
 		if err != nil {
 			return fail(err)
 		}
-		return withPending(st, req.SessionID, broker, protocol.OpPeek, protocol.Response{OK: true, Unread: info.Unread,
+		return withPending(st, req, actorIsBroker, protocol.Response{OK: true, Unread: info.Unread,
 			HighWater: info.HighWater, PeekIDs: info.IDs, PeekFroms: info.Froms})
 	case protocol.OpBroadcast:
 		if err := st.Broadcast(req.Scope, req.From, req.Body); err != nil {

@@ -69,11 +69,11 @@ func refuse(reason string) (protocol.Response, bool) {
 // check either answers a relay request outright - a refusal, or the register
 // that binds the caller's credential - or rewrites it for dispatch. Every
 // refusal is logged here, in the one place they all pass through.
-func (g *relayGate) check(req *protocol.Request) (protocol.Response, bool) {
+func (g *relayGate) check(req *protocol.Request, claimedKind string) (protocol.Response, bool) {
 	if g == nil {
 		return protocol.Response{}, false // unix: nothing to prove
 	}
-	resp, final := g.decide(req)
+	resp, final := g.decide(req, claimedKind)
 	if resp.Error != "" {
 		relayLog("refused %s: %s", req.Op, resp.Error)
 	}
@@ -82,7 +82,7 @@ func (g *relayGate) check(req *protocol.Request) (protocol.Response, bool) {
 
 // decide is the gate proper: token, then allowlist, then the session binding,
 // so a caller failing the first two never touches the store.
-func (g *relayGate) decide(req *protocol.Request) (protocol.Response, bool) {
+func (g *relayGate) decide(req *protocol.Request, claimedKind string) (protocol.Response, bool) {
 	// An empty token authorizes nobody: only AC_RELAY_INSECURE, set on
 	// purpose, drops this check.
 	if !g.insecure && (g.token == "" || subtle.ConstantTimeCompare([]byte(req.Token), []byte(g.token)) != 1) {
@@ -98,7 +98,7 @@ func (g *relayGate) decide(req *protocol.Request) (protocol.Response, bool) {
 		return refuse("unauthorized")
 	}
 	if req.Op == protocol.OpRegister {
-		return g.register(req)
+		return g.register(req, claimedKind)
 	}
 	id, err := g.st.VerifyRelaySecret(req.SessionID, req.SessionSecret)
 	if err != nil {
@@ -118,11 +118,13 @@ func (g *relayGate) decide(req *protocol.Request) (protocol.Response, bool) {
 	return protocol.Response{}, false
 }
 
-// register answers the two registrations the relay allows. Each needs proof
-// of its own: a broker brings the secret it preminted for its launcher row,
-// while an eyes child is minted for it by the launcher holding that task.
-func (g *relayGate) register(req *protocol.Request) (protocol.Response, bool) {
-	switch req.Kind {
+// register answers the two registrations the relay allows, and the kind a
+// caller asks to be is the one thing it says about itself that is read here.
+// Each needs proof of its own: a broker brings the secret it preminted for its
+// launcher row, while an eyes child is minted for it by the launcher holding
+// that task.
+func (g *relayGate) register(req *protocol.Request, claimedKind string) (protocol.Response, bool) {
+	switch claimedKind {
 	case protocol.KindLauncher:
 		if !strings.HasPrefix(req.Scope, hostScopePrefix) {
 			return refuse("foreign session")
@@ -131,7 +133,7 @@ func (g *relayGate) register(req *protocol.Request) (protocol.Response, bool) {
 		// mints nothing, so a lost response costs a retry and never an
 		// identity.
 		if _, err := g.st.RegisterRelay(store.RelayRegistration{
-			Scope: req.Scope, SessionID: req.SessionID, Kind: req.Kind, Origin: relayOrigin,
+			Scope: req.Scope, SessionID: req.SessionID, Kind: claimedKind, Origin: relayOrigin,
 			Platform: req.Platform, Capabilities: req.Capabilities, Secret: req.SessionSecret}); err != nil {
 			return refuse(relayError(err))
 		}

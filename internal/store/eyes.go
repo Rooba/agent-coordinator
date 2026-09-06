@@ -511,10 +511,16 @@ func (s *Store) eyesMail(q execQuerier, t EyesTask, role eyesRole, a EyesActor, 
 		if err != nil {
 			return Delivery{}, false, err
 		}
-		// The canceller lives in the requester's workspace by construction -
-		// that is what made it the requester's side in the first place.
-		ref := protocol.AgentRef{Name: a.Ref.Name, AgentID: a.Ref.AgentID, Scope: t.RequesterScope}
-		return Delivery{FromScope: t.RequesterScope, FromName: senderKey(ref), ToScope: l.Scope,
+		// The cancel carries the TASK's requester, not whoever pressed the
+		// button - a bound subagent may be the one cancelling. Every
+		// lifecycle mail then names the same return address, which is the
+		// one the broker matches its launch against and answers on.
+		aid, name, err := s.resolveAgent(q, t.RequesterScope, t.RequesterAgentID)
+		if err != nil {
+			return Delivery{}, false, err
+		}
+		ref := protocol.AgentRef{Name: name, AgentID: aid, Scope: t.RequesterScope}
+		return Delivery{FromScope: t.RequesterScope, FromName: aid, ToScope: l.Scope,
 			ToName: l.AgentID, Body: string(cancel), ReplyTo: &ref, TaskID: t.TaskID}, true, nil
 	}
 	actor, err := s.taskVoice(q, t, a)

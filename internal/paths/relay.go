@@ -137,39 +137,37 @@ func readToken(path string) (string, error) {
 	if !before.Mode().IsRegular() {
 		return "", fmt.Errorf("relay token file %s must be a regular, non-symlink file", path)
 	}
-	if before.Size() != 64 {
-		return "", fmt.Errorf("relay token file %s must hold exactly 64 lowercase hex characters: delete it to mint a new token", path)
-	}
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
+	// What was opened must be the file that was checked: a path swapped
+	// underneath - for a link, a device, or somebody else's file - is refused
+	// rather than read.
 	after, err := f.Stat()
 	if err != nil {
 		return "", err
 	}
-	if !after.Mode().IsRegular() || !os.SameFile(before, after) {
-		return "", fmt.Errorf("relay token file %s changed while opening", path)
-	}
-	current, err := os.Lstat(path)
-	if err != nil || !current.Mode().IsRegular() || !os.SameFile(current, after) {
+	if !os.SameFile(before, after) {
 		return "", fmt.Errorf("relay token file %s changed while opening", path)
 	}
 	if err := checkTokenPerm(path, after); err != nil {
 		return "", err
 	}
-	if after.Size() != 64 {
-		return "", fmt.Errorf("relay token file %s must hold exactly 64 lowercase hex characters: delete it to mint a new token", path)
-	}
-	b, err := io.ReadAll(io.LimitReader(f, 65))
+	// One byte past the longest token file this daemon has ever written, so
+	// an oversized file is refused instead of read into memory.
+	b, err := io.ReadAll(io.LimitReader(f, 66))
 	if err != nil {
 		return "", err
 	}
-	if len(b) != 64 {
-		return "", fmt.Errorf("relay token file %s must hold exactly 64 lowercase hex characters: delete it to mint a new token", path)
+	// Earlier builds ended the file with a newline. Exactly that one line
+	// ending is forgiven, so an upgrade does not strand the paired broker;
+	// everything else has to be the 64 hex characters that were minted.
+	token, hadNewline := strings.CutSuffix(string(b), "\n")
+	if hadNewline {
+		token = strings.TrimSuffix(token, "\r")
 	}
-	token := string(b)
 	if !mintedToken(token) {
 		return "", fmt.Errorf("relay token file %s must hold exactly 64 lowercase hex characters: delete it to mint a new token", path)
 	}

@@ -1252,9 +1252,9 @@ func TestPickLauncherMatchesOnlyKnownProviders(t *testing.T) {
 	}
 }
 
-// The redelivery queue uses the daemon's task stamp and ledger order, so
-// reordering the launch struct's fields cannot silently empty it.
-func TestPendingTaskMailMatchesAnyFieldOrder(t *testing.T) {
+// The redelivery queue selects on the daemon's task_id stamp, never on what
+// the body says, so a launch whose JSON was rewritten is still owed.
+func TestPendingTaskMailFiltersOnTheTaskIDStamp(t *testing.T) {
 	s := open(t)
 	name, _ := s.Register("/r", "s-a", "hook")
 	registerBroker(t, s, "host:BOX", "broker-1")

@@ -86,9 +86,10 @@ func taskReport(st *store.Store, req protocol.Request, actor protocol.AgentRef) 
 		return fail(errReservedTask), true
 	}
 	// Lifecycle mail always uses the structured cross-workspace send and the
-	// exact requester id the daemon put in task.launch. The store still routes
-	// from its ledger, but rejecting any other target catches malformed or
-	// replayed broker frames instead of silently fixing them up.
+	// one requester the daemon stamps on task.launch and task.cancel alike, so
+	// a report answering either is aimed at the same place. The store still
+	// routes from its ledger, but rejecting any other target catches malformed
+	// or replayed broker frames instead of silently fixing them up.
 	task, err := st.EyesTask(taskID)
 	if err != nil {
 		return protocol.Response{Error: relayError(err)}, true
@@ -107,8 +108,9 @@ func taskReport(st *store.Store, req protocol.Request, actor protocol.AgentRef) 
 
 // taskMessageType reads only top-level fields, so nested or quoted task text
 // remains ordinary mail. Once a top-level task.* type is seen, later malformed
-// JSON or a duplicate type still belongs to the reserved family and the strict
-// typed decoder will refuse it.
+// JSON still belongs to the reserved family and the strict typed decoder will
+// refuse it. A repeated type is only the lifecycle's when one of its values
+// names the family - otherwise it is odd JSON, and odd JSON is still mail.
 func taskMessageType(body string) (string, bool) {
 	decoder := json.NewDecoder(strings.NewReader(body))
 	open, err := decoder.Token()
@@ -116,26 +118,27 @@ func taskMessageType(body string) (string, bool) {
 		return "", false
 	}
 	typ := ""
-	found := false
+	seen := false
 	for decoder.More() {
 		key, err := decoder.Token()
 		if err != nil {
-			return typ, strings.HasPrefix(typ, taskPrefix)
+			break
 		}
-		if key == "type" {
-			if found {
-				return taskPrefix, true
-			}
-			found = true
-			if err := decoder.Decode(&typ); err != nil {
-				return "", false
+		if key != "type" {
+			var discard json.RawMessage
+			if err := decoder.Decode(&discard); err != nil {
+				break
 			}
 			continue
 		}
-		var discard json.RawMessage
-		if err := decoder.Decode(&discard); err != nil {
-			return typ, strings.HasPrefix(typ, taskPrefix)
+		var next string
+		if err := decoder.Decode(&next); err != nil {
+			break
 		}
+		if seen && (strings.HasPrefix(typ, taskPrefix) || strings.HasPrefix(next, taskPrefix)) {
+			return taskPrefix, true // reserved, and no one type to decode as
+		}
+		typ, seen = next, true
 	}
 	return typ, strings.HasPrefix(typ, taskPrefix)
 }
@@ -217,15 +220,15 @@ func pendingTaskMail(st *store.Store, sessionID string, broker bool) ([]protocol
 // of the fresh mail. It cannot duplicate anything: a broker's poll leaves the
 // raw launch and cancel rows out, so the queue is the only place it ever sees
 // them - and the only one that knows what is still owed.
-func withPending(st *store.Store, sessionID string, broker bool, op string, resp protocol.Response) protocol.Response {
-	owed, err := pendingTaskMail(st, sessionID, broker)
+func withPending(st *store.Store, req protocol.Request, broker bool, resp protocol.Response) protocol.Response {
+	owed, err := pendingTaskMail(st, req.SessionID, broker)
 	if err != nil {
 		return fail(err)
 	}
 	if len(owed) == 0 {
 		return resp // the ordinary poll, untouched
 	}
-	if op == protocol.OpRead {
+	if req.Op == protocol.OpRead {
 		resp.Messages = append(owed, resp.Messages...)
 		return resp
 	}

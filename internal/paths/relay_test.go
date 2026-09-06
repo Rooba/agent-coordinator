@@ -175,8 +175,9 @@ const hexToken = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd
 // reported, never repaired: a short or hand-typed secret guards the whole
 // relay, and silently replacing it would break the paired broker instead.
 func TestRelayTokenRejectsMalformedFile(t *testing.T) {
-	for _, body := range []string{"hunter2\n", hexToken[:63], hexToken + "\n", hexToken + "extra\n",
-		strings.ToUpper(hexToken) + "\n", "zzzz56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01\n"} {
+	for _, body := range []string{"hunter2\n", hexToken[:63], hexToken + "extra\n",
+		strings.ToUpper(hexToken), hexToken[:63] + "\n",
+		"zzzz56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01"} {
 		dir := t.TempDir()
 		t.Setenv("AC_DB", filepath.Join(dir, "coordinator.db"))
 		t.Setenv("AC_TOKEN", "")
@@ -193,6 +194,39 @@ func TestRelayTokenRejectsMalformedFile(t *testing.T) {
 		}
 		if after, _ := os.ReadFile(path); string(after) != body {
 			t.Fatalf("a bad token file must be left alone, got %q", after)
+		}
+	}
+}
+
+// Earlier builds wrote the token with a trailing newline. That one line
+// ending is forgiven, so upgrading keeps the paired broker working instead of
+// silently turning the relay off - and nothing else about the file is.
+func TestRelayTokenForgivesOneLegacyNewline(t *testing.T) {
+	for body, want := range map[string]string{
+		hexToken:             hexToken,
+		hexToken + "\n":      hexToken, // minted before this daemon dropped the newline
+		hexToken + "\r\n":    hexToken, // the same file copied through Windows
+		hexToken + "\n\n":    "",
+		hexToken + "\r":      "",
+		" " + hexToken:       "",
+		"\n" + hexToken:      "",
+		hexToken[:63] + "\n": "",
+	} {
+		dir := t.TempDir()
+		t.Setenv("AC_DB", filepath.Join(dir, "coordinator.db"))
+		t.Setenv("AC_TOKEN", "")
+		if err := os.WriteFile(filepath.Join(dir, "relay.token"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		got, err := RelayToken()
+		if want == "" {
+			if err == nil {
+				t.Errorf("token file %q must be refused, got %q", body, got)
+			}
+			continue
+		}
+		if err != nil || got != want {
+			t.Errorf("token file %q -> %q (%v), want %q", body, got, err, want)
 		}
 	}
 }

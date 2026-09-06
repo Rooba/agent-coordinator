@@ -462,21 +462,34 @@ func TestUnixCannotActAsRelayRow(t *testing.T) {
 	}
 	lastSeen := eyes[0].LastSeen
 	st.Now = func() time.Time { return time.Unix(lastSeen+10, 0) }
-	for _, op := range []string{protocol.OpRead, protocol.OpPeek} {
+	// Read and peek act AS the row; deregister, idle and event key off
+	// (scope, session) alone. A unix caller reaches the launcher through
+	// none of them - retiring it there would strand the task it is running.
+	for _, op := range []string{protocol.OpRead, protocol.OpPeek, protocol.OpDeregister,
+		protocol.OpIdle, protocol.OpEvent} {
 		got := roundTrip(t, sock, protocol.Request{Op: op, Scope: "host:BOX",
-			SessionID: "broker-1", From: launcher.Name})
+			SessionID: "broker-1", From: launcher.Name, Tool: "Read", Activity: "poking"})
 		if got.OK || got.Error != "unauthorized" || len(got.Messages) != 0 || got.Unread != 0 {
 			t.Fatalf("unix %s as relay row: %+v", op, got)
 		}
 	}
 	eyes, err = st.ListEyes()
-	if err != nil || len(eyes) != 1 || eyes[0].LastSeen != lastSeen {
+	if err != nil || len(eyes) != 1 || eyes[0].LastSeen != lastSeen || eyes[0].Status != "active" {
 		t.Fatalf("rejected unix calls must not touch the launcher: %+v (%v)", eyes, err)
 	}
 	real := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpRead,
 		SessionID: "broker-1", Token: tok, SessionSecret: secret})
 	if !real.OK || len(real.Messages) != 1 || real.Messages[0].TaskID != task.TaskID {
 		t.Fatalf("authenticated relay poll must retain the launch: %+v", real)
+	}
+	// The launcher still retires itself the way it registered: over the
+	// relay, with the secret only it holds.
+	if bye := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpDeregister,
+		SessionID: "broker-1", Token: tok, SessionSecret: secret}); !bye.OK {
+		t.Fatalf("the launcher's own deregister: %+v", bye)
+	}
+	if eyes, err := st.ListEyes(); err != nil || len(eyes) != 0 {
+		t.Fatalf("a launcher that said goodbye must leave the listing: %+v (%v)", eyes, err)
 	}
 }
 
@@ -499,24 +512,25 @@ func TestRelayGateRewritesTheRequest(t *testing.T) {
 	req := protocol.Request{Op: protocol.OpSend, Scope: "/somewhere-else", From: "impostor",
 		To: "someone", Body: "hi", TaskID: "task-000000000000", AgentID: "deadbeef1234",
 		SessionID: "broker-1", Token: "shared-token", SessionSecret: secret}
-	if resp, final := gate.check(&req); final {
+	if resp, final := gate.check(&req, ""); final {
 		t.Fatalf("a proven relay send must dispatch: %+v", resp)
 	}
-	if req.Scope != "host:BOX" || req.From != reg.Name || req.TaskID != "" || req.AgentID != "" {
+	if req.Scope != "host:BOX" || req.From != reg.Name || req.Kind != protocol.KindLauncher ||
+		req.TaskID != "" || req.AgentID != "" {
 		t.Fatalf("gate must answer as the row: %+v", req)
 	}
-	if resp, final := (*relayGate)(nil).check(&req); final {
+	if resp, final := (*relayGate)(nil).check(&req, ""); final {
 		t.Fatalf("the unix listener has no gate: %+v", resp)
 	}
 	// An empty token authorizes nobody: only the explicit insecure flag does.
 	blank := &relayGate{st: st}
 	if resp, _ := blank.check(&protocol.Request{Op: protocol.OpPeek, SessionID: "broker-1",
-		SessionSecret: secret}); resp.Error != "unauthorized" {
+		SessionSecret: secret}, ""); resp.Error != "unauthorized" {
 		t.Fatalf("an empty token must not disable auth: %+v", resp)
 	}
 	open := &relayGate{st: st, insecure: true}
 	if resp, final := open.check(&protocol.Request{Op: protocol.OpPeek, SessionID: "broker-1",
-		SessionSecret: secret}); final {
+		SessionSecret: secret}, ""); final {
 		t.Fatalf("insecure must skip only the token: %+v", resp)
 	}
 }
@@ -1207,6 +1221,56 @@ func TestLauncherPollRedeliversAnUnackedCancel(t *testing.T) {
 	}
 }
 
+// A cancel belongs to the TASK, not to whoever pressed the button: a
+// requester's subagent may call one off, and the broker must still answer the
+// terminal to the address the launch carried. Stamping the canceller there
+// leaves that answer refused, the cancel unacked and the launcher busy.
+func TestCancelKeepsTheRequestersReturnAddress(t *testing.T) {
+	sock, addr, tok, st := relayDaemon(t)
+	requester := registerUnix(t, sock, "/r", "s-a")
+	sub := roundTrip(t, sock, protocol.Request{Op: protocol.OpRegister, Scope: "/r",
+		SessionID: "s-a", Source: "hook-subagent", AgentID: "a1", AgentType: "Explore"})
+	if !sub.OK {
+		t.Fatalf("subagent register: %+v", sub)
+	}
+	_, secret := registerLauncher(t, addr, tok, "broker-1", "host:BOX")
+	task := roundTrip(t, sock, protocol.Request{Op: protocol.OpRequestEyes, Scope: "/r",
+		SessionID: "s-a", From: requester.Name, Brief: "look"})
+	if !task.OK {
+		t.Fatalf("request_eyes: %+v", task)
+	}
+	if c := roundTrip(t, sock, protocol.Request{Op: protocol.OpCancelEyes, Scope: "/r",
+		SessionID: "s-a", From: sub.Name, TaskID: task.TaskID}); !c.OK {
+		t.Fatalf("the requester's subagent may cancel: %+v", c)
+	}
+	// The broker lost the launch response, so the cancel is the first frame
+	// it acts on and its return address is the only one it has.
+	inbox := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpRead, SessionID: "broker-1",
+		Token: tok, SessionSecret: secret})
+	if len(inbox.Messages) != 1 || inbox.Messages[0].ReplyTo == nil {
+		t.Fatalf("the broker is owed the cancel: %+v", inbox.Messages)
+	}
+	if got := *inbox.Messages[0].ReplyTo; got != requester {
+		t.Fatalf("the cancel must answer to the requester, got %+v", got)
+	}
+	failed, err := json.Marshal(protocol.TaskFailedMsg{Type: protocol.TaskFailed,
+		TaskID: task.TaskID, Error: "cancelled"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := tcpRoundTrip(t, addr, protocol.Request{Op: protocol.OpSendWorkspace, SessionID: "broker-1",
+		Token: tok, SessionSecret: secret, Body: string(failed),
+		Target: inbox.Messages[0].ReplyTo}); !r.OK {
+		t.Fatalf("the launcher's terminal answers the cancel: %+v", r)
+	}
+	if got, err := st.EyesTask(task.TaskID); err != nil || !got.CancelAcked {
+		t.Fatalf("the answer must ack the cancel: %+v (%v)", got, err)
+	}
+	if l, err := st.PickLauncher(); err != nil || l.SessionID != "broker-1" {
+		t.Fatalf("the ack must free the launcher: %+v (%v)", l, err)
+	}
+}
+
 // The task.* bodies are the lifecycle's, not mail's: an agent with no
 // standing in a task cannot move it and delivers nothing by trying, while
 // anything that is not a task body travels as the ordinary mail it is.
@@ -1242,6 +1306,12 @@ func TestPlainMailCannotSpeakForATask(t *testing.T) {
 	if r := send(`{"type":"note","task_id":"task-000000000000"}`); !r.OK {
 		t.Fatalf("json that is not a task body: %+v", r)
 	}
+	// A repeated key is odd JSON, not a claim on the lifecycle: it is
+	// reserved only when one of its values names the family.
+	repeated := `{"type":"note","type":"chat"}`
+	if r := send(repeated); !r.OK {
+		t.Fatalf("a duplicate type nobody claims is ordinary mail: %+v", r)
+	}
 	// The launch and the cancel are the daemon's own to write, and an unknown
 	// task.* type is nothing it can honour: none of them is deliverable mail.
 	for _, body := range []string{
@@ -1249,13 +1319,16 @@ func TestPlainMailCannotSpeakForATask(t *testing.T) {
 		`{"type":"task.cancel","task_id":"` + req.TaskID + `"}`,
 		`{"type":"task.somethingelse","task_id":"` + req.TaskID + `"}`,
 		`{"type":"task.result","task_id":42}`,
+		`{"type":"task.result","type":"note"}`,
+		`{"type":"note","type":"task.result"}`,
 	} {
 		if r := send(body); r.OK || r.Error != "reserved task message" {
 			t.Fatalf("%s must be refused: %+v", body, r)
 		}
 	}
 	read := roundTrip(t, sock, protocol.Request{Op: protocol.OpRead, Scope: "/r", From: a.Name})
-	if len(read.Messages) != 2 || read.Messages[0].Body != "just talking" {
+	if len(read.Messages) != 3 || read.Messages[0].Body != "just talking" ||
+		read.Messages[2].Body != repeated {
 		t.Fatalf("a refused report must deliver nothing: %+v", read.Messages)
 	}
 }
