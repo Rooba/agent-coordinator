@@ -131,7 +131,9 @@ func doJoin(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("%s", errMsg)
 	}
 	fmt.Fprintf(stdout, "[coordinator] you are '%s' in this workspace. Peer tools (MCP agent-coordinator): status_board, list_agents, send_message, read_messages, broadcast. "+
-		"To be wakeable while waiting or delegating, arm a background task first: agent-coordinator wait '%s' - it exits the moment new mail arrives and the harness re-invokes you.\n",
+		"To stay reachable while waiting or delegating, run: agent-coordinator wait '%s' -timeout 570 - it exits the moment new mail arrives. "+
+		"Background it only if your harness re-invokes you when a background task exits (Claude Code does; Codex does not); "+
+		"otherwise block on it in the foreground before yielding.\n",
 		resp.Name, resp.Name)
 	return nil
 }

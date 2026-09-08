@@ -65,10 +65,17 @@ details are in the agent-coordinator README under "Optional Windows host Chrome 
 
 ## Wake pattern (be woken, do not busy-poll)
 
-Arm a background task: `agent-coordinator wait '<yourname>' -timeout <sec>` (default 570s). It
-baselines on your current high-water message id at arm time and exits 0 only when **newer** mail
-arrives (stale backlog does not wake). On success stdout is `mail from=... count=N ids=...`; on
-timeout `timeout` (exit 1). Treat exit 0 as a WAKE SIGNAL, then confirm with `read_messages`.
+Run `agent-coordinator wait '<yourname>' -timeout <sec>` (default 570s). Once stderr prints
+`armed after_id=N`, its durable cursor covers messages across a killed or timed-out waiter;
+promptly re-arm either one. On success stdout is `mail from=... count=N ids=...`; on timeout it is
+`timeout` (exit 1). Treat exit 0 as a WAKE SIGNAL, promptly confirm with `read_messages`, then
+re-arm; the next quiet peek advances past the mail you consumed.
+
+Foreground or background depends on your harness. Background is correct only where the harness
+starts a NEW TURN when a background task exits - Claude Code does this. Codex does not: its
+background terminals yield mid-turn and never re-invoke the model on exit, so a Codex agent that
+backgrounds the wait and ends its turn goes deaf. Under Codex (and any harness you are unsure
+about) block on the wait in the FOREGROUND as the last action of the turn.
 
 ## DO
 
@@ -487,11 +494,16 @@ than that baseline appears. Stale backlog that was already unread when
 Peeking never consumes mail or the once-only notice nudge.
 
 An agent blocked on a synchronous subagent has no harness touchpoint and
-cannot be woken. But an agent that arms `wait` as a BACKGROUND task before
-delegating or idling gets re-invoked by the harness the moment `wait`
-exits - i.e. the moment **new** mail arrives. Arm first, then delegate. The
-SessionStart injection (or `agent-coordinator join`) teaches every agent
-this pattern with its own name filled in.
+cannot be woken. An agent that arms `wait` as a BACKGROUND task before
+delegating or idling gets re-invoked the moment `wait` exits - i.e. the
+moment new mail arrives - but only on harnesses that start a new turn
+when a background task completes. Claude Code does. Codex does not: its
+background terminals yield control back mid-turn and produce no new turn
+on exit, so under Codex the wait must be run in the FOREGROUND as the
+last action of the turn. Wait for the `armed` line, then delegate; if
+the process is killed or times out, promptly re-arm it. The SessionStart
+injection (or `agent-coordinator join`) teaches every agent this pattern
+with its own name filled in.
 
 ### Bootstrap without hooks (`join`)
 

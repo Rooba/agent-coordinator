@@ -161,7 +161,10 @@ func Run(stdin io.Reader, stdout io.Writer, socketPath string) {
 		if resp.Name != "" {
 			emit(stdout, "SessionStart", fmt.Sprintf(
 				"[coordinator] you are '%s' in this workspace. Peer tools (MCP agent-coordinator): status_board, list_agents, send_message, read_messages, broadcast. "+
-					"To be wakeable while waiting or delegating, arm a background task first: agent-coordinator wait '%s' - it exits the moment a DM arrives and the harness re-invokes you.",
+					"To stay reachable while waiting on a peer, run: agent-coordinator wait '%s' -timeout 570 - it exits the moment a DM arrives. "+
+					"Run it in the FOREGROUND and block on it unless you know your harness starts a new turn when a background task exits "+
+					"(Claude Code does; Codex background terminals do NOT - they yield and never call you back). "+
+					"When it returns, call read_messages, then re-arm. Do not end your turn with an unread inbox and no armed wait.",
 				resp.Name, resp.Name))
 		}
 	}
