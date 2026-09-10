@@ -184,11 +184,14 @@ func (s *Store) ReissueEyesChild(taskID, launcherSession, launcherSecret string)
 	if !t.unsettled() {
 		return RelayResult{}, ErrTaskNotLive
 	}
-	launcher, err := s.agentBySession(tx, launcherSession)
-	if err != nil {
+	// The launcher is read in the workspace its task recorded, so a session
+	// id that came back in another host scope is a different broker and can
+	// never claim this task's child.
+	launcher, err := s.agentAt(tx, t.LauncherScope, launcherSession)
+	switch {
+	case err != nil && !errors.Is(err, ErrNoSession):
 		return RelayResult{}, err
-	}
-	if launcher.Origin != "relay" || launcher.Kind != protocol.KindLauncher {
+	case err != nil, launcher.Origin != RelayOrigin, launcher.Kind != protocol.KindLauncher:
 		return RelayResult{}, ErrForeignSession
 	}
 	if subtle.ConstantTimeCompare([]byte(sha256Hex(launcherSecret)), []byte(launcher.secretHash)) != 1 {

@@ -83,15 +83,17 @@ func hostInstall(ctx context.Context, args []string, stdout io.Writer) error {
 	claudeExe := fs.String("claude-exe", "", "absolute Claude executable")
 	claudeDir := fs.String("claude-workdir", "", "absolute Claude working directory")
 	claudeConfig := fs.String("claude-config-dir", "", "isolated Claude config directory")
+	claudeModel := fs.String("claude-model", "", "Claude model alias or id for eyes turns (default sonnet)")
+	claudeCredentials := fs.String("claude-credentials", "", "main Claude credentials file mirrored into the isolated config directory (default <user profile>/.claude/.credentials.json)")
 	claudeReady := fs.Bool("claude-chrome-ready", false, "assert a manual Claude Chrome smoke probe passed")
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 {
-		return errors.New("usage: agent-coordinator host install --claude-exe PATH --claude-workdir PATH --claude-config-dir PATH --claude-chrome-ready [--addr IP:PORT] [--dry-run]")
+		return errors.New("usage: agent-coordinator host install --claude-exe PATH --claude-workdir PATH --claude-config-dir PATH --claude-chrome-ready [--claude-model ALIAS] [--claude-credentials PATH] [--addr IP:PORT] [--dry-run]")
 	}
 	if !*claudeReady {
 		return errors.New("install requires a completed manual Claude Chrome smoke probe")
 	}
 	config := hostbroker.HostConfig{Version: hostbroker.HostConfigVersion, Addr: *addr, Provider: "claude", Executable: *claudeExe,
-		WorkingDir: *claudeDir, ConfigDir: *claudeConfig, BrowserReady: true}
+		WorkingDir: *claudeDir, ConfigDir: *claudeConfig, ClaudeModel: *claudeModel, ClaudeCredentials: *claudeCredentials, BrowserReady: true}
 	if err := config.Validate(); err != nil {
 		return err
 	}
@@ -164,6 +166,7 @@ func hostRun(ctx context.Context, args []string) error {
 	}
 	provider, err := hostrunner.NewClaudeProvider(hostrunner.ClaudeConfig{
 		Executable: config.Executable, WorkingDir: config.WorkingDir, ConfigDir: config.ConfigDir,
+		Model: config.ClaudeModel, Credentials: config.ClaudeCredentials,
 	})
 	if err != nil {
 		return err
@@ -203,6 +206,8 @@ func parseHostRunConfig(args []string, config hostbroker.HostConfig) (hostbroker
 	claudeExe := fs.String("claude-exe", config.Executable, "absolute Claude executable")
 	claudeDir := fs.String("claude-workdir", config.WorkingDir, "absolute Claude working directory")
 	claudeConfig := fs.String("claude-config-dir", config.ConfigDir, "isolated Claude config directory")
+	claudeModel := fs.String("claude-model", config.ClaudeModel, "Claude model alias or id for eyes turns (default sonnet)")
+	claudeCredentials := fs.String("claude-credentials", config.ClaudeCredentials, "main Claude credentials file mirrored into the isolated config directory (default <user profile>/.claude/.credentials.json)")
 	claudeReady := fs.Bool("claude-chrome-ready", config.BrowserReady, "assert a manual Claude Chrome smoke probe passed")
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 {
 		return hostbroker.HostConfig{}, errors.New("usage: agent-coordinator host run [Claude provider configuration flags]")
@@ -211,7 +216,7 @@ func parseHostRunConfig(args []string, config hostbroker.HostConfig) (hostbroker
 		return hostbroker.HostConfig{}, errors.New("no readiness-gated provider configured; complete a manual Claude Chrome smoke probe first")
 	}
 	config = hostbroker.HostConfig{Version: hostbroker.HostConfigVersion, Addr: *addr, Provider: "claude", Executable: *claudeExe,
-		WorkingDir: *claudeDir, ConfigDir: *claudeConfig, BrowserReady: *claudeReady}
+		WorkingDir: *claudeDir, ConfigDir: *claudeConfig, ClaudeModel: *claudeModel, ClaudeCredentials: *claudeCredentials, BrowserReady: *claudeReady}
 	if err := config.Validate(); err != nil {
 		return hostbroker.HostConfig{}, err
 	}

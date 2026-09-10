@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -389,6 +390,184 @@ func TestWhoamiReturnsBoundIdentity(t *testing.T) {
 	}
 	if len(*got) != 2 || (*got)[1].Op != protocol.OpWhoami || (*got)[1].SessionID != "claude-uuid-1" {
 		t.Fatalf("want register + whoami for the bound session: %+v", *got)
+	}
+}
+
+func persistentMCP(t *testing.T, sock string) (call func(id int, tool, args string) string, closeFn func()) {
+	t.Helper()
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	done := make(chan error, 1)
+	go func() { done <- Serve(inR, outW, sock, cwd) }()
+	sc := bufio.NewScanner(outR)
+	call = func(id int, tool, args string) string {
+		t.Helper()
+		fmt.Fprintf(inW, `{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":%q,"arguments":%s}}`+"\n", id, tool, args)
+		if !sc.Scan() {
+			t.Fatalf("no response for %s #%d: %v", tool, id, sc.Err())
+		}
+		return sc.Text()
+	}
+	closeFn = func() {
+		t.Helper()
+		inW.Close()
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	return call, closeFn
+}
+
+func rpcText(t *testing.T, line string) string {
+	t.Helper()
+	var env struct {
+		Result struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(line), &env); err != nil {
+		t.Fatal(err)
+	}
+	if len(env.Result.Content) == 0 {
+		t.Fatalf("no text content: %s", line)
+	}
+	return env.Result.Content[0].Text
+}
+
+func whoamiName(t *testing.T, line string) string {
+	t.Helper()
+	var id struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal([]byte(rpcText(t, line)), &id); err != nil {
+		t.Fatal(err)
+	}
+	return id.Name
+}
+
+func readBindFile(t *testing.T, dir string, anchor int) hookcli.Bind {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, fmt.Sprintf("%d.json", anchor)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b hookcli.Bind
+	if err := json.Unmarshal(data, &b); err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// register_agent must talk to the daemon even when a name is already cached,
+// write a bind file, and keep the row on EOF (same path the SessionStart hook uses).
+func TestRegisterAgentReRegistersCachedIdentity(t *testing.T) {
+	dir := stubBind(t, []int{42})
+	sock, got := fakeDaemon(t, protocol.Response{OK: true, Name: "bold-ibis", AgentID: "aabbccddeeff", Source: "mcp"})
+	call, closeFn := persistentMCP(t, sock)
+	if out := call(1, "send_message", `{"to":"peer","body":"hi"}`); !strings.Contains(out, `"content"`) {
+		t.Fatalf("send: %s", out)
+	}
+	if out := call(2, "register_agent", `{}`); !strings.Contains(out, "registered as bold-ibis") {
+		t.Fatalf("register_agent: %s", out)
+	}
+	if out := call(3, "whoami", `{}`); !strings.Contains(out, `\"name\": \"bold-ibis\"`) {
+		t.Fatalf("whoami: %s", out)
+	}
+	closeFn()
+	regs := 0
+	var second protocol.Request
+	for _, r := range *got {
+		if r.Op == protocol.OpRegister {
+			regs++
+			if regs == 2 {
+				second = r
+			}
+		}
+		if r.Op == protocol.OpDeregister {
+			t.Fatalf("explicit register must bind the row: %+v", *got)
+		}
+	}
+	if regs != 2 {
+		t.Fatalf("register_agent must re-register a cached name, got %d: %+v", regs, *got)
+	}
+	if second.OnlyIfNoHook || second.SessionID == "" {
+		t.Fatalf("explicit re-register: %+v", second)
+	}
+	b := readBindFile(t, dir, 42)
+	if b.SessionID != second.SessionID || b.Name != "bold-ibis" || b.Scope != scope.Resolve(cwd) {
+		t.Fatalf("bind file: %+v", b)
+	}
+}
+
+// After the store row is GC'd, register_agent on the same MCP connection must
+// recreate it so whoami and claim succeed under the same name.
+func TestRegisterAgentRebindsAgedOutRow(t *testing.T) {
+	dir := stubBind(t, []int{42})
+	var mu sync.Mutex
+	now := time.Unix(1_000_000, 0)
+	sock, st, _ := startDaemonPrepared(t, func(st *store.Store) {
+		st.Now = func() time.Time {
+			mu.Lock()
+			defer mu.Unlock()
+			return now
+		}
+	})
+	call, closeFn := persistentMCP(t, sock)
+	defer closeFn()
+
+	reg := call(1, "register_agent", `{}`)
+	name := strings.TrimPrefix(rpcText(t, reg), "registered as ")
+	if name == "" {
+		t.Fatalf("register_agent: %s", reg)
+	}
+
+	mu.Lock()
+	now = now.Add(3 * time.Hour)
+	mu.Unlock()
+	if err := st.Housekeep(); err != nil {
+		t.Fatal(err)
+	}
+
+	send := call(2, "send_message", `{"to":"peer","body":"hi"}`)
+	if !strings.Contains(send, `"isError":true`) || !strings.Contains(send, "no agent") {
+		t.Fatalf("send after purge must fail until rebind: %s", send)
+	}
+
+	reg2 := call(3, "register_agent", `{}`)
+	if !strings.Contains(reg2, "registered as "+name) {
+		t.Fatalf("rebind register_agent: %s", reg2)
+	}
+	who := call(4, "whoami", `{}`)
+	if got := whoamiName(t, who); got != name {
+		t.Fatalf("whoami after rebind: got %q want %q in %s", got, name, who)
+	}
+	claimed := call(5, "claim", `{"path":"todo:p1-rebind"}`)
+	if !strings.Contains(claimed, "claimed todo:p1-rebind") {
+		t.Fatalf("claim after rebind: %s", claimed)
+	}
+
+	b := readBindFile(t, dir, 42)
+	if b.Name != name || b.SessionID == "" {
+		t.Fatalf("bind after rebind: %+v", b)
+	}
+}
+
+// A bind written by register_agent lets a new MCP process adopt the same row.
+func TestRegisterAgentBindSurvivesProcessRestart(t *testing.T) {
+	stubBind(t, []int{42})
+	sock, _ := startDaemon(t)
+	out := rpc(t, sock,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"register_agent","arguments":{}}}`)
+	name := strings.TrimPrefix(rpcText(t, out[0]), "registered as ")
+	if name == "" {
+		t.Fatalf("register: %s", out[0])
+	}
+	out2 := rpc(t, sock,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"whoami","arguments":{}}}`)
+	if got := whoamiName(t, out2[0]); got != name {
+		t.Fatalf("restarted MCP must adopt the bind: got %q want %q in %s", got, name, out2[0])
 	}
 }
 

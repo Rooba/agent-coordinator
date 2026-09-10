@@ -11,20 +11,26 @@ import (
 	"path/filepath"
 	"strings"
 	"unicode"
+
+	"github.com/Rooba/agent-coordinator/internal/hostrunner"
 )
 
 const HostConfigVersion = 1
 
 var ErrConfigNotFound = errors.New("host broker is not configured")
 
+// Fields added after version 1 stay optional: configs sealed without them decode
+// to empty and keep their defaults.
 type HostConfig struct {
-	Version      int    `json:"version"`
-	Addr         string `json:"addr"`
-	Provider     string `json:"provider"`
-	Executable   string `json:"executable"`
-	WorkingDir   string `json:"working_dir"`
-	ConfigDir    string `json:"config_dir"`
-	BrowserReady bool   `json:"browser_ready"`
+	Version           int    `json:"version"`
+	Addr              string `json:"addr"`
+	Provider          string `json:"provider"`
+	Executable        string `json:"executable"`
+	WorkingDir        string `json:"working_dir"`
+	ConfigDir         string `json:"config_dir"`
+	ClaudeModel       string `json:"claude_model"`
+	ClaudeCredentials string `json:"claude_credentials"`
+	BrowserReady      bool   `json:"browser_ready"`
 }
 
 func (c HostConfig) Validate() error {
@@ -44,13 +50,20 @@ func (c HostConfig) Validate() error {
 		{name: "Claude config directory", value: c.ConfigDir, directory: true},
 	} {
 		info, err := os.Stat(path.value)
-		if !filepath.IsAbs(path.value) || len(path.value) > 512 || hasControl(path.value) || err != nil || info.IsDir() != path.directory {
+		if !safePath(path.value) || err != nil || info.IsDir() != path.directory {
 			kind := "file"
 			if path.directory {
 				kind = "directory"
 			}
 			return fmt.Errorf("%s must be an existing absolute %s", path.name, kind)
 		}
+	}
+	if c.ClaudeModel != "" && !hostrunner.ValidModel(c.ClaudeModel) {
+		return errors.New("Claude model must be a short alias or id of letters, digits, '.', '-' or '_'")
+	}
+	// The credentials file is copied per turn, so only its shape is checked here.
+	if c.ClaudeCredentials != "" && !safePath(c.ClaudeCredentials) {
+		return errors.New("Claude credentials must be an absolute file path")
 	}
 	workingDir, workErr := filepath.EvalSymlinks(c.WorkingDir)
 	configDir, configErr := filepath.EvalSymlinks(c.ConfigDir)
@@ -61,8 +74,8 @@ func (c HostConfig) Validate() error {
 	return nil
 }
 
-func hasControl(value string) bool {
-	return strings.IndexFunc(value, unicode.IsControl) >= 0
+func safePath(value string) bool {
+	return filepath.IsAbs(value) && len(value) <= 512 && strings.IndexFunc(value, unicode.IsControl) < 0
 }
 
 type ConfigStore interface {

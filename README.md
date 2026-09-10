@@ -291,6 +291,7 @@ New-Item -ItemType Directory -Force $workDir, $configDir | Out-Null
   --claude-exe $claudeExe `
   --claude-workdir $workDir `
   --claude-config-dir $configDir `
+  --claude-model sonnet `
   --claude-chrome-ready
 ```
 
@@ -299,6 +300,12 @@ the protected configuration, creates a least-privilege per-user Task Scheduler e
 interactive logon token, and starts it immediately. It starts again when that user logs on. Append
 `--dry-run` to validate the inputs and print the scheduler plan without saving configuration or
 changing Task Scheduler.
+
+Eyes turns run on Sonnet by default; `--claude-model` selects another alias or model id instead of
+your account default. Before each turn the broker refreshes the isolated login in
+`--claude-config-dir` from your main Claude credentials file (`--claude-credentials`, by default
+`%USERPROFILE%\.claude\.credentials.json`) whenever that file is the newer of the two, so signing in
+again on your main Claude keeps the bridge working.
 
 For foreground debugging, first persist a valid configuration with `host install`, then stop the
 scheduled copy so the single-instance lock is free:
@@ -309,8 +316,9 @@ scheduled copy so the single-instance lock is free:
 ```
 
 `host run` accepts temporary `--addr`, `--claude-exe`, `--claude-workdir`,
-`--claude-config-dir`, and `--claude-chrome-ready` overrides, but does not save them. Press Ctrl+C to
-stop it. Re-run `host install` with the full configuration to restore logon startup.
+`--claude-config-dir`, `--claude-model`, `--claude-credentials`, and `--claude-chrome-ready`
+overrides, but does not save them. Press Ctrl+C to stop it. Re-run `host install` with the full
+configuration to restore logon startup.
 
 To inspect or remove the scheduled task:
 
@@ -484,11 +492,20 @@ fires consumes it, the mail itself stays unread until `read_messages`):
 agent-coordinator wait <name> [-timeout <seconds>] [-interval <seconds>]
 ```
 
-`wait` resolves the workspace scope from its cwd, records the agent's
-**high-water** message id at arm time, then polls the daemon (read-only
-peek, default every 2s) until an unread message with id strictly greater
-than that baseline appears. Stale backlog that was already unread when
-`wait` started does **not** wake. Exit 0 prints
+`wait` resolves the workspace scope from its cwd and checkpoints
+the agent's **high-water** message id, then polls the daemon (read-only peek,
+default every 2s) until a later unread message appears. It prints
+`armed after_id=N` to stderr only after that checkpoint is durable; delegate
+or idle after seeing it. A first-ever arm ignores the backlog included in its
+initial high-water mark.
+
+The cursor survives a killed waiter and a normal timeout, so promptly re-running
+the same scoped name covers mail delivered in either re-arm gap. Each re-arm
+refreshes its 24-hour expiry. A wake does not advance past unread mail until a
+later quiet peek proves it was consumed: a waiter killed before its wake reaches
+the harness therefore leaves the mail available to wake its replacement. Concurrent
+waiters may both report the same mail, but cannot checkpoint past it. Corrupt or
+expired state is safely replaced with a fresh baseline. Exit 0 prints
 `mail from=<names> count=N ids=...`; exit 1 on timeout prints `timeout`
 (default 570s, under common 600s background caps); exit 2 on usage error.
 Peeking never consumes mail or the once-only notice nudge.
@@ -520,7 +537,9 @@ id (name will not stick across restarts).
 ## Configuration
 
 - `AC_SOCKET` - socket path. Default `$XDG_RUNTIME_DIR/agent-coordinator.sock`;
-  if `XDG_RUNTIME_DIR` is unset, a private per-uid directory
+  if `XDG_RUNTIME_DIR` is unset, `/run/user/<uid>/agent-coordinator.sock` when
+  that directory exists and is owned by you (so shims launched without a login
+  environment still reach the same daemon), else a private per-uid directory
   `/tmp/agent-coordinator-<uid>/agent-coordinator.sock` (mode 0700). On
   Windows: `%LOCALAPPDATA%\agent-coordinator\ac.sock`.
 - `AC_DB` - database path. Default `~/.local/state/agent-coordinator/coordinator.db`

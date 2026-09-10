@@ -181,7 +181,8 @@ func TestFailOpenWithoutDaemon(t *testing.T) {
 // Subagent tool events carry the child identity fields so the daemon records
 // the activity under the CHILD row (no more "(subagent: X)" tag on the parent).
 func TestSubagentEventCarriesChildIdentity(t *testing.T) {
-	sock, got := fakeDaemon(t, protocol.Response{OK: true})
+	sock, got := fakeDaemon(t, protocol.Response{OK: true, Name: "vivid-owl/explore-1",
+		Notices: []string{"[coordinator] 1 new message from amber-fox - call read_messages"}})
 	var out bytes.Buffer
 	Run(bytes.NewReader(fixture(t, "post_bash_subagent.json")), &out, sock)
 	if len(*got) != 1 {
@@ -193,6 +194,14 @@ func TestSubagentEventCarriesChildIdentity(t *testing.T) {
 	}
 	if strings.Contains(r.Activity, "subagent") {
 		t.Fatalf("activity must not carry the old parent-row tag: %q", r.Activity)
+	}
+	for _, want := range []string{"additionalContext", "vivid-owl/explore-1", "from='vivid-owl/explore-1'", "amber-fox"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("stdout missing %q: %s", want, out.String())
+		}
+	}
+	if strings.Count(out.String(), "additionalContext") != 1 {
+		t.Fatalf("identity and notices must share one hook response: %s", out.String())
 	}
 }
 

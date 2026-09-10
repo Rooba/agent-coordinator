@@ -27,6 +27,7 @@ type Invocation struct {
 	ReportFromStdout bool
 	ConfigKey        string // provider-owned; never accepted through Environment
 	ConfigDir        string
+	Warning          string // non-fatal preparation diagnostic, e.g. a skipped credentials refresh
 }
 
 type Provider interface {
@@ -37,10 +38,13 @@ type Provider interface {
 // ExecConfig is shared by fixed CLI adapters. Ambient and explicit
 // environments receive the same narrow allowlist. ConfigDir must be a
 // dedicated, explicitly provisioned provider home; both adapters require it.
+// Model and Credentials are Claude settings the Codex adapter ignores.
 type ExecConfig struct {
 	Executable  string
 	WorkingDir  string
 	ConfigDir   string
+	Model       string
+	Credentials string
 	Environment []string
 }
 
@@ -48,6 +52,8 @@ type execConfig struct {
 	executable  string
 	workingDir  string
 	configDir   string
+	model       string
+	credentials string
 	environment []string
 }
 
@@ -73,16 +79,28 @@ func newExecConfig(name string, config ExecConfig) (execConfig, error) {
 	if config.ConfigDir != "" && !validProviderPath(config.ConfigDir, true) {
 		return execConfig{}, fmt.Errorf("%s config directory must be an existing absolute directory", name)
 	}
-	configDir := config.ConfigDir
-	if configDir != "" {
-		configDir = filepath.Clean(configDir)
+	if config.Model != "" && !ValidModel(config.Model) {
+		return execConfig{}, fmt.Errorf("%s model must be at most %d characters of letters, digits, '.', '-' or '_'", name, MaxModelBytes)
+	}
+	// The credentials file is copied per turn, so it need not exist yet.
+	if config.Credentials != "" && !filepath.IsAbs(config.Credentials) {
+		return execConfig{}, fmt.Errorf("%s credentials must be an absolute file path", name)
 	}
 	return execConfig{
 		executable:  filepath.Clean(config.Executable),
 		workingDir:  filepath.Clean(config.WorkingDir),
-		configDir:   configDir,
+		configDir:   cleanIfSet(config.ConfigDir),
+		model:       config.Model,
+		credentials: cleanIfSet(config.Credentials),
 		environment: providerEnvironment(config.Environment),
 	}, nil
+}
+
+func cleanIfSet(path string) string {
+	if path == "" {
+		return ""
+	}
+	return filepath.Clean(path)
 }
 
 func validProviderPath(path string, directory bool) bool {
@@ -131,6 +149,10 @@ func parseReport(data []byte) (Report, error) {
 	}
 	if err := decoder.Decode(new(any)); err != io.EOF {
 		return Report{}, fmt.Errorf("%w: trailing result data", ErrInvalidReport)
+	}
+	// Models often explain a failure only in the summary; keep that report.
+	if report.Status == ReportFailed && strings.TrimSpace(report.Error) == "" {
+		report.Error = report.Summary
 	}
 	if err := report.Validate(); err != nil {
 		return Report{}, err
@@ -236,8 +258,12 @@ func (p *CodexProvider) Prepare(task Task, scratchDir string) (Invocation, error
 }
 
 const (
-	claudeProviderName = "claude"
-	claudeChromeTools  = "mcp__claude-in-chrome"
+	claudeProviderName    = "claude"
+	claudeChromeTools     = "mcp__claude-in-chrome"
+	claudeDefaultModel    = "sonnet"
+	claudeHomeDir         = ".claude"
+	claudeCredentialsFile = ".credentials.json"
+	maxCredentialsBytes   = 64 << 10
 )
 
 type ClaudeConfig = ExecConfig
@@ -251,12 +277,19 @@ func NewClaudeProvider(config ClaudeConfig) (*ClaudeProvider, error) {
 	if validated.configDir == "" {
 		return nil, errors.New("Claude requires an explicit config directory")
 	}
+	if validated.model == "" {
+		validated.model = claudeDefaultModel
+	}
 	return &ClaudeProvider{validated}, nil
 }
 
 func (p *ClaudeProvider) Name() string { return claudeProviderName }
 
 func (p *ClaudeProvider) Prepare(task Task, scratchDir string) (Invocation, error) {
+	warning, err := p.refreshCredentials()
+	if err != nil {
+		return Invocation{}, err
+	}
 	settingsPath, mcpPath := filepath.Join(scratchDir, "claude-settings.json"), filepath.Join(scratchDir, "claude-mcp.json")
 	if err := os.WriteFile(settingsPath, []byte(`{}`), 0o600); err != nil {
 		return Invocation{}, fmt.Errorf("write Claude settings: %w", err)
@@ -264,12 +297,75 @@ func (p *ClaudeProvider) Prepare(task Task, scratchDir string) (Invocation, erro
 	if err := os.WriteFile(mcpPath, []byte(`{"mcpServers":{}}`), 0o600); err != nil {
 		return Invocation{}, fmt.Errorf("write Claude MCP config: %w", err)
 	}
+	// dontAsk denies every tool not on the allow list, so the Chrome tools are the
+	// only ones Claude can use; an empty --tools list would strip them too.
 	args := []string{"--print", "--chrome", "--no-session-persistence", "--permission-mode", "dontAsk",
-		"--tools", "", "--allowedTools", claudeChromeTools, "--output-format", "json", "--json-schema", reportSchema}
+		"--model", p.model, "--allowedTools", claudeChromeTools, "--output-format", "json", "--json-schema", reportSchema}
 	args = append(args, "--settings", settingsPath, "--setting-sources", "", "--mcp-config", mcpPath, "--strict-mcp-config")
 	invocation := p.invocation(args, eyesPrompt(task, "Claude in Chrome"), true, parseClaudeReport)
-	invocation.ConfigKey, invocation.ConfigDir = "CLAUDE_CONFIG_DIR", p.configDir
+	invocation.ConfigKey, invocation.ConfigDir, invocation.Warning = "CLAUDE_CONFIG_DIR", p.configDir, warning
 	return invocation, nil
+}
+
+// refreshCredentials keeps the isolated login in step with the user's main Claude
+// credentials file, which is the only copy a re-login updates. A failed refresh is
+// fatal only when it would leave the turn with no login at all.
+func (p *ClaudeProvider) refreshCredentials() (string, error) {
+	destination := filepath.Join(p.configDir, claudeCredentialsFile)
+	copied, copiedErr := os.Stat(destination)
+	err := copyNewerCredentials(p.credentials, destination, copied)
+	switch {
+	case err == nil:
+		return "", nil
+	case copiedErr != nil:
+		return "", fmt.Errorf("Claude login: %w", err)
+	default:
+		return "Claude login not refreshed: " + err.Error(), nil
+	}
+}
+
+// copyNewerCredentials publishes the main credentials file into the isolated
+// config directory, and only ever in that direction: the isolated copy refreshes
+// its own token, so a newer copy must never be overwritten.
+func copyNewerCredentials(source, destination string, copied os.FileInfo) error {
+	if source == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("locate user profile: %w", err)
+		}
+		source = filepath.Join(home, claudeHomeDir, claudeCredentialsFile)
+	}
+	info, err := os.Stat(source)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", source, err)
+	}
+	if !info.Mode().IsRegular() || info.Size() > maxCredentialsBytes {
+		return fmt.Errorf("%s must be a regular file of at most %d bytes", source, maxCredentialsBytes)
+	}
+	if copied != nil && !info.ModTime().After(copied.ModTime()) {
+		return nil
+	}
+	data, err := os.ReadFile(source)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", source, err)
+	}
+	temp, err := os.CreateTemp(filepath.Dir(destination), ".credentials-*.tmp")
+	if err != nil {
+		return fmt.Errorf("stage credentials: %w", err)
+	}
+	defer os.Remove(temp.Name())
+	if _, err := temp.Write(data); err != nil {
+		temp.Close()
+		return fmt.Errorf("stage credentials: %w", err)
+	}
+	if err := temp.Chmod(0o600); err != nil {
+		temp.Close()
+		return fmt.Errorf("stage credentials: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("stage credentials: %w", err)
+	}
+	return os.Rename(temp.Name(), destination)
 }
 
 func parseClaudeReport(stdout []byte) (Report, error) {

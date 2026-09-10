@@ -1,11 +1,14 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,11 +18,9 @@ import (
 	"github.com/Rooba/agent-coordinator/internal/scope"
 )
 
-// runWait blocks until the named agent receives mail newer than the arm-time
-// baseline (exit 0) or the timeout passes (exit 1). Stale unread backlog does
-// not wake: only messages with id strictly greater than the high-water mark
-// at arm time count. Armed as a background task before delegating or idling,
-// its exit is a harness touchpoint so a fresh DM re-invokes the agent.
+// runWait blocks until the named agent receives mail newer than its durable
+// cursor (exit 0) or the timeout passes (exit 1). The cursor lets a replacement
+// process continue an interrupted arm without repeatedly waking on old mail.
 func runWait(args []string) {
 	usage := func() {
 		fmt.Fprintln(os.Stderr, "usage: agent-coordinator wait <name> [-timeout <seconds>] [-interval <seconds>]")
@@ -40,8 +41,14 @@ func runWait(args []string) {
 		cwd = "."
 	}
 	sc := scope.Resolve(cwd)
-	result, found, err := waitForMail(paths.Socket(), sc, name,
-		time.Duration(*timeout)*time.Second, time.Duration(*interval)*time.Second)
+	statePath, err := waitStatePath(sc, name)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "wait: %v\n", err)
+		os.Exit(2)
+	}
+	result, found, err := waitForMail(paths.Socket(), statePath, sc, name,
+		time.Duration(*timeout)*time.Second, time.Duration(*interval)*time.Second,
+		func(afterID int64) { fmt.Fprintf(os.Stderr, "armed after_id=%d\n", afterID) })
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "wait: %v\n", err)
 		os.Exit(2)
@@ -68,34 +75,108 @@ type waitResult struct {
 	Froms  []string
 }
 
-// waitForMail arms against the agent's current high-water message id, then
-// polls until a strictly newer unread delivery appears or the deadline passes.
-// A definitive daemon refusal at arm time (e.g. an unknown agent name) is
-// returned as an error so the caller can fail fast instead of burning the
-// timeout. A transient failed poll is just a miss - the daemon may be
-// idle-restarting - so polling continues.
-func waitForMail(socketPath, sc, name string, timeout, interval time.Duration) (waitResult, bool, error) {
-	deadline := time.Now().Add(timeout)
-	// Baseline: max message id already delivered to this agent (AfterID=0
-	// returns HighWater over all deliveries). Stale unread backlog sits at or
-	// below this watermark and must not wake us. Daemon down at arm keeps the
-	// baseline at zero so the first successful peek still works.
-	baseline := int64(0)
-	switch info, err := peekOnce(socketPath, sc, name, 0); {
-	case err == nil:
-		baseline = info.HighWater
-	case errors.As(err, new(daemonErr)):
-		return waitResult{}, false, err
+// A checkpoint survives ordinary timeouts and killed waiter processes, but
+// eventually ages out rather than changing first-arm semantics forever.
+const waitStateTTL = 24 * time.Hour
+
+// waitForMail resumes a live cursor or creates one from the current high-water
+// id, then polls for newer unread mail. Timeouts preserve the cursor; a wake
+// leaves it behind the unread delivery until a later quiet peek proves the
+// mail was consumed. Definitive daemon refusals fail fast, while transport
+// failures remain misses because the daemon may be idle-restarting.
+func waitForMail(socketPath, statePath, sc, name string, timeout, interval time.Duration, armed func(int64)) (waitResult, bool, error) {
+	now := time.Now()
+	deadline := now.Add(timeout)
+	afterID, ok := loadWaitState(statePath, now)
+	if !ok {
+		switch info, err := peekOnce(socketPath, sc, name, 0); {
+		case err == nil:
+			afterID = info.HighWater
+		case errors.As(err, new(daemonErr)):
+			return waitResult{}, false, err
+		}
+		if err := saveWaitState(statePath, afterID); err != nil {
+			return waitResult{}, false, fmt.Errorf("save arm state: %w", err)
+		}
+	} else if err := os.Chtimes(statePath, now, now); err != nil {
+		return waitResult{}, false, fmt.Errorf("refresh arm state: %w", err)
+	}
+	if armed != nil {
+		armed(afterID)
 	}
 	for {
-		if info, err := peekOnce(socketPath, sc, name, baseline); err == nil && info.Unread > 0 {
+		info, err := peekOnce(socketPath, sc, name, afterID)
+		if err == nil && info.Unread > 0 {
+			// Do not checkpoint unread mail before the wake reaches the harness.
+			// If this process dies now, its replacement must see the same mail.
 			return waitResult{Unread: info.Unread, IDs: info.IDs, Froms: info.Froms}, true, nil
+		}
+		if err == nil && info.HighWater > afterID {
+			// Deliveries above the cursor have already been consumed. Advancing
+			// here prevents them from becoming stale wake candidates without
+			// ever checkpointing past unread mail.
+			afterID = info.HighWater
+			if err := saveWaitState(statePath, afterID); err != nil {
+				return waitResult{}, false, fmt.Errorf("advance consumed state: %w", err)
+			}
+		}
+		if errors.As(err, new(daemonErr)) {
+			return waitResult{}, false, err
 		}
 		if time.Now().After(deadline) {
 			return waitResult{}, false, nil
 		}
 		time.Sleep(interval)
 	}
+}
+
+func waitStatePath(sc, name string) (string, error) {
+	db, err := paths.DB()
+	if err != nil {
+		return "", err
+	}
+	key := sha256.Sum256([]byte(sc + "\x00" + name))
+	return filepath.Join(filepath.Dir(db), "wait", fmt.Sprintf("%x.cursor", key)), nil
+}
+
+func loadWaitState(path string, now time.Time) (int64, bool) {
+	info, err := os.Stat(path)
+	if err != nil || !info.ModTime().Add(waitStateTTL).After(now) {
+		return 0, false
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	afterID, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if err != nil || afterID < 0 {
+		return 0, false
+	}
+	return afterID, true
+}
+
+func saveWaitState(path string, afterID int64) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(filepath.Dir(path), ".wait-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if err = f.Chmod(0o600); err != nil {
+		f.Close()
+		return err
+	}
+	if _, err = fmt.Fprintln(f, afterID); err != nil {
+		f.Close()
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 type peekInfo struct {

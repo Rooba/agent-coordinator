@@ -167,6 +167,59 @@ func TestSubagentRequestsTargetChildRow(t *testing.T) {
 	}
 }
 
+func TestFirstSubagentEventIntroducesChildOnce(t *testing.T) {
+	sock, _ := startDaemon(t, time.Minute)
+	parent := roundTrip(t, sock, protocol.Request{Op: protocol.OpRegister, Scope: "/r", SessionID: "p1", Source: "hook"})
+	req := protocol.Request{Op: protocol.OpEvent, Scope: "/r", SessionID: "p1",
+		AgentID: "a1", AgentType: "Explore", Tool: "Read", Activity: "Reading x"}
+
+	first := roundTrip(t, sock, req)
+	if !first.OK || first.Name != parent.Name+"/explore-1" {
+		t.Fatalf("first child event: %+v", first)
+	}
+	if again := roundTrip(t, sock, req); !again.OK || again.Name != "" {
+		t.Fatalf("repeat child event must not reintroduce its identity: %+v", again)
+	}
+}
+
+func TestConcurrentFirstSubagentEventsIntroduceChildOnce(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "d.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	parent := dispatch(st, protocol.Request{Op: protocol.OpRegister, Scope: "/r", SessionID: "p1", Source: "hook"})
+	req := protocol.Request{Op: protocol.OpEvent, Scope: "/r", SessionID: "p1",
+		AgentID: "a1", AgentType: "Explore", Tool: "Read", Activity: "Reading x"}
+
+	const calls = 8
+	start := make(chan struct{})
+	responses := make(chan protocol.Response, calls)
+	for range calls {
+		go func() {
+			<-start
+			responses <- dispatch(st, req)
+		}()
+	}
+	close(start)
+	introduced := 0
+	for range calls {
+		resp := <-responses
+		if !resp.OK {
+			t.Fatalf("child event: %+v", resp)
+		}
+		if resp.Name != "" {
+			introduced++
+			if resp.Name != parent.Name+"/explore-1" {
+				t.Fatalf("introduced name: %q", resp.Name)
+			}
+		}
+	}
+	if introduced != 1 {
+		t.Fatalf("identity introductions: got %d want 1", introduced)
+	}
+}
+
 // The heartbeat: an MCP tool call carrying the bound session id lifts sticky
 // idle back to active, and never resurrects a gone row.
 func TestToolCallHeartbeatRefreshesIdleRow(t *testing.T) {

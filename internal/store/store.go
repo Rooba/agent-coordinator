@@ -123,6 +123,10 @@ func Open(path string) (*Store, error) {
 		// A cancel is durable only once the broker answers it, so the task
 		// records whether that answer has arrived.
 		`ALTER TABLE eyes_tasks ADD COLUMN cancel_acked INTEGER NOT NULL DEFAULT 0`,
+		// The workspace the chosen broker registered in, so its side of the
+		// task is proved by scope and session together - a session id that is
+		// registered again elsewhere inherits nothing.
+		`ALTER TABLE eyes_tasks ADD COLUMN launcher_scope TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := db.Exec(alter); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
@@ -189,24 +193,25 @@ func ChildSessionID(parentSessionID, subagentID string) string {
 
 // RegisterChild registers (or refreshes) a subagent identity under its parent
 // session, giving it its own row and therefore its own inbox. Idempotent per
-// (scope, child session); names are <parent>/<agent_type|sub>-<n>.
-func (s *Store) RegisterChild(scope, parentSessionID, subagentID, agentType string) (string, error) {
+// (scope, child session); names are <parent>/<agent_type|sub>-<n>. created is
+// true only for the call whose INSERT won, so callers can announce it once.
+func (s *Store) RegisterChild(scope, parentSessionID, subagentID, agentType string) (string, bool, error) {
 	child := ChildSessionID(parentSessionID, subagentID)
 	now := s.Now().Unix()
 	var name string
 	err := s.db.QueryRow(`SELECT name FROM agents WHERE scope=? AND session_id=?`, scope, child).Scan(&name)
 	if err == nil {
 		_, err = s.db.Exec(`UPDATE agents SET status='active', last_seen=? WHERE scope=? AND session_id=?`, now, scope, child)
-		return name, err
+		return name, false, err
 	}
 	if err != sql.ErrNoRows {
-		return "", err
+		return "", false, err
 	}
 	// The parent anchors the child's name; registering it also keeps the
 	// parent row fresh while its subagents work.
 	parentName, err := s.Register(scope, parentSessionID, "hook")
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	typ := strings.ToLower(agentType)
 	if typ == "" {
@@ -216,7 +221,7 @@ func (s *Store) RegisterChild(scope, parentSessionID, subagentID, agentType stri
 		name = fmt.Sprintf("%s/%s-%d", parentName, typ, n)
 		var count int
 		if err := s.db.QueryRow(`SELECT COUNT(*) FROM agents WHERE scope=? AND name=?`, scope, name).Scan(&count); err != nil {
-			return "", err
+			return "", false, err
 		}
 		if count > 0 {
 			continue
@@ -224,18 +229,18 @@ func (s *Store) RegisterChild(scope, parentSessionID, subagentID, agentType stri
 		_, err := s.db.Exec(`INSERT INTO agents (scope, session_id, agent_id, name, status, registered_at, last_seen, source, parent_session_id)
 			VALUES (?,?,?,?,'active',?,?,'hook-subagent',?)`, scope, child, agentID(child), name, now, now, parentSessionID)
 		if err == nil {
-			return name, nil
+			return name, true, nil
 		}
 		if !isUniqueViolation(err) {
-			return "", err
+			return "", false, err
 		}
 		// Unique race: a concurrent RegisterChild won this child's PK (return
 		// its name) or took this name (try the next suffix).
 		if e := s.db.QueryRow(`SELECT name FROM agents WHERE scope=? AND session_id=?`, scope, child).Scan(&name); e == nil {
-			return name, nil
+			return name, false, nil
 		}
 	}
-	return "", fmt.Errorf("register child: no free name under %q in scope %q", parentName, scope)
+	return "", false, fmt.Errorf("register child: no free name under %q in scope %q", parentName, scope)
 }
 
 func isUniqueViolation(err error) bool {
@@ -435,12 +440,33 @@ func (s *Store) resolveAgent(q execQuerier, scope, nameOrID string) (aid, name s
 	return aid, name, err
 }
 
+// Sender is everything a message write needs about who is sending: the id the
+// row lands under, the name a return address carries, and the kind stamped on
+// it. A caller that already read the row hands one over so nothing looks it up
+// twice.
+type Sender struct {
+	protocol.AgentRef
+	Kind string
+}
+
+// resolveSender reads that whole identity in one lookup.
+func (s *Store) resolveSender(q execQuerier, scope, nameOrID string) (Sender, error) {
+	from := Sender{AgentRef: protocol.AgentRef{Scope: scope}}
+	err := q.QueryRow(`SELECT agent_id, name, kind FROM agents WHERE scope=? AND (name=? OR agent_id=?)`,
+		scope, nameOrID, nameOrID).Scan(&from.AgentID, &from.Name, &from.Kind)
+	if err == sql.ErrNoRows {
+		return Sender{}, fmt.Errorf("%w %q in this workspace", ErrNoAgent, nameOrID)
+	}
+	return from, err
+}
+
 // Delivery is one message write. The daemon fills every field from the
 // authenticated sender; a client never gets to say who it is.
 type Delivery struct {
 	FromScope string // sender's workspace
 	FromName  string // sender's name or agent id in FromScope
-	ToScope   string // recipient workspace; empty means FromScope
+	From      Sender // the sender already resolved; when set, FromScope and FromName are not read
+	ToScope   string // recipient workspace; empty means the sender's scope
 	ToName    string // recipient name or agent id; empty means everyone live there
 	Body      string
 	ReplyTo   *protocol.AgentRef // return address, stamped by the daemon
@@ -468,18 +494,19 @@ func (s *Store) SendToScope(d Delivery) error {
 // already hold a transaction (assigning an eyes task, advancing one) pass it
 // in, so a task never exists without the mail that announces it.
 func (s *Store) sendToScope(q execQuerier, d Delivery) error {
-	fromID, _, err := s.resolveAgent(q, d.FromScope, d.FromName)
-	if err != nil {
-		return err
+	var err error
+	from := d.From
+	if from.AgentID == "" {
+		if from, err = s.resolveSender(q, d.FromScope, d.FromName); err != nil {
+			return err
+		}
 	}
-	var kind string
-	q.QueryRow(`SELECT kind FROM agents WHERE scope=? AND agent_id=?`, d.FromScope, fromID).Scan(&kind)
 	toScope, fromScope := d.ToScope, ""
 	if toScope == "" {
-		toScope = d.FromScope
+		toScope = from.Scope
 	}
-	if toScope != d.FromScope {
-		fromScope = d.FromScope
+	if toScope != from.Scope {
+		fromScope = from.Scope
 	}
 	var toID any // NULL addresses everyone live in the scope
 	var targets []string
@@ -489,7 +516,7 @@ func (s *Store) sendToScope(q execQuerier, d Delivery) error {
 			return err
 		}
 		toID, targets = id, []string{id}
-	} else if targets, err = s.liveAgents(q, toScope, fromID); err != nil {
+	} else if targets, err = s.liveAgents(q, toScope, from.AgentID); err != nil {
 		return err
 	}
 	replyTo := ""
@@ -503,7 +530,7 @@ func (s *Store) sendToScope(q execQuerier, d Delivery) error {
 	res, err := q.Exec(`INSERT INTO messages
 		(scope, from_agent, to_agent, body, created_at, from_scope, reply_to, task_id, kind)
 		VALUES (?,?,?,?,?,?,?,?,?)`,
-		toScope, fromID, toID, d.Body, s.Now().Unix(), fromScope, replyTo, d.TaskID, kind)
+		toScope, from.AgentID, toID, d.Body, s.Now().Unix(), fromScope, replyTo, d.TaskID, from.Kind)
 	if err != nil {
 		return err
 	}

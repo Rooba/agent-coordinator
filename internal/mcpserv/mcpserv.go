@@ -136,6 +136,7 @@ func (s *server) handle(req rpcReq) (any, map[string]any) {
 			"serverInfo":      map[string]any{"name": "agent-coordinator", "version": "2.0.0"},
 			"instructions": "Presence + messaging mesh for agents sharing this workspace. " +
 				"Identity: if session-start context assigned a coordinator name ('you are <name>'), use it and do not call register_agent; otherwise call register_agent once. " +
+				"If whoami or claim fail after a long idle, call register_agent again to rebind this connection. " +
 				"Subagents share the parent connection and MUST pass from='<their child name>' on read_messages - a bare call drains the PARENT inbox. " +
 				"Wake pattern while waiting on a peer: run `agent-coordinator wait '<your name>' -timeout 570`; it prints `armed after_id=N` once its durable cursor is set and exits when a DM arrives; then call read_messages and re-arm (also after a kill or timeout - the cursor loses no mail) - never busy-poll. " +
 				"Background it ONLY if your harness starts a new turn when a background task exits (Claude Code does; Codex background terminals do not - they yield and never call back); otherwise block on it in the foreground as the last action of your turn. " +
@@ -411,9 +412,9 @@ func (s *server) callTool(p callParams) map[string]any {
 // row, so one session stays one inbox. While unbound, every call re-checks for
 // a bind: the hook may write one after an early call minted a fallback name,
 // and late adoption then retires the minted row and switches identity. Without
-// a bind, an implicit call minting a fresh mcp- identity is allowed only when
-// the scope has no live hook agents (the daemon enforces this); register_agent
-// (explicit) always registers.
+// a bind, an implicit mint is allowed only when the scope has no live hook
+// agents (the daemon enforces this). register_agent always re-registers with
+// the daemon and writes a bind so a name we return is one the caller can use.
 func (s *server) ensureRegistered(explicit bool) (string, error) {
 	if !s.bound {
 		if dir, err := bindDirFn(); err == nil {
@@ -426,7 +427,7 @@ func (s *server) ensureRegistered(explicit bool) (string, error) {
 			}
 		}
 	}
-	if s.name != "" {
+	if s.name != "" && !explicit {
 		return s.name, nil
 	}
 	resp, err := roundTrip(s.socketPath, protocol.Request{
@@ -444,7 +445,25 @@ func (s *server) ensureRegistered(explicit bool) (string, error) {
 		return "", errors.New(resp.Error)
 	}
 	s.name = resp.Name
+	if explicit {
+		s.bindConnection(s.name)
+	}
 	return s.name, nil
+}
+
+// bindConnection pins this MCP process to the registered row the way the
+// SessionStart hook does: a bind file for sibling processes, and bound=true
+// so stdin EOF does not retire the row.
+func (s *server) bindConnection(name string) {
+	s.bound = true
+	dir, err := bindDirFn()
+	if err != nil {
+		return
+	}
+	_ = hookcli.WriteBind(dir, hookcli.Bind{
+		SessionID: s.sessionID, Scope: s.scope, Name: name,
+		Pids: ancestryFn(), TS: time.Now().Unix(),
+	})
 }
 
 func (s *server) whoami() map[string]any {
@@ -515,7 +534,7 @@ func roundTrip(socketPath string, req protocol.Request) (protocol.Response, erro
 var toolDefs = []map[string]any{
 	{
 		"name":        "register_agent",
-		"description": "ONLY if no SessionStart-assigned name; call once. Registers this MCP session and returns its assigned agent name.",
+		"description": "ONLY if no SessionStart-assigned name; call once, or again if identity was lost after a long idle. Registers this MCP session, binds it to this connection, and returns its assigned agent name.",
 		"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
 	},
 	{

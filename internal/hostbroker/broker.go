@@ -15,6 +15,7 @@ import (
 
 	"github.com/Rooba/agent-coordinator/internal/hostrunner"
 	"github.com/Rooba/agent-coordinator/internal/protocol"
+	"github.com/Rooba/agent-coordinator/internal/taskid"
 )
 
 const (
@@ -224,18 +225,9 @@ func (b *Broker) handleMessage(ctx context.Context, message protocol.Message) er
 }
 
 func validCancelEnvelope(message protocol.Message, cancel protocol.TaskCancelMsg) bool {
-	if cancel.Type != protocol.TaskCancel || cancel.TaskID != message.TaskID || message.FromScope == "" ||
-		message.ReplyTo == nil || message.ReplyTo.Scope != message.FromScope ||
-		(message.ReplyTo.AgentID == "" && message.ReplyTo.Name == "") || len(cancel.TaskID) != hostrunner.MaxTaskIDBytes ||
-		!strings.HasPrefix(cancel.TaskID, "task-") {
-		return false
-	}
-	for _, c := range cancel.TaskID[len("task-"):] {
-		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-			return false
-		}
-	}
-	return true
+	return cancel.Type == protocol.TaskCancel && cancel.TaskID == message.TaskID && message.FromScope != "" &&
+		message.ReplyTo != nil && message.ReplyTo.Scope == message.FromScope &&
+		(message.ReplyTo.AgentID != "" || message.ReplyTo.Name != "") && taskid.Valid(cancel.TaskID)
 }
 
 func (b *Broker) handleLaunch(ctx context.Context, launch protocol.TaskLaunchMsg) error {

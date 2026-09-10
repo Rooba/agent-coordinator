@@ -1,47 +1,81 @@
 # agent-coordinator - findings, fixes, and improvements
 
-## 2026-09-06 - open items from the WSL<->Windows eyes relay build
+## 2026-09-06 - relay follow-ups: status after the three-coordinator pass
 
 Source: the three-session relay build (bold-ibis/Claude core, eager-crane/Grok CLI+MCP,
 solid-mole broker), landed on main through 8ec17b6. Full ruling ledger and review reports are
 archived (git-ignored) under `.ignore/coordination/bold-ibis-sdd-archive/`.
 
+**Status 2026-09-06 (later the same day): worked by lucid-fox/Claude, amber-crane/Grok,
+lucid-raven/Codex.** Everything below marked DONE landed with tests in one uncommitted tree
+(see `git status`); the eyes bridge was set up for real on this host.
+
 ### Coordinator bugs
-- P1 - `register_agent` on a resumed MCP connection does not bind. After a ~2 day idle gap the
-  session's row had decayed; `register_agent` answered "registered as bold-ibis" but every
-  following call (`claim`, `send_message`, `whoami`) failed with "no agent ... in this
-  workspace". Repro: let a session's agent row age out, then call `register_agent` from the
-  same MCP connection. Fix: bind the freshly registered row to the calling connection (the
-  same bind-file/anchor path the SessionStart hook uses) and make `whoami` reflect it; a
-  registration that returns a name the caller cannot use is worse than an error.
-- P2 - `agent-coordinator wait` is a long-lived subprocess, so a host low-memory watchdog
-  kills it first (observed twice on 2026-09-06 with 13 GB free; the kill came from the Claude
-  Code harness, not the OS). Consider a wake mechanism that does not hold a process per
-  waiting agent, or document that the wait may be killed and must be re-armed.
+- DONE (amber-crane) - `register_agent` on a resumed MCP connection now always re-registers,
+  writes the bind file and marks the connection bound, so `whoami`/`claim`/`send_message`
+  work after the 2h GC purged the row. Tests: `TestRegisterAgentReRegistersCachedIdentity`,
+  `TestRegisterAgentRebindsAgedOutRow`, `TestRegisterAgentBindSurvivesProcessRestart`.
+- DONE (lucid-raven) - `agent-coordinator wait` persists an atomic 24h per-scope/name cursor,
+  so a wait killed by the harness watchdog or a timeout gap loses no mail on re-arm; it prints
+  `armed after_id=N` only after the durable arm. Wakes are at-least-once: the cursor advances
+  only after the mail is consumed and a later quiet peek sees it, never on the wake itself.
+  The wait is still a process per waiter and can still be killed: re-arm it. Caveat: a
+  first-ever arm baselines mail that arrived before the durable ack.
+- DONE (lucid-fox) - socket split-brain: MCP shims and hooks launched without
+  `XDG_RUNTIME_DIR` (about half of the live shims on this host) dialed
+  `/tmp/agent-coordinator-<uid>/` and spawned a SECOND daemon beside the systemd one, sharing
+  the DB but not in-memory state (relay listener, eyes tasks, wakes). `defaultSocket` now falls
+  back to `/run/user/<uid>` when that directory exists and is ours, before `/tmp`.
+- DONE (lucid-raven) - Codex child identity: Codex has no PreToolUse/SubagentStart hooks, so
+  its subagents got no deny-reason name injection and guessed `from=parent/default-N`.
+  PostToolUse already registers the child; the daemon now returns that child name and the
+  hook emits it as additionalContext (`use from=<child>`). Limitation: the name arrives
+  after the child's first tool call, so a coordinator call made before that is unattributed.
+- DONE (lucid-raven) - `paths_windows.go` resolves the socket dir from the canonical
+  `FOLDERID_LocalAppData` known folder instead of the caller's environment, with no temp
+  fallback; an unresolvable directory exits with `AC_SOCKET` guidance instead of forming a
+  second mesh.
 
-### Relay polish (parked with rulings, not blocking)
-- `eyesRole` launcher arm compares session only; add the scope compare so a re-registered
-  launcher session in another `host:` scope can never take the role (safe today because
-  `RegisterRelay` refuses a second scope for a relay session id and the deadline sweep settles
-  orphaned tasks).
-- `validTaskID` is now implemented three times (`internal/daemon/eyes.go`,
-  `internal/hostbroker`, `internal/hostrunner`); one shared helper.
-- The cancel path resolves the requester once in `eyesMail` and again in `sendToScope`; thread
-  the resolved id through `Delivery` if the cancel path ever matters for latency.
-- `taskMessageType` treats any duplicate top-level `"type"` as reserved only when a value has
-  the `task.` prefix (fixed in 43b1ba9); keep a test if the classifier changes again.
-- Spec drift to close in `docs/superpowers/specs/2026-09-03-wsl-host-relay-design.md`:
-  section 4 should say the eyes-registration gate answers only `unauthorized` (all
-  ownership/state failures collapse), and section 7 should name the `task.result` status
-  enum the daemon enforces.
+### Relay polish
+- DONE - `eyesRole` launcher arm compares `(launcher_scope, launcher_session)`; tasks record
+  `launcher_scope` (new column). Test: a launcher session re-registered in another `host:`
+  scope cannot ack the task. `ReissueEyesChild` binds to the same pair.
+- DONE (lucid-raven) - one `internal/taskid.Valid` replaces the three `validTaskID` copies.
+- DONE - cancel path resolves the requester once and threads a `Sender` through `Delivery`;
+  `sendToScope` dropped its separate kind query.
+- DONE - `taskMessageType` duplicate-`type` coverage confirmed in
+  `internal/daemon/relay_test.go` (`TestPlainMailCannotSpeakForATask`,
+  `TestTaskReportsRequireStrictEnvelopeAndCanonicalTarget`).
+- DONE - spec sections 4, 7 and 10 updated (gate answers only `unauthorized`; `task.result`
+  status enum `succeeded|failed` with the error rule; `launcher_scope` in the ALTER list).
 
-### Deployment caveats (v1 shipped without exercising these)
-- The Windows Task Scheduler logon task and Credential Manager pairing were implemented but not
-  executed on the real host; run `agent-coordinator host install` / `host pair` once and record
-  the outcome.
-- No live paid Claude+Chrome turn was executed end to end; the broker advertises Claude only
-  and gates `browser.chrome` on a readiness probe. Do one real turn before relying on it.
-- Codex runner is internal-only (non-interactive `codex exec` shape documented); Grok absent.
+### Deployment: exercised for real on this host (2026-09-06)
+- Relay listener: systemd drop-in `~/.config/systemd/user/agent-coordinator.service.d/relay.conf`
+  sets `AC_RELAY_LISTEN=127.0.0.1:7400`; the token is minted at
+  `~/.local/state/agent-coordinator/relay.token`.
+- Windows: `agent-coordinator.exe` in `%LOCALAPPDATA%\agent-coordinator\`, `host pair --file`
+  over `\\wsl.localhost\openSUSE-Tumbleweed\...` succeeded, `Test-NetConnection 7400` true.
+- FIXED - `host install` failed with "task XML is malformed / unable to switch the encoding":
+  `schtasks /XML` requires UTF-16; the task XML is now written UTF-16 LE with BOM. After the
+  fix the scheduled task `Agent Coordinator Host Broker-<hash>` runs and the launcher shows in
+  `agent-coordinator eyes` as `deft-newt` on `host:RAMEN`.
+- Claude eyes provider: WinGet `claude.exe`, workdir `%LOCALAPPDATA%\agent-coordinator\eyes-workdir`,
+  config dir `...\claude-config` seeded with the user's Claude `.credentials.json`
+  (Claude needs login state in the isolated config dir).
+- FIXED - first live turn failed: `--tools ""` strips the Chrome tools before the allow list
+  applies, so every `mcp__claude-in-chrome__*` call was denied under `dontAsk`; the flag is
+  gone (dontAsk + `--allowedTools mcp__claude-in-chrome` already denies everything else).
+  The model's `failed` report also carried no `error`, which the runner rejected; a failed
+  report now takes its summary as the error. After the final deploy a real `request-eyes`
+  through the scheduled broker returned `task.result status=succeeded` (heading "Example
+  Domain" observed, console clean, tab closed). The `total_cost_usd` Claude prints (about
+  $0.25-0.50) is its list-price estimate for ~190k mostly cached tokens; the seeded login is a
+  Max subscription, so the turn draws from that allowance, not API billing.
+- DONE - eyes turns run Sonnet by default (`--claude-model`, persisted as `claude_model`); the
+  account default model was being used before. The broker also refreshes the isolated
+  `.credentials.json` from `%USERPROFILE%\.claude\.credentials.json` (`--claude-credentials`)
+  before each turn whenever the main file is newer, so a re-login propagates by itself.
+- Codex runner remains internal-only; Grok absent.
 
 ### Deferred by design (revisit when needed)
 - v1.1 bidirectional eyes: broker keeps the model's stdin open (`--input-format stream-json`),

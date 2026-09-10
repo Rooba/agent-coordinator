@@ -6,11 +6,13 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/Rooba/agent-coordinator/internal/taskid"
 )
 
 const (
-	MaxTaskIDBytes   = 17
 	MaxProviderBytes = 64
+	MaxModelBytes    = 64
 	MaxBriefBytes    = 64 << 10
 	MinTaskTimeout   = 5 * time.Minute
 	MaxTaskTimeout   = 30 * time.Minute
@@ -38,7 +40,7 @@ type Task struct {
 
 func (t Task) Validate() error {
 	switch {
-	case !validTaskID(t.ID):
+	case !taskid.Valid(t.ID):
 		return fmt.Errorf("%w: task_id must be task- plus 12 lowercase hex digits", ErrInvalidTask)
 	case !validIdentifier(t.Provider, MaxProviderBytes):
 		return fmt.Errorf("%w: unsafe runtime", ErrInvalidTask)
@@ -51,18 +53,6 @@ func (t Task) Validate() error {
 	}
 }
 
-func validTaskID(value string) bool {
-	if len(value) != MaxTaskIDBytes || !strings.HasPrefix(value, "task-") {
-		return false
-	}
-	for _, char := range value[len("task-"):] {
-		if !(char >= '0' && char <= '9' || char >= 'a' && char <= 'f') {
-			return false
-		}
-	}
-	return true
-}
-
 func validIdentifier(value string, max int) bool {
 	if value == "" || len(value) > max {
 		return false
@@ -73,6 +63,23 @@ func validIdentifier(value string, max int) bool {
 			continue
 		}
 		return false
+	}
+	return true
+}
+
+// ValidModel accepts only model aliases and ids that are safe as a single argv
+// token, so configuration cannot inject extra arguments into a provider.
+func ValidModel(value string) bool {
+	if value == "" || len(value) > MaxModelBytes {
+		return false
+	}
+	for _, char := range value {
+		switch {
+		case char >= 'a' && char <= 'z', char >= 'A' && char <= 'Z', char >= '0' && char <= '9',
+			char == '.', char == '-', char == '_':
+		default:
+			return false
+		}
 	}
 	return true
 }

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf16"
 )
 
 type ScheduleAction string
@@ -60,7 +61,7 @@ func applySchedule(ctx context.Context, action ScheduleAction, executable, sid, 
 		path := file.Name()
 		defer os.Remove(path)
 		if err = file.Chmod(0o600); err == nil {
-			_, err = file.WriteString(xmlBody)
+			_, err = file.Write(utf16LE(xmlBody))
 		}
 		if closeErr := file.Close(); err == nil {
 			err = closeErr
@@ -117,7 +118,7 @@ func scheduleXML(executable, sid string) (string, error) {
 	}
 	command, workingDir := xmlEscape(executable), xmlEscape(filepath.Dir(executable))
 	user := xmlEscape(sid)
-	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><Description>Agent Coordinator Windows host broker</Description></RegistrationInfo>
   <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>%s</UserId></LogonTrigger></Triggers>
@@ -125,6 +126,18 @@ func scheduleXML(executable, sid string) (string, error) {
   <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>true</AllowHardTerminate><StartWhenAvailable>true</StartWhenAvailable><AllowStartOnDemand>true</AllowStartOnDemand><Enabled>true</Enabled><ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings>
   <Actions Context="CurrentUser"><Exec><Command>%s</Command><Arguments>host run</Arguments><WorkingDirectory>%s</WorkingDirectory></Exec></Actions>
 </Task>`, user, user, command, workingDir), nil
+}
+
+// utf16LE encodes the task XML the way schtasks /XML expects: a UTF-16 LE
+// byte order mark followed by little-endian code units.
+func utf16LE(s string) []byte {
+	units := utf16.Encode([]rune(s))
+	out := make([]byte, 0, 2+2*len(units))
+	out = append(out, 0xFF, 0xFE)
+	for _, u := range units {
+		out = append(out, byte(u), byte(u>>8))
+	}
+	return out
 }
 
 func xmlEscape(value string) string {

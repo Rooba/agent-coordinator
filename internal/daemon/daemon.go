@@ -271,18 +271,21 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 	}
 	// Requests carrying the subagent AgentID target the CHILD row derived from
 	// the parent SessionID: register/refresh it up front and retarget the op.
-	childSession := ""
+	childSession, childName := "", ""
 	if req.AgentID != "" {
 		switch req.Op {
 		case protocol.OpRegister, protocol.OpEvent, protocol.OpDeregister:
 			childSession = store.ChildSessionID(req.SessionID, req.AgentID)
 			if req.Op != protocol.OpDeregister {
-				name, err := st.RegisterChild(req.Scope, req.SessionID, req.AgentID, req.AgentType)
+				name, created, err := st.RegisterChild(req.Scope, req.SessionID, req.AgentID, req.AgentType)
 				if err != nil {
 					return fail(err)
 				}
 				if req.Op == protocol.OpRegister {
 					return protocol.Response{OK: true, Name: name}
+				}
+				if created {
+					childName = name // introduce a newly discovered child exactly once
 				}
 			}
 		}
@@ -375,7 +378,7 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 		if err != nil {
 			return fail(err)
 		}
-		return protocol.Response{OK: true, Notices: notices}
+		return protocol.Response{OK: true, Name: childName, Notices: notices}
 	case protocol.OpAgents:
 		agents, err := st.Agents(req.Scope)
 		if err != nil {

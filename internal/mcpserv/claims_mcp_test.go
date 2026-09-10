@@ -17,12 +17,24 @@ import (
 // startDaemon runs a real daemon+store and returns the socket plus a seeding
 // round-tripper, for MCP tests that need actual claim/journal semantics.
 func startDaemon(t *testing.T) (string, func(protocol.Request) protocol.Response) {
+	sock, _, seed := startDaemonWithStore(t)
+	return sock, seed
+}
+
+func startDaemonWithStore(t *testing.T) (string, *store.Store, func(protocol.Request) protocol.Response) {
+	return startDaemonPrepared(t, nil)
+}
+
+func startDaemonPrepared(t *testing.T, prep func(*store.Store)) (string, *store.Store, func(protocol.Request) protocol.Response) {
 	t.Helper()
 	dir := socktest.Dir(t)
 	sock := filepath.Join(dir, "d.sock")
 	st, err := store.Open(filepath.Join(dir, "d.db"))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if prep != nil {
+		prep(st)
 	}
 	l, err := net.Listen("unix", sock)
 	if err != nil {
@@ -42,7 +54,7 @@ func startDaemon(t *testing.T) (string, func(protocol.Request) protocol.Response
 		}
 		return resp
 	}
-	return sock, seed
+	return sock, st, seed
 }
 
 func TestClaimToolForwardsPathAndNote(t *testing.T) {

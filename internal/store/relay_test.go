@@ -602,6 +602,38 @@ func TestReissueEyesChildRefusesAForeignRow(t *testing.T) {
 	}
 }
 
+// A launcher session is bound to the workspace its task recorded: the same
+// session id coming back in another host scope is a different broker, and it
+// must not be able to re-mint the task's child.
+func TestReissueEyesChildRequiresTheTasksLauncherScope(t *testing.T) {
+	s := open(t)
+	broker := registerBroker(t, s, "host:BOX", "broker-1")
+	seedTask(t, s, "task-1", "broker-1", "queued", s.Now().Unix())
+
+	child, err := s.ReissueEyesChild("task-1", "broker-1", broker.Secret)
+	if err != nil || len(child.Secret) != 64 {
+		t.Fatalf("the task's own launcher must reissue: %+v (%v)", child, err)
+	}
+	// The broker's row is purged and the session id comes back in another
+	// host scope, holding a secret it minted for itself.
+	if _, err := s.db.Exec(`DELETE FROM agents WHERE scope='host:BOX' AND session_id='broker-1'`); err != nil {
+		t.Fatal(err)
+	}
+	evil := brokerSecret("evil")
+	if _, err := s.RegisterRelay(RelayRegistration{Scope: "host:EVIL", SessionID: "broker-1",
+		Kind: protocol.KindLauncher, Origin: "relay", Secret: evil}); err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{evil, broker.Secret} {
+		if _, err := s.ReissueEyesChild("task-1", "broker-1", secret); !errors.Is(err, ErrForeignSession) {
+			t.Fatalf("a launcher in another scope must not reissue, got %v", err)
+		}
+	}
+	if _, err := s.VerifyRelaySecret("eyes-task-1", child.Secret); err != nil {
+		t.Fatalf("the refused reissue must not rotate the child secret: %v", err)
+	}
+}
+
 // A live eyes child must not make the workspace look hook-occupied: an MCP
 // client that self-mints while a child runs would otherwise be refused.
 func TestRelayAgentDoesNotBlockSelfMintedIdentity(t *testing.T) {
@@ -625,7 +657,7 @@ func TestRelayAgentDoesNotBlockSelfMintedIdentity(t *testing.T) {
 func TestResolveActorAcceptsSelfAndRegisteredChildren(t *testing.T) {
 	s := open(t)
 	parent, _ := s.Register("/r", "s-a", "hook")
-	child, err := s.RegisterChild("/r", "s-a", "sub1", "Explore")
+	child, _, err := s.RegisterChild("/r", "s-a", "sub1", "Explore")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -661,7 +693,7 @@ func TestResolveActorAcceptsSelfAndRegisteredChildren(t *testing.T) {
 func TestResolveActorNeedsTheCallersOwnRow(t *testing.T) {
 	s := open(t)
 	s.Register("/r", "s-a", "hook")
-	child, err := s.RegisterChild("/r", "s-a", "sub1", "Explore")
+	child, _, err := s.RegisterChild("/r", "s-a", "sub1", "Explore")
 	if err != nil {
 		t.Fatal(err)
 	}

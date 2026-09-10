@@ -9,6 +9,7 @@ import (
 
 	"github.com/Rooba/agent-coordinator/internal/protocol"
 	"github.com/Rooba/agent-coordinator/internal/store"
+	"github.com/Rooba/agent-coordinator/internal/taskid"
 )
 
 // sendOps are the ops that carry a body: the ops a task report can arrive on,
@@ -153,13 +154,13 @@ func decodeTaskReport(typ, body string) (string, bool) {
 	switch typ {
 	case protocol.TaskAccepted:
 		var msg protocol.TaskAcceptedMsg
-		if !decodeTaskJSON(body, &msg) || msg.Type != typ || !validTaskID(msg.TaskID) || !validRef(msg.Child) {
+		if !decodeTaskJSON(body, &msg) || msg.Type != typ || !taskid.Valid(msg.TaskID) || !validRef(msg.Child) {
 			return "", false
 		}
 		return msg.TaskID, true
 	case protocol.TaskResult:
 		var msg protocol.TaskResultMsg
-		if !decodeTaskJSON(body, &msg) || msg.Type != typ || !validTaskID(msg.TaskID) ||
+		if !decodeTaskJSON(body, &msg) || msg.Type != typ || !taskid.Valid(msg.TaskID) ||
 			(msg.Status != "succeeded" && msg.Status != "failed") || strings.TrimSpace(msg.Summary) == "" ||
 			msg.Observations == nil || msg.Actions == nil || msg.Evidence == nil ||
 			(msg.Status == "succeeded" && msg.Error != "") ||
@@ -169,7 +170,7 @@ func decodeTaskReport(typ, body string) (string, bool) {
 		return msg.TaskID, true
 	case protocol.TaskFailed:
 		var msg protocol.TaskFailedMsg
-		if !decodeTaskJSON(body, &msg) || msg.Type != typ || !validTaskID(msg.TaskID) || strings.TrimSpace(msg.Error) == "" {
+		if !decodeTaskJSON(body, &msg) || msg.Type != typ || !taskid.Valid(msg.TaskID) || strings.TrimSpace(msg.Error) == "" {
 			return "", false
 		}
 		return msg.TaskID, true
@@ -181,18 +182,6 @@ func decodeTaskJSON(body string, dst any) bool {
 	decoder := json.NewDecoder(strings.NewReader(body))
 	decoder.DisallowUnknownFields()
 	return decoder.Decode(dst) == nil && decoder.Decode(new(any)) == io.EOF
-}
-
-func validTaskID(taskID string) bool {
-	if len(taskID) != len("task-")+12 || !strings.HasPrefix(taskID, "task-") {
-		return false
-	}
-	for _, c := range taskID[len("task-"):] {
-		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-			return false
-		}
-	}
-	return true
 }
 
 // pendingTaskMail is what this broker still owes an answer for: launches it

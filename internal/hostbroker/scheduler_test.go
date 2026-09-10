@@ -112,3 +112,18 @@ func TestSchedulerRollbackUsesCallerContext(t *testing.T) {
 		t.Fatalf("install rollback = (err %v, calls %d)", err, calls)
 	}
 }
+
+func TestSchedulerXMLIsUTF16WithBOM(t *testing.T) {
+	xmlBody, err := scheduleXML("/Program Files/ac.exe", "S-1-5-21-100")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(xmlBody, `<?xml version="1.0" encoding="UTF-16"?>`) {
+		t.Fatalf("task XML must declare UTF-16, got %q", xmlBody[:40])
+	}
+	encoded := utf16LE("<a>x</a>")
+	want := []byte{0xFF, 0xFE, '<', 0, 'a', 0, '>', 0, 'x', 0, '<', 0, '/', 0, 'a', 0, '>', 0}
+	if string(encoded) != string(want) {
+		t.Fatalf("utf16LE = % x, want % x", encoded, want)
+	}
+}

@@ -18,12 +18,13 @@ func seedTask(t *testing.T, s *Store, taskID, launcherSession, state string, upd
 	seedTaskIn(t, s, "/r", taskID, launcherSession, state, updatedAt)
 }
 
-// seedTaskIn is the same for a requester in some other workspace.
+// seedTaskIn is the same for a requester in some other workspace. Every
+// seeded broker lives in host:BOX, which is the workspace the row records.
 func seedTaskIn(t *testing.T, s *Store, scope, taskID, launcherSession, state string, updatedAt int64) {
 	t.Helper()
 	if _, err := s.db.Exec(`INSERT INTO eyes_tasks
-		(task_id, requester_scope, requester_agent_id, launcher_session, runtime, state, created_at, updated_at)
-		VALUES (?,?,?,?,'claude',?,?,?)`, taskID, scope, "aid-a", launcherSession, state, updatedAt, updatedAt); err != nil {
+		(task_id, requester_scope, requester_agent_id, launcher_session, launcher_scope, runtime, state, created_at, updated_at)
+		VALUES (?,?,?,?,'host:BOX','claude',?,?,?)`, taskID, scope, "aid-a", launcherSession, state, updatedAt, updatedAt); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -335,7 +336,7 @@ func TestEyesTaskOwnershipAndHousekeep(t *testing.T) {
 	now := time.Unix(2000000, 0)
 	s.Now = func() time.Time { return now }
 	nA, _ := s.Register("/r", "s-a", "hook")
-	childName, err := s.RegisterChild("/r", "s-a", "sub1", "Explore")
+	childName, _, err := s.RegisterChild("/r", "s-a", "sub1", "Explore")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1112,6 +1113,30 @@ func TestTransitionEyesTaskRefusesALocalActor(t *testing.T) {
 	}
 	if _, _, err := s2.TransitionEyesTask(task2.TaskID, relayActor("/r", "eyes-"+task2.TaskID), "failed", "{}"); !errors.Is(err, ErrNotYourTask) {
 		t.Fatalf("a relay row that is neither launcher nor eyes must not report, got %v", err)
+	}
+}
+
+// A broker is a workspace AND a session: its agent row is purged hours before
+// its task, so the same session id can be registered again on another host.
+// That stranger inherits nothing - the ledger recorded which workspace the
+// launcher answered from.
+func TestTransitionEyesTaskIsBoundToTheLaunchersScope(t *testing.T) {
+	s := open(t)
+	_, _, task, _ := liveTask(t, s)
+	stored, err := s.EyesTask(task.TaskID)
+	if err != nil || task.LauncherScope != "host:BOX" || stored.LauncherScope != "host:BOX" {
+		t.Fatalf("the task must record the broker's workspace: %+v (%v)", stored, err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM agents WHERE scope='host:BOX' AND session_id='broker-1'`); err != nil {
+		t.Fatal(err)
+	}
+	registerBroker(t, s, "host:EVIL", "broker-1")
+	if _, _, err := s.TransitionEyesTask(task.TaskID, relayActor("host:EVIL", "broker-1"),
+		"accepted", "{}"); !errors.Is(err, ErrNotYourTask) {
+		t.Fatalf("a launcher session re-registered elsewhere must not ack, got %v", err)
+	}
+	if got, _ := s.EyesTask(task.TaskID); got.State != "queued" {
+		t.Fatalf("a refused ack must leave the task alone: %+v", got)
 	}
 }
 

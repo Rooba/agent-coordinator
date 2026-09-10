@@ -160,8 +160,12 @@ const taskLedgerBody = `m.task_id != ''`
 // EyesTask is one requested host-eyes job. The ledger exists so cancel
 // authorization and launch idempotency never depend on scanning inboxes.
 type EyesTask struct {
-	TaskID, RequesterScope, RequesterAgentID, LauncherSession, Runtime, State string
-	CreatedAt, UpdatedAt                                                      int64
+	TaskID, RequesterScope, RequesterAgentID, Runtime, State string
+	// LauncherSession and LauncherScope are the broker's row together: a
+	// session id alone names no one, since it can be registered again in
+	// another workspace once the original row is purged.
+	LauncherSession, LauncherScope string
+	CreatedAt, UpdatedAt           int64
 	// CancelAcked is set once the broker has reported on a cancelled task.
 	// Until then the task still reserves its broker.
 	CancelAcked bool
@@ -216,12 +220,13 @@ func (s *Store) AssignEyesTask(req EyesRequest) (EyesTask, protocol.AgentRef, er
 	}
 	now, deadline := s.Now().Unix(), eyesDeadline(req.DeadlineS)
 	t := EyesTask{TaskID: "task-" + suffix, RequesterScope: req.Requester.Scope,
-		RequesterAgentID: req.Requester.AgentID, LauncherSession: l.SessionID,
+		RequesterAgentID: req.Requester.AgentID, LauncherSession: l.SessionID, LauncherScope: l.Scope,
 		Runtime: runtime, State: "queued", CreatedAt: now, UpdatedAt: now}
 	if _, err := tx.Exec(`INSERT INTO eyes_tasks
-		(task_id, requester_scope, requester_agent_id, launcher_session, runtime, state, deadline_s, created_at, updated_at)
-		VALUES (?,?,?,?,?,'queued',?,?,?)`,
-		t.TaskID, t.RequesterScope, t.RequesterAgentID, t.LauncherSession, t.Runtime, deadline, now, now); err != nil {
+		(task_id, requester_scope, requester_agent_id, launcher_session, launcher_scope, runtime, state, deadline_s, created_at, updated_at)
+		VALUES (?,?,?,?,?,?,'queued',?,?,?)`,
+		t.TaskID, t.RequesterScope, t.RequesterAgentID, t.LauncherSession, t.LauncherScope,
+		t.Runtime, deadline, now, now); err != nil {
 		return EyesTask{}, protocol.AgentRef{}, err
 	}
 	body, err := json.Marshal(protocol.TaskLaunchMsg{Type: protocol.TaskLaunch, TaskID: t.TaskID,
@@ -322,9 +327,10 @@ func (s *Store) EyesTask(taskID string) (EyesTask, error) {
 func (s *Store) eyesTask(q execQuerier, taskID string) (EyesTask, error) {
 	var t EyesTask
 	err := q.QueryRow(`SELECT task_id, requester_scope, requester_agent_id, launcher_session,
-		runtime, state, cancel_acked, created_at, updated_at FROM eyes_tasks WHERE task_id=?`, taskID).
+		launcher_scope, runtime, state, cancel_acked, created_at, updated_at
+		FROM eyes_tasks WHERE task_id=?`, taskID).
 		Scan(&t.TaskID, &t.RequesterScope, &t.RequesterAgentID, &t.LauncherSession,
-			&t.Runtime, &t.State, &t.CancelAcked, &t.CreatedAt, &t.UpdatedAt)
+			&t.LauncherScope, &t.Runtime, &t.State, &t.CancelAcked, &t.CreatedAt, &t.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return EyesTask{}, ErrUnknownTask
 	}
@@ -457,7 +463,7 @@ func (s *Store) eyesRole(q execQuerier, t EyesTask, a EyesActor) eyesRole {
 		if s.relayKind(q, a.Scope, a.SessionID, protocol.KindEyes) {
 			return roleChild
 		}
-	case a.Origin == RelayOrigin && a.SessionID == t.LauncherSession:
+	case a.Origin == RelayOrigin && a.SessionID == t.LauncherSession && a.Scope == t.LauncherScope:
 		if s.relayKind(q, a.Scope, a.SessionID, protocol.KindLauncher) {
 			return roleLauncher
 		}
@@ -500,7 +506,7 @@ func (s *Store) acksCancel(q execQuerier, t EyesTask, role eyesRole, to string) 
 // task is, and that must not block a move nobody could have mailed anyway.
 func (s *Store) eyesMail(q execQuerier, t EyesTask, role eyesRole, a EyesActor, msg string) (Delivery, bool, error) {
 	if role == roleRequester {
-		l, err := s.agentBySession(q, t.LauncherSession)
+		l, err := s.agentAt(q, t.LauncherScope, t.LauncherSession)
 		if errors.Is(err, ErrNoSession) {
 			return Delivery{}, false, nil // the broker's row is gone: nobody to tell
 		}
@@ -515,13 +521,13 @@ func (s *Store) eyesMail(q execQuerier, t EyesTask, role eyesRole, a EyesActor, 
 		// button - a bound subagent may be the one cancelling. Every
 		// lifecycle mail then names the same return address, which is the
 		// one the broker matches its launch against and answers on.
-		aid, name, err := s.resolveAgent(q, t.RequesterScope, t.RequesterAgentID)
+		from, err := s.resolveSender(q, t.RequesterScope, t.RequesterAgentID)
 		if err != nil {
 			return Delivery{}, false, err
 		}
-		ref := protocol.AgentRef{Name: name, AgentID: aid, Scope: t.RequesterScope}
-		return Delivery{FromScope: t.RequesterScope, FromName: aid, ToScope: l.Scope,
-			ToName: l.AgentID, Body: string(cancel), ReplyTo: &ref, TaskID: t.TaskID}, true, nil
+		ref := from.AgentRef
+		return Delivery{From: from, ToScope: l.Scope, ToName: l.AgentID,
+			Body: string(cancel), ReplyTo: &ref, TaskID: t.TaskID}, true, nil
 	}
 	actor, err := s.taskVoice(q, t, a)
 	if err == nil && role == roleSystem {
@@ -540,22 +546,21 @@ func (s *Store) eyesMail(q execQuerier, t EyesTask, role eyesRole, a EyesActor, 
 		return Delivery{}, false, err
 	}
 	ref := protocol.AgentRef{Name: actor.Name, AgentID: actor.AgentID, Scope: actor.Scope}
-	return Delivery{FromScope: actor.Scope, FromName: senderKey(ref), ToScope: t.RequesterScope,
+	return Delivery{From: Sender{AgentRef: ref, Kind: actor.Kind}, ToScope: t.RequesterScope,
 		ToName: t.RequesterAgentID, Body: msg, ReplyTo: &ref, TaskID: t.TaskID}, true, nil
 }
 
 // taskVoice is the identity a report leaves under: the row the actor proved,
 // or - when the deadline sweep settles a task with no caller at all - the
-// task's child, falling back to the broker that was holding it. Only the
-// ledger's own launcher_session is resolved without a workspace, because the
-// ledger is where that session id came from.
+// task's child, falling back to the broker that was holding it. Every lookup
+// is a workspace and a session together, the ledger's own pair included.
 func (s *Store) taskVoice(q execQuerier, t EyesTask, a EyesActor) (RelayIdentity, error) {
 	if a.SessionID != "" {
 		return s.agentAt(q, a.Scope, a.SessionID)
 	}
 	id, err := s.agentAt(q, t.RequesterScope, "eyes-"+t.TaskID)
 	if errors.Is(err, ErrNoSession) {
-		return s.agentBySession(q, t.LauncherSession)
+		return s.agentAt(q, t.LauncherScope, t.LauncherSession)
 	}
 	return id, err
 }

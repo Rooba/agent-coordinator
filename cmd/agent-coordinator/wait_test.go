@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"encoding/json"
 	"net"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -45,10 +47,11 @@ func peekDaemon(t *testing.T, baselineMisses, stalePolls int64, hw int64) string
 			}
 			// After baseline arm, polls with AfterID=hw see fresh mail only
 			// once stalePolls of "still only old mail" have elapsed.
-			if req.AfterID >= hw {
+			if req.AfterID != 0 {
 				armedPoll := n - baselineMisses - 1 // 1-based arm already used one poll
 				if armedPoll > stalePolls {
 					resp.Unread = 1
+					resp.HighWater = hw + 1
 					resp.PeekIDs = []int64{hw + 1}
 					resp.PeekFroms = []string{"sender-fox"}
 				}
@@ -67,10 +70,15 @@ func peekDaemon(t *testing.T, baselineMisses, stalePolls int64, hw int64) string
 	return sock
 }
 
+func waitStateFile(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(t.TempDir(), "wait.json")
+}
+
 func TestWaitForMailFindsMailAfterPolls(t *testing.T) {
 	// Arm sees hw=10 (and 3 stale unread). Two polls still only stale. Then fresh.
 	sock := peekDaemon(t, 0, 2, 10)
-	result, found, err := waitForMail(sock, "/r", "amber-fox", 5*time.Second, 10*time.Millisecond)
+	result, found, err := waitForMail(sock, waitStateFile(t), "/r", "amber-fox", 5*time.Second, 10*time.Millisecond, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +93,7 @@ func TestWaitForMailFindsMailAfterPolls(t *testing.T) {
 func TestWaitForMailTimesOutOnStaleBacklogOnly(t *testing.T) {
 	// High water 10, never injects mail above it - only "stale" responses forever.
 	sock := peekDaemon(t, 0, 1<<40, 10)
-	result, found, err := waitForMail(sock, "/r", "amber-fox", 50*time.Millisecond, 10*time.Millisecond)
+	result, found, err := waitForMail(sock, waitStateFile(t), "/r", "amber-fox", 50*time.Millisecond, 10*time.Millisecond, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,12 +104,171 @@ func TestWaitForMailTimesOutOnStaleBacklogOnly(t *testing.T) {
 
 func TestWaitForMailTimesOut(t *testing.T) {
 	sock := peekDaemon(t, 0, 1<<40, 10)
-	result, found, err := waitForMail(sock, "/r", "amber-fox", 50*time.Millisecond, 10*time.Millisecond)
+	result, found, err := waitForMail(sock, waitStateFile(t), "/r", "amber-fox", 50*time.Millisecond, 10*time.Millisecond, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if found || result.Unread != 0 {
 		t.Fatalf("want timeout, got found=%v result=%+v", found, result)
+	}
+}
+
+func TestWaitForMailRearmsAfterProcessDies(t *testing.T) {
+	statePath := waitStateFile(t)
+	sock := peekDaemon(t, 0, 0, 10)
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		waitForMail(sock, statePath, "/r", "amber-fox", time.Second, 10*time.Millisecond, func(afterID int64) {
+			persisted, ok := loadWaitState(statePath, time.Now())
+			if !ok || afterID != 10 || persisted != 10 {
+				t.Errorf("armed callback preceded durable state: after=%d persisted=%d ok=%v", afterID, persisted, ok)
+			}
+			runtime.Goexit() // model a host watchdog killing the waiter after it armed
+		})
+	}()
+	<-stopped
+
+	result, found, err := waitForMail(sock, statePath, "/r", "amber-fox", time.Second, 10*time.Millisecond, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || len(result.IDs) != 1 || result.IDs[0] != 11 {
+		t.Fatalf("re-arm lost mail delivered after the killed process armed: found=%v result=%+v", found, result)
+	}
+}
+
+func TestWaitForMailRearmsAcrossTimeoutGapAndAdvancesAfterRead(t *testing.T) {
+	statePath := waitStateFile(t)
+	quietSock := peekDaemon(t, 0, 1<<40, 10)
+	if _, found, err := waitForMail(quietSock, statePath, "/r", "amber-fox", 30*time.Millisecond, 10*time.Millisecond, nil); err != nil || found {
+		t.Fatalf("initial wait must time out quietly: found=%v err=%v", found, err)
+	}
+	afterID, ok := loadWaitState(statePath, time.Now())
+	if !ok || afterID != 10 {
+		t.Fatalf("timeout must preserve baseline 10 for re-arm, got after=%d ok=%v", afterID, ok)
+	}
+
+	freshSock := peekDaemon(t, 0, 0, 10)
+	result, found, err := waitForMail(freshSock, statePath, "/r", "amber-fox", time.Second, 10*time.Millisecond, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || len(result.IDs) != 1 || result.IDs[0] != 11 {
+		t.Fatalf("re-arm lost mail delivered after timeout: found=%v result=%+v", found, result)
+	}
+	afterID, ok = loadWaitState(statePath, time.Now())
+	if !ok || afterID != 10 {
+		t.Fatalf("wake must not checkpoint unread mail before the harness sees it: after=%d ok=%v", afterID, ok)
+	}
+	// Model the first process dying after it detected mail but before its output
+	// reached the harness. The replacement must deliver the same wake again.
+	result, found, err = waitForMail(freshSock, statePath, "/r", "amber-fox", time.Second, 10*time.Millisecond, nil)
+	if err != nil || !found || len(result.IDs) != 1 || result.IDs[0] != 11 {
+		t.Fatalf("re-arm after an unobserved wake lost unread mail: found=%v result=%+v err=%v", found, result, err)
+	}
+
+	// Model the harness reading the wake's mail before it re-arms. The first
+	// quiet peek proves the intervening delivery was consumed and advances it.
+	staleSock := peekDaemon(t, 0, 1<<40, 11)
+	if _, found, err := waitForMail(staleSock, statePath, "/r", "amber-fox", 30*time.Millisecond, 10*time.Millisecond, nil); err != nil || found {
+		t.Fatalf("already reported mail must not wake forever: found=%v err=%v", found, err)
+	}
+	afterID, ok = loadWaitState(statePath, time.Now())
+	if !ok || afterID != 11 {
+		t.Fatalf("quiet re-arm must advance past consumed mail: after=%d ok=%v", afterID, ok)
+	}
+}
+
+func TestWaitForMailConcurrentWaitersDoNotCheckpointUnread(t *testing.T) {
+	statePath := waitStateFile(t)
+	if err := saveWaitState(statePath, 10); err != nil {
+		t.Fatal(err)
+	}
+	sock := peekDaemon(t, 0, 0, 10)
+	type outcome struct {
+		result waitResult
+		found  bool
+		err    error
+	}
+	outcomes := make(chan outcome, 2)
+	for range 2 {
+		go func() {
+			result, found, err := waitForMail(sock, statePath, "/r", "amber-fox", time.Second, 10*time.Millisecond, nil)
+			outcomes <- outcome{result: result, found: found, err: err}
+		}()
+	}
+	for range 2 {
+		got := <-outcomes
+		if got.err != nil || !got.found || len(got.result.IDs) != 1 || got.result.IDs[0] != 11 {
+			t.Fatalf("concurrent waiter lost wake: %+v", got)
+		}
+	}
+	afterID, ok := loadWaitState(statePath, time.Now())
+	if !ok || afterID != 10 {
+		t.Fatalf("concurrent wakes must leave unread mail re-armable: after=%d ok=%v", afterID, ok)
+	}
+}
+
+func TestWaitForMailReplacesCorruptOrExpiredState(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		content string
+		expired bool
+	}{
+		{name: "corrupt", content: "not an id"},
+		{name: "expired", content: "4", expired: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			statePath := waitStateFile(t)
+			if err := os.WriteFile(statePath, []byte(tc.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if tc.expired {
+				old := time.Now().Add(-waitStateTTL - time.Hour)
+				if err := os.Chtimes(statePath, old, old); err != nil {
+					t.Fatal(err)
+				}
+			}
+			sock := peekDaemon(t, 0, 1<<40, 10)
+			if _, found, err := waitForMail(sock, statePath, "/r", "amber-fox", 30*time.Millisecond, 10*time.Millisecond, nil); err != nil || found {
+				t.Fatalf("replacement arm must time out quietly: found=%v err=%v", found, err)
+			}
+			afterID, ok := loadWaitState(statePath, time.Now())
+			if !ok || afterID != 10 {
+				t.Fatalf("invalid state was not safely replaced: after=%d ok=%v", afterID, ok)
+			}
+		})
+	}
+}
+
+func TestWaitForMailFailsBeforeArmedWhenCheckpointCannotBeSaved(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(parent, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	armed := false
+	_, found, err := waitForMail(peekDaemon(t, 0, 1<<40, 10), filepath.Join(parent, "wait"), "/r", "amber-fox",
+		time.Second, 10*time.Millisecond, func(int64) { armed = true })
+	if found || err == nil || armed || !strings.Contains(err.Error(), "save arm state") {
+		t.Fatalf("must fail durably before acknowledging arm: found=%v armed=%v err=%v", found, armed, err)
+	}
+}
+
+func TestSaveWaitStateConcurrentWritersStayValid(t *testing.T) {
+	statePath := waitStateFile(t)
+	errs := make(chan error, 16)
+	for id := int64(0); id < 16; id++ {
+		go func() { errs <- saveWaitState(statePath, id) }()
+	}
+	for range 16 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	afterID, ok := loadWaitState(statePath, time.Now())
+	if !ok || afterID < 0 || afterID >= 16 {
+		t.Fatalf("concurrent replacement left an invalid cursor: after=%d ok=%v", afterID, ok)
 	}
 }
 
@@ -111,7 +278,7 @@ func TestWaitForMailSurvivesMissingDaemon(t *testing.T) {
 	// test binary itself as "daemon".
 	t.Setenv("AC_NO_SPAWN", "1")
 	sock := filepath.Join(socktest.Dir(t), "absent.sock")
-	if _, found, err := waitForMail(sock, "/r", "x", 30*time.Millisecond, 10*time.Millisecond); found || err != nil {
+	if _, found, err := waitForMail(sock, waitStateFile(t), "/r", "x", 30*time.Millisecond, 10*time.Millisecond, nil); found || err != nil {
 		t.Fatal("must time out quietly without a daemon")
 	}
 }
@@ -155,7 +322,7 @@ func TestWaitForMailImmediateWhenFreshAtArm(t *testing.T) {
 			c.Close()
 		}
 	}()
-	result, found, err := waitForMail(sock, "/r", "amber-fox", 2*time.Second, 10*time.Millisecond)
+	result, found, err := waitForMail(sock, waitStateFile(t), "/r", "amber-fox", 2*time.Second, 10*time.Millisecond, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +353,7 @@ func TestWaitForMailUnknownNameFailsFast(t *testing.T) {
 		}
 	}()
 	start := time.Now()
-	_, found, err := waitForMail(sock, "/r", "nosuch", 5*time.Second, 10*time.Millisecond)
+	_, found, err := waitForMail(sock, waitStateFile(t), "/r", "nosuch", 5*time.Second, 10*time.Millisecond, nil)
 	if found || err == nil {
 		t.Fatalf("unknown name must return an error, got found=%v err=%v", found, err)
 	}

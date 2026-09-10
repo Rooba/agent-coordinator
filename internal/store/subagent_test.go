@@ -13,24 +13,24 @@ func TestRegisterChildIdempotentAndSuffix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c1, err := s.RegisterChild("/r", "parent-sess", "a1", "Explore")
-	if err != nil || c1 != parent+"/explore-1" {
-		t.Fatalf("first child: %q err=%v", c1, err)
+	c1, created, err := s.RegisterChild("/r", "parent-sess", "a1", "Explore")
+	if err != nil || !created || c1 != parent+"/explore-1" {
+		t.Fatalf("first child: %q created=%v err=%v", c1, created, err)
 	}
 	// Same (scope, child session) is idempotent.
-	again, err := s.RegisterChild("/r", "parent-sess", "a1", "Explore")
-	if err != nil || again != c1 {
-		t.Fatalf("re-register: %q err=%v", again, err)
+	again, created, err := s.RegisterChild("/r", "parent-sess", "a1", "Explore")
+	if err != nil || created || again != c1 {
+		t.Fatalf("re-register: %q created=%v err=%v", again, created, err)
 	}
 	// A second distinct child of the same type takes the next suffix.
-	c2, err := s.RegisterChild("/r", "parent-sess", "a2", "Explore")
-	if err != nil || c2 != parent+"/explore-2" {
-		t.Fatalf("second child: %q err=%v", c2, err)
+	c2, created, err := s.RegisterChild("/r", "parent-sess", "a2", "Explore")
+	if err != nil || !created || c2 != parent+"/explore-2" {
+		t.Fatalf("second child: %q created=%v err=%v", c2, created, err)
 	}
 	// Empty agent type falls back to "sub".
-	c3, err := s.RegisterChild("/r", "parent-sess", "a3", "")
-	if err != nil || c3 != parent+"/sub-1" {
-		t.Fatalf("typeless child: %q err=%v", c3, err)
+	c3, created, err := s.RegisterChild("/r", "parent-sess", "a3", "")
+	if err != nil || !created || c3 != parent+"/sub-1" {
+		t.Fatalf("typeless child: %q created=%v err=%v", c3, created, err)
 	}
 	id, err := s.Identity("/r", ChildSessionID("parent-sess", "a1"))
 	if err != nil || id.Name != c1 || id.Source != "hook-subagent" || id.Parent != parent {
@@ -38,12 +38,49 @@ func TestRegisterChildIdempotentAndSuffix(t *testing.T) {
 	}
 }
 
+func TestRegisterChildConcurrentCreatedWinner(t *testing.T) {
+	s := open(t)
+	parent, err := s.Register("/r", "parent-sess", "hook")
+	if err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		name    string
+		created bool
+		err     error
+	}
+	const calls = 8
+	start := make(chan struct{})
+	results := make(chan result, calls)
+	for range calls {
+		go func() {
+			<-start
+			name, created, err := s.RegisterChild("/r", "parent-sess", "a1", "Explore")
+			results <- result{name, created, err}
+		}()
+	}
+	close(start)
+	winners := 0
+	for range calls {
+		got := <-results
+		if got.err != nil || got.name != parent+"/explore-1" {
+			t.Fatalf("concurrent child: %+v", got)
+		}
+		if got.created {
+			winners++
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("created winners: got %d want 1", winners)
+	}
+}
+
 // A missing parent row is registered on the fly so the child never fails.
 func TestRegisterChildCreatesAbsentParent(t *testing.T) {
 	s := open(t)
-	c, err := s.RegisterChild("/r", "orphan-sess", "a1", "Plan")
-	if err != nil || !strings.HasSuffix(c, "/plan-1") {
-		t.Fatalf("child: %q err=%v", c, err)
+	c, created, err := s.RegisterChild("/r", "orphan-sess", "a1", "Plan")
+	if err != nil || !created || !strings.HasSuffix(c, "/plan-1") {
+		t.Fatalf("child: %q created=%v err=%v", c, created, err)
 	}
 	if id, err := s.Identity("/r", "orphan-sess"); err != nil || id.Name == "" {
 		t.Fatalf("parent must exist after child registration: %+v err=%v", id, err)
@@ -56,7 +93,7 @@ func TestChildReadLeavesParentUnread(t *testing.T) {
 	s := open(t)
 	parent, _ := s.Register("/r", "parent-sess", "hook")
 	peer, _ := s.Register("/r", "peer-sess", "hook")
-	child, err := s.RegisterChild("/r", "parent-sess", "a1", "Explore")
+	child, _, err := s.RegisterChild("/r", "parent-sess", "a1", "Explore")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +124,7 @@ func TestParentNoticeDrainLeavesChildNotices(t *testing.T) {
 	s := open(t)
 	parent, _ := s.Register("/r", "parent-sess", "hook")
 	peer, _ := s.Register("/r", "peer-sess", "hook")
-	child, _ := s.RegisterChild("/r", "parent-sess", "a1", "Explore")
+	child, _, _ := s.RegisterChild("/r", "parent-sess", "a1", "Explore")
 	if err := s.Send("/r", peer, parent, "for-parent"); err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +145,7 @@ func TestParentNoticeDrainLeavesChildNotices(t *testing.T) {
 func TestBoardShowsChildUnderParent(t *testing.T) {
 	s := open(t)
 	parent, _ := s.Register("/r", "parent-sess", "hook")
-	child, _ := s.RegisterChild("/r", "parent-sess", "a1", "Explore")
+	child, _, _ := s.RegisterChild("/r", "parent-sess", "a1", "Explore")
 	childSess := ChildSessionID("parent-sess", "a1")
 	if _, err := s.RecordEvent("/r", childSess, protocol.Request{Tool: "Read", Activity: "Reading x"}); err != nil {
 		t.Fatal(err)

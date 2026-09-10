@@ -26,7 +26,7 @@ it. Do not grep the filesystem for it.
 - `peek_messages(from?)` - non-destructive unread preview.
 - `broadcast(body, from?)` - one-shot to agents registered **now**; late joiners miss it.
 
-## Cross-workspace relay and Windows eyes
+## Cross-workspace relay and Windows eyes (For WSL)
 
 - `list_workspaces` - discover scopes with live agents before addressing another workspace.
 - `list_eyes` - list connected host launchers and active eyes tasks across workspaces.

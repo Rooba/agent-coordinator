@@ -43,6 +43,7 @@ type Result struct {
 	Stderr          []byte
 	StdoutTruncated bool
 	StderrTruncated bool
+	Warning         string // non-fatal preparation diagnostic from the provider
 }
 
 // Runner remembers only the active task. Durable completed-ID deduplication
@@ -163,6 +164,7 @@ func (r *Runner) Run(ctx context.Context, task Task) (Result, error) {
 	})
 	guard.Close() // also retires descendants after a clean root exit
 	result := capture(stdout, stderr)
+	result.Warning = invocation.Warning
 	if interrupted && waitErr != nil {
 		return result, runCtx.Err()
 	}

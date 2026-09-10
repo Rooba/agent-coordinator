@@ -143,8 +143,13 @@ func Run(stdin io.Reader, stdout io.Writer, socketPath string) {
 	}
 	switch event {
 	case "PostToolUse", "UserPromptSubmit":
-		if len(resp.Notices) > 0 {
-			emit(stdout, in.HookEventName, strings.Join(resp.Notices, "\n"))
+		notices := resp.Notices
+		if event == "PostToolUse" && in.AgentID != "" && resp.Name != "" {
+			identity := fmt.Sprintf("[coordinator] you are '%s' in this workspace; use from='%s' on coordinator tools because the MCP connection is shared with the parent.", resp.Name, resp.Name)
+			notices = append([]string{identity}, notices...)
+		}
+		if len(notices) > 0 {
+			emit(stdout, in.HookEventName, strings.Join(notices, "\n"))
 		}
 	case "Stop":
 		// Blocking Stop-hook output: the reason is fed back to the model, so
