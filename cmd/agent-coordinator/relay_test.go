@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -115,8 +116,12 @@ func TestJoinTCPDoesNotLeakSecret(t *testing.T) {
 		t.Fatalf("generated secret leaked: %s", out)
 	}
 	st, err := os.Stat(cred)
-	if err != nil || st.Mode().Perm() != 0o600 {
-		t.Fatalf("cred mode: %v %v", st.Mode(), err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Windows reports writable files as 0666; it does not implement Unix mode bits.
+	if runtime.GOOS != "windows" && st.Mode().Perm() != 0o600 {
+		t.Fatalf("cred mode: %v", st.Mode())
 	}
 	seen := <-got
 	if seen.Token != token || seen.Kind != protocol.KindEyes || seen.Platform != "windows" ||

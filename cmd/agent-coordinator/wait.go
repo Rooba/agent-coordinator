@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Rooba/agent-coordinator/internal/dialer"
@@ -176,7 +178,22 @@ func saveWaitState(path string, afterID int64) error {
 	if err = f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	return retryWaitStateRename(func() error { return os.Rename(tmp, path) }, runtime.GOOS == "windows", time.Sleep)
+}
+
+func retryWaitStateRename(rename func() error, onWindows bool, sleep func(time.Duration)) error {
+	// Competing replacements can temporarily leave a Windows destination
+	// pending deletion. Retry the atomic rename, never remove the old cursor.
+	// Numeric Win32 codes keep this path testable from every platform.
+	const accessDenied, sharingViolation = syscall.Errno(5), syscall.Errno(32)
+	for attempt := 0; ; attempt++ {
+		err := rename()
+		if err == nil || !onWindows || attempt == 8 ||
+			!errors.Is(err, accessDenied) && !errors.Is(err, sharingViolation) {
+			return err
+		}
+		sleep(5 * time.Millisecond << attempt) // at most 1.275 seconds in total
+	}
 }
 
 type peekInfo struct {

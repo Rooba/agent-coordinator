@@ -3,12 +3,14 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -263,12 +265,69 @@ func TestSaveWaitStateConcurrentWritersStayValid(t *testing.T) {
 	}
 	for range 16 {
 		if err := <-errs; err != nil {
-			t.Fatal(err)
+			t.Error(err) // collect every writer before temporary-directory cleanup
 		}
 	}
 	afterID, ok := loadWaitState(statePath, time.Now())
 	if !ok || afterID < 0 || afterID >= 16 {
 		t.Fatalf("concurrent replacement left an invalid cursor: after=%d ok=%v", afterID, ok)
+	}
+}
+
+func TestWaitStateRenameRetriesTransientWindowsErrors(t *testing.T) {
+	results := []error{
+		&os.LinkError{Op: "rename", Old: "temporary", New: "cursor", Err: syscall.Errno(5)},
+		&os.LinkError{Op: "rename", Old: "temporary", New: "cursor", Err: syscall.Errno(32)},
+		nil,
+	}
+	calls := 0
+	var delays []time.Duration
+	err := retryWaitStateRename(func() error {
+		if calls >= len(results) {
+			t.Fatal("rename continued after succeeding")
+		}
+		result := results[calls]
+		calls++
+		return result
+	}, true, func(d time.Duration) { delays = append(delays, d) })
+	if err != nil || calls != 3 || len(delays) != 2 || delays[0] <= 0 || delays[1] <= delays[0] {
+		t.Fatalf("transient retry: calls=%d delays=%v err=%v", calls, delays, err)
+	}
+}
+
+func TestWaitStateRenameReturnsPermanentOrExhaustedError(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		onWindows bool
+		cause     error
+		retry     bool
+	}{
+		{"nonretryable", true, os.ErrNotExist, false},
+		{"unix", false, syscall.Errno(5), false},
+		{"access denied exhausted", true, syscall.Errno(5), true},
+		{"sharing violation exhausted", true, syscall.Errno(32), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			failure := &os.LinkError{Op: "rename", Old: "temporary", New: "cursor", Err: tc.cause}
+			calls, slept := 0, time.Duration(0)
+			err := retryWaitStateRename(func() error {
+				calls++
+				if calls > 10 {
+					t.Fatal("rename retry is not bounded")
+				}
+				return failure
+			}, tc.onWindows, func(d time.Duration) { slept += d })
+			if err != failure || !errors.Is(err, tc.cause) {
+				t.Fatalf("must preserve final replacement error: %v", err)
+			}
+			if tc.retry {
+				if calls < 2 || slept <= 0 || slept > 2*time.Second {
+					t.Fatalf("retry budget: calls=%d sleep=%v", calls, slept)
+				}
+			} else if calls != 1 || slept != 0 {
+				t.Fatalf("nonretryable replacement retried: calls=%d sleep=%v", calls, slept)
+			}
+		})
 	}
 }
 
