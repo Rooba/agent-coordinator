@@ -21,6 +21,20 @@ const (
 	// built so every caller gets the same rule.
 	eyesDeadlineDefault = 300
 	eyesDeadlineMax     = 1800
+	// eyesProgressMailInterval is how often a running task may DM its
+	// requester. The row updates on every sample because that is cheap and
+	// private; mail is not, so a 30 minute task costs an inbox a handful of
+	// messages rather than one per turn.
+	eyesProgressMailInterval = 120
+	// maxEyesToolBytes bounds the one provider-supplied string a progress
+	// record carries.
+	maxEyesToolBytes = 64
+	// maxEyesTurns bounds the counter, so a malformed sample cannot store nonsense.
+	maxEyesTurns = 100000
+	// eyesHeartbeatStaleS is how quiet a live task may go before its last
+	// sign of life stops counting as one. A stalled task sends no mail, so
+	// this is the only signal a reader gets that it has gone quiet.
+	eyesHeartbeatStaleS = 120
 )
 
 var (
@@ -337,6 +351,253 @@ func (s *Store) eyesTask(q execQuerier, taskID string) (EyesTask, error) {
 	return t, err
 }
 
+// eyesTaskListMax bounds one listing: 50 rows is more ledger than a human
+// reads at a glance, and the newest are the ones that matter.
+const eyesTaskListMax = 50
+
+// EyesTaskFilter narrows the ledger. Scope is the workspace boundary;
+// OwnerAgentID is the opt-in "only mine" view - the tasks that agent could
+// cancel, its own plus the ones its parent asked for. An empty field does not
+// filter, so the whole workspace is the zero value.
+type EyesTaskFilter struct {
+	Scope, OwnerAgentID string
+	Limit               int
+}
+
+// EyesTaskView is one ledger row plus the numbers that answer "is it alive
+// and how long has it got?". All are measured on the daemon's clock - the
+// same one the deadline sweep judges by - so a caller never has to reconcile
+// its own. A settled task is measured to the moment it settled, so its
+// elapsed time stops there instead of growing forever.
+type EyesTaskView struct {
+	EyesTask
+	DeadlineS, ElapsedS int
+	// RemainingS goes negative once a live task passes its deadline; a
+	// settled one reports no time left rather than a negative count.
+	RemainingS int
+	// Progress is the last sample the task reported, HeartbeatAt when it
+	// arrived (0 if none has) and HeartbeatAgeS how long ago that was.
+	Progress      EyesProgress
+	HeartbeatAt   int64
+	HeartbeatAgeS int
+	// Overdue is a live task whose deadline passed with no completion or
+	// cancellation confirmed: the sweep has not reached it and nothing has
+	// reported, so whether it still runs is unknown.
+	Overdue bool
+	// HeartbeatStale is a live task that has shown no sign of life for
+	// eyesHeartbeatStaleS, measured from its last sample or, if none ever
+	// arrived, from when it was created.
+	HeartbeatStale bool
+}
+
+// ListEyesTasks lists the task ledger, tasks still holding a broker first and
+// newest first within that, so an in-flight job is always the top row.
+func (s *Store) ListEyesTasks(f EyesTaskFilter) ([]EyesTaskView, error) {
+	var where []string
+	var args []any
+	if f.Scope != "" {
+		where = append(where, "t.requester_scope = ?")
+		args = append(args, f.Scope)
+	}
+	if f.OwnerAgentID != "" {
+		// "Mine" means the tasks this agent could cancel: the ones it asked
+		// for, plus the ones its parent asked for.
+		where = append(where, `(t.requester_agent_id = ? OR t.requester_agent_id = (
+			SELECT p.agent_id FROM agents c
+			JOIN agents p ON c.parent_session_id != '' AND p.scope = c.scope AND p.session_id = c.parent_session_id
+			WHERE c.scope = t.requester_scope AND c.agent_id = ?))`)
+		args = append(args, f.OwnerAgentID, f.OwnerAgentID)
+	}
+	clause := ""
+	if len(where) > 0 {
+		clause = " WHERE " + strings.Join(where, " AND ")
+	}
+	rows, err := s.db.Query(`SELECT t.task_id, t.requester_scope, t.requester_agent_id,
+		t.launcher_session, t.launcher_scope, t.runtime, t.state, t.cancel_acked,
+		t.deadline_s, t.created_at, t.updated_at, t.progress, t.heartbeat_at
+		FROM eyes_tasks t`+clause+`
+		ORDER BY `+taskHoldsBroker+` DESC, t.created_at DESC, t.task_id LIMIT ?`,
+		append(args, eyesTaskLimit(f.Limit))...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	now := s.Now().Unix()
+	var out []EyesTaskView
+	for rows.Next() {
+		var v EyesTaskView
+		var progress string
+		if err := rows.Scan(&v.TaskID, &v.RequesterScope, &v.RequesterAgentID, &v.LauncherSession,
+			&v.LauncherScope, &v.Runtime, &v.State, &v.CancelAcked, &v.DeadlineS,
+			&v.CreatedAt, &v.UpdatedAt, &progress, &v.HeartbeatAt); err != nil {
+			return nil, err
+		}
+		// A live task is measured to now; a settled one stops at the moment
+		// it settled, so yesterday's two-minute job still reads as two minutes.
+		live := v.unsettled()
+		end := v.UpdatedAt
+		if live {
+			end = now
+		}
+		v.ElapsedS = int(end - v.CreatedAt)
+		v.RemainingS = v.DeadlineS - v.ElapsedS
+		v.Overdue = live && v.RemainingS < 0
+		if !live {
+			v.RemainingS = max(v.RemainingS, 0)
+		}
+		v.Progress = decodeEyesProgress(progress)
+		quietSince := v.CreatedAt
+		if v.HeartbeatAt > 0 {
+			quietSince = v.HeartbeatAt
+			v.HeartbeatAgeS = max(int(end-v.HeartbeatAt), 0)
+		}
+		v.HeartbeatStale = live && end-quietSince >= eyesHeartbeatStaleS
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// eyesTaskLimit bounds one listing to eyesTaskListMax rows.
+func eyesTaskLimit(n int) int {
+	if n <= 0 || n > eyesTaskListMax {
+		return eyesTaskListMax
+	}
+	return n
+}
+
+// EyesProgress is what a running task reports about itself. It is content-free
+// by construction: a turn count and the NAME of the tool last used are all it
+// may carry, because an eyes task looks at a live browser session and nothing
+// derived from the page may be stored or mailed. MailedAt and MailedTurns are
+// the throttle's own memory of the last copy the requester was sent.
+type EyesProgress struct {
+	Turns       int    `json:"turns,omitempty"`
+	Tool        string `json:"tool,omitempty"`
+	MailedAt    int64  `json:"mailed_at,omitempty"`
+	MailedTurns int    `json:"mailed_turns,omitempty"`
+}
+
+// cleanEyesTool bounds a tool name and requires it to BE a name: a value
+// carrying anything else is dropped whole rather than compacted, so page text
+// cannot reach the row or an inbox by posing as a tool.
+func cleanEyesTool(name string) string {
+	if len(name) > maxEyesToolBytes {
+		name = name[:maxEyesToolBytes]
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
+			c == '_', c == '-', c == '.', c == ':':
+		default:
+			return ""
+		}
+	}
+	return name
+}
+
+func decodeEyesProgress(raw string) EyesProgress {
+	var p EyesProgress
+	if raw != "" {
+		_ = json.Unmarshal([]byte(raw), &p)
+	}
+	return p
+}
+
+// RecordEyesProgress writes one liveness sample from a running task: the row
+// moves on every sample and the task's child agent is marked seen, so "is it
+// alive?" is answerable at a glance, while the requester's inbox is spared
+// everything but a throttled copy. It reports the stored sample and whether
+// that copy was sent.
+func (s *Store) RecordEyesProgress(taskID string, a EyesActor, p EyesProgress) (EyesProgress, bool, error) {
+	now := s.Now().Unix()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return EyesProgress{}, false, err
+	}
+	defer tx.Rollback()
+	t, err := s.eyesTask(tx, taskID)
+	if err != nil {
+		return EyesProgress{}, false, err
+	}
+	// Only the two sides that actually run the job may say it is alive, and
+	// only while it still is: a settled task takes no more samples.
+	role := s.eyesRole(tx, t, a)
+	if role != roleChild && role != roleLauncher {
+		return EyesProgress{}, false, ErrNotYourTask
+	}
+	if t.State != "queued" && t.State != "accepted" {
+		return EyesProgress{}, false, fmt.Errorf("%w: %s", ErrTaskNotLive, t.State)
+	}
+	next, due := s.nextEyesProgress(tx, t, p, now)
+	if err := s.writeEyesProgress(tx, t, next, now); err != nil {
+		return EyesProgress{}, false, err
+	}
+	if due {
+		// The body is built HERE, from the clamped record, so nothing a
+		// provider wrote is ever passed through to an inbox.
+		body, err := json.Marshal(protocol.TaskProgressMsg{Type: protocol.TaskProgress,
+			TaskID: t.TaskID, Turns: next.Turns, Tool: next.Tool, ElapsedS: int(now - t.CreatedAt)})
+		if err != nil {
+			return EyesProgress{}, false, err
+		}
+		d, deliver, err := s.eyesMail(tx, t, role, a, string(body))
+		if err != nil {
+			return EyesProgress{}, false, err
+		}
+		if deliver {
+			if err := s.sendToScope(tx, d); err != nil {
+				return EyesProgress{}, false, err
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return EyesProgress{}, false, err
+	}
+	return next, due, nil
+}
+
+// nextEyesProgress folds one sample onto the stored one and decides whether the
+// requester is due another copy. Turns only ever climb, the last known tool
+// name survives a sample that names none, and the first sample only starts the
+// clock - the accept already told the requester the task had begun. A task
+// stuck on one turn mails nothing at all, and its heartbeat keeps arriving, so
+// the row reads as alive but not advancing rather than as failed.
+func (s *Store) nextEyesProgress(q execQuerier, t EyesTask, p EyesProgress, now int64) (EyesProgress, bool) {
+	var raw string
+	if err := q.QueryRow(`SELECT progress FROM eyes_tasks WHERE task_id=?`, t.TaskID).Scan(&raw); err != nil {
+		raw = ""
+	}
+	prev := decodeEyesProgress(raw)
+	next := EyesProgress{Turns: min(max(p.Turns, prev.Turns), maxEyesTurns), Tool: cleanEyesTool(p.Tool),
+		MailedAt: prev.MailedAt, MailedTurns: prev.MailedTurns}
+	if next.Tool == "" {
+		next.Tool = cleanEyesTool(prev.Tool)
+	}
+	due := prev.MailedAt != 0 && now-prev.MailedAt >= eyesProgressMailInterval && next.Turns > prev.MailedTurns
+	if due || prev.MailedAt == 0 {
+		next.MailedAt, next.MailedTurns = now, next.Turns
+	}
+	return next, due
+}
+
+// writeEyesProgress stamps the row and refreshes the task's child agent, whose
+// last_seen would otherwise stay frozen at registration - leaving no way to
+// tell a working task from a dead one.
+func (s *Store) writeEyesProgress(q execQuerier, t EyesTask, p EyesProgress, now int64) error {
+	body, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	if _, err := q.Exec(`UPDATE eyes_tasks SET progress=?, heartbeat_at=? WHERE task_id=?`,
+		string(body), now, t.TaskID); err != nil {
+		return err
+	}
+	_, err = q.Exec(`UPDATE agents SET last_seen=?, status=CASE status WHEN 'idle' THEN 'active' ELSE status END
+		WHERE scope=? AND session_id=? AND status != 'gone'`, now, t.RequesterScope, "eyes-"+t.TaskID)
+	return err
+}
+
 // eyesRole is which side of a task an actor speaks for.
 type eyesRole string
 
@@ -625,14 +886,15 @@ func (s *Store) expiredTasks(now time.Time) ([]string, error) {
 }
 
 // actsFor reports whether agentID is the owner or one of the owner's bound
-// children: a subagent may cancel what its parent asked for.
+// children: a subagent may cancel what its parent asked for. A parentless
+// agent stores an empty parent, which must never match a row that has one.
 func (s *Store) actsFor(q execQuerier, scope, agentID, ownerID string) bool {
 	if agentID == ownerID {
 		return true
 	}
 	var parentID string
 	err := q.QueryRow(`SELECT p.agent_id FROM agents c
-		JOIN agents p ON p.scope = c.scope AND p.session_id = c.parent_session_id
+		JOIN agents p ON c.parent_session_id != '' AND p.scope = c.scope AND p.session_id = c.parent_session_id
 		WHERE c.scope=? AND c.agent_id=?`, scope, agentID).Scan(&parentID)
 	return err == nil && parentID == ownerID
 }

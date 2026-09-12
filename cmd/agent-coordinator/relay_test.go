@@ -314,3 +314,103 @@ func TestUnixSockAddrIgnoresACAddr(t *testing.T) {
 		t.Fatalf("unix helper must not attach creds: %+v", req)
 	}
 }
+
+// humanDur is what makes a second count readable at a glance, in both
+// directions: a deadline that has passed is rendered by its size, and how far
+// past it is said in words next to it.
+func TestHumanDur(t *testing.T) {
+	for _, c := range []struct {
+		secs int
+		want string
+	}{
+		{secs: 0, want: "0s"},
+		{secs: 59, want: "59s"},
+		{secs: 60, want: "1m00s"},
+		{secs: 782, want: "13m02s"},
+		{secs: 3599, want: "59m59s"},
+		{secs: 3600, want: "1h00m"},
+		{secs: 7380, want: "2h03m"},
+		{secs: -480, want: "8m00s"},
+	} {
+		if got := humanDur(c.secs); got != c.want {
+			t.Errorf("humanDur(%d) = %q, want %q", c.secs, got, c.want)
+		}
+	}
+}
+
+// The task row has to answer "is it alive and how long has it got?" without
+// the reader doing arithmetic, and it must say outright when a task is past
+// its deadline with nothing running behind it.
+func TestEyesTaskLineShowsDeadlineState(t *testing.T) {
+	row := func(state string, elapsed, remaining int, overdue bool) protocol.EyesTaskInfo {
+		return protocol.EyesTaskInfo{TaskID: "task-0123456789ab", Runtime: "claude", State: state,
+			RequesterScope: "/r", RequesterAgentID: "aid-a", DeadlineS: 300,
+			ElapsedS: elapsed, RemainingS: remaining, Overdue: overdue}
+	}
+	for _, c := range []struct {
+		name   string
+		task   protocol.EyesTaskInfo
+		want   []string
+		absent string
+	}{
+		{name: "queued", task: row("queued", 12, 288, false),
+			want: []string{"task-0123456789ab", "claude", "queued", "elapsed=12s",
+				"remaining=4m48s", "aid-a@/r"}},
+		{name: "accepted", task: row("accepted", 780, 1020, false),
+			want: []string{"accepted", "elapsed=13m00s", "remaining=17m00s"}},
+		{name: "overdue accepted", task: row("accepted", 780, -480, true),
+			want: []string{"accepted", "elapsed=13m00s", "OVERDUE by 8m00s"}, absent: "remaining="},
+		{name: "terminal", task: row("done", 900, -600, false),
+			want: []string{"done", "elapsed=15m00s", "remaining=-"}, absent: "OVERDUE"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			line := eyesTaskLine(c.task)
+			for _, want := range c.want {
+				if !strings.Contains(line, want) {
+					t.Fatalf("line %q missing %q", line, want)
+				}
+			}
+			if c.absent != "" && strings.Contains(line, c.absent) {
+				t.Fatalf("line %q must not contain %q", line, c.absent)
+			}
+		})
+	}
+}
+
+// A stalled task deliberately sends no mail, so the row is where a reader
+// finds out it has gone quiet - and it must never show what a tool was
+// looking at, only its name.
+func TestEyesTaskLineShowsProgressAndStall(t *testing.T) {
+	row := func(turns int, tool string, hb int64, age int, stale bool) protocol.EyesTaskInfo {
+		return protocol.EyesTaskInfo{TaskID: "task-0123456789ab", Runtime: "claude", State: "accepted",
+			RequesterScope: "/r", RequesterAgentID: "aid-a", DeadlineS: 300, ElapsedS: 60,
+			RemainingS: 240, Turns: turns, Tool: tool, HeartbeatAt: hb, HeartbeatAgeS: age,
+			HeartbeatStale: stale}
+	}
+	for _, c := range []struct {
+		name   string
+		task   protocol.EyesTaskInfo
+		want   []string
+		absent string
+	}{
+		{name: "moving", task: row(7, "mcp__claude-in-chrome__click", 1000000, 12, false),
+			want: []string{"turns=7", "tool=mcp__claude-in-chrome__click", "hb=12s"}, absent: "STALE"},
+		{name: "gone quiet", task: row(7, "Read", 1000000, 310, true),
+			want: []string{"turns=7", "hb=STALE:5m10s"}},
+		{name: "never reported", task: row(0, "", 0, 0, true), want: []string{"hb=STALE:never"},
+			absent: "turns="},
+		{name: "no sample yet", task: row(0, "", 0, 0, false), want: []string{"hb=-"}, absent: "STALE"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			line := eyesTaskLine(c.task)
+			for _, want := range c.want {
+				if !strings.Contains(line, want) {
+					t.Fatalf("line %q missing %q", line, want)
+				}
+			}
+			if c.absent != "" && strings.Contains(line, c.absent) {
+				t.Fatalf("line %q must not contain %q", line, c.absent)
+			}
+		})
+	}
+}

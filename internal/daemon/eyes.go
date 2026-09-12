@@ -66,6 +66,48 @@ func cancelEyes(st *store.Store, req protocol.Request, actor protocol.AgentRef) 
 	return protocol.Response{OK: true, TaskID: task.TaskID}
 }
 
+// listEyesTasks answers with the eyes task ledger. The workspace is the
+// boundary - it is the scope the daemon bound, never one the caller named, so
+// no request reads another workspace's tasks - and any peer in it may read
+// this bounded metadata. Asking for "mine" narrows to the caller's own tasks;
+// who may cancel one is decided separately, at the cancel.
+func listEyesTasks(st *store.Store, req protocol.Request, actor protocol.AgentRef) protocol.Response {
+	filter := store.EyesTaskFilter{Scope: req.Scope, Limit: req.Limit}
+	if req.Mine {
+		owner, err := eyesOwner(st, req, actor)
+		if err != nil {
+			return fail(err)
+		}
+		filter.OwnerAgentID = owner
+	}
+	tasks, err := st.ListEyesTasks(filter)
+	if err != nil {
+		return fail(err)
+	}
+	out := make([]protocol.EyesTaskInfo, 0, len(tasks))
+	for _, t := range tasks {
+		out = append(out, protocol.EyesTaskInfo{TaskID: t.TaskID, Runtime: t.Runtime, State: t.State,
+			RequesterScope: t.RequesterScope, RequesterAgentID: t.RequesterAgentID,
+			LauncherScope: t.LauncherScope, CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt,
+			DeadlineS: t.DeadlineS, ElapsedS: t.ElapsedS, RemainingS: t.RemainingS,
+			Overdue: t.Overdue, CancelAcked: t.CancelAcked, Turns: t.Progress.Turns,
+			Tool: t.Progress.Tool, HeartbeatAt: t.HeartbeatAt, HeartbeatAgeS: t.HeartbeatAgeS,
+			HeartbeatStale: t.HeartbeatStale})
+	}
+	return protocol.Response{OK: true, EyesTasks: out}
+}
+
+// eyesOwner is the agent id behind a "mine" listing: the identity this request
+// already proved, or failing that the calling session's own row. Only "mine"
+// needs one, so an unknown caller is an error rather than a wider listing.
+func eyesOwner(st *store.Store, req protocol.Request, actor protocol.AgentRef) (string, error) {
+	if actor.AgentID != "" {
+		return actor.AgentID, nil
+	}
+	id, err := st.ResolveActor(req.Scope, req.SessionID, req.From)
+	return id.AgentID, err
+}
+
 // taskReport spots a lifecycle report inside outgoing mail: the launcher's ack
 // and its child's outcome move the task instead of landing as ordinary mail,
 // so the state change and the requester's copy commit together. Anything that
@@ -81,9 +123,9 @@ func taskReport(st *store.Store, req protocol.Request, actor protocol.AgentRef) 
 	if !taskBody {
 		return protocol.Response{}, false
 	}
-	to, ok := taskStates[typ]
-	taskID, valid := decodeTaskReport(typ, req.Body)
-	if !ok || !valid {
+	to, lifecycle := taskStates[typ]
+	taskID, sample, valid := decodeTaskReport(typ, req.Body)
+	if !valid || !lifecycle && typ != protocol.TaskProgress {
 		return fail(errReservedTask), true
 	}
 	// Lifecycle mail always uses the structured cross-workspace send and the
@@ -100,8 +142,16 @@ func taskReport(st *store.Store, req protocol.Request, actor protocol.AgentRef) 
 		return fail(errReservedTask), true
 	}
 	// Who may make this move is the store's call: only the broker holding the
-	// task, or the child it minted for it, has standing in it.
-	if _, _, err := st.TransitionEyesTask(taskID, eyesActor(req, actor), to, req.Body); err != nil {
+	// task, or the child it minted for it, has standing in it. Progress is not
+	// a move at all: it refreshes the row and the child's presence, and the
+	// store decides whether the requester is due another copy.
+	if lifecycle {
+		_, _, err = st.TransitionEyesTask(taskID, eyesActor(req, actor), to, req.Body)
+	} else {
+		_, _, err = st.RecordEyesProgress(taskID, eyesActor(req, actor),
+			store.EyesProgress{Turns: sample.Turns, Tool: sample.Tool})
+	}
+	if err != nil {
 		return protocol.Response{Error: relayError(err)}, true
 	}
 	return protocol.Response{OK: true, TaskID: taskID}, true
@@ -144,20 +194,30 @@ func taskMessageType(body string) (string, bool) {
 	return typ, strings.HasPrefix(typ, taskPrefix)
 }
 
-// decodeTaskReport strictly decodes the one shared wire struct named by typ.
-// Unknown fields, trailing values, type mismatches and absent required fields
-// all make the reserved task body invalid rather than ordinary mail.
-func decodeTaskReport(typ, body string) (string, bool) {
+// decodeTaskReport strictly decodes the one shared wire struct named by typ,
+// and hands back the progress sample when that is what arrived. Unknown
+// fields, trailing values, type mismatches and absent required fields all make
+// the reserved task body invalid rather than ordinary mail.
+func decodeTaskReport(typ, body string) (string, protocol.TaskProgressMsg, bool) {
 	validRef := func(ref *protocol.AgentRef) bool {
 		return ref == nil || ref.Name != "" && ref.AgentID != "" && ref.Scope != ""
 	}
 	switch typ {
+	case protocol.TaskProgress:
+		var msg protocol.TaskProgressMsg
+		// A sample carries counts and a tool NAME only; the store clamps both
+		// again before anything is stored or mailed.
+		if !decodeTaskJSON(body, &msg) || msg.Type != typ || !taskid.Valid(msg.TaskID) ||
+			msg.Turns < 0 || msg.ElapsedS < 0 {
+			return "", protocol.TaskProgressMsg{}, false
+		}
+		return msg.TaskID, msg, true
 	case protocol.TaskAccepted:
 		var msg protocol.TaskAcceptedMsg
 		if !decodeTaskJSON(body, &msg) || msg.Type != typ || !taskid.Valid(msg.TaskID) || !validRef(msg.Child) {
-			return "", false
+			return "", protocol.TaskProgressMsg{}, false
 		}
-		return msg.TaskID, true
+		return msg.TaskID, protocol.TaskProgressMsg{}, true
 	case protocol.TaskResult:
 		var msg protocol.TaskResultMsg
 		if !decodeTaskJSON(body, &msg) || msg.Type != typ || !taskid.Valid(msg.TaskID) ||
@@ -165,17 +225,17 @@ func decodeTaskReport(typ, body string) (string, bool) {
 			msg.Observations == nil || msg.Actions == nil || msg.Evidence == nil ||
 			(msg.Status == "succeeded" && msg.Error != "") ||
 			(msg.Status == "failed" && strings.TrimSpace(msg.Error) == "") {
-			return "", false
+			return "", protocol.TaskProgressMsg{}, false
 		}
-		return msg.TaskID, true
+		return msg.TaskID, protocol.TaskProgressMsg{}, true
 	case protocol.TaskFailed:
 		var msg protocol.TaskFailedMsg
 		if !decodeTaskJSON(body, &msg) || msg.Type != typ || !taskid.Valid(msg.TaskID) || strings.TrimSpace(msg.Error) == "" {
-			return "", false
+			return "", protocol.TaskProgressMsg{}, false
 		}
-		return msg.TaskID, true
+		return msg.TaskID, protocol.TaskProgressMsg{}, true
 	}
-	return "", false
+	return "", protocol.TaskProgressMsg{}, false
 }
 
 func decodeTaskJSON(body string, dst any) bool {

@@ -9,9 +9,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/Rooba/agent-coordinator/internal/daemon"
 	"github.com/Rooba/agent-coordinator/internal/protocol"
 	"github.com/Rooba/agent-coordinator/internal/socktest"
+	"github.com/Rooba/agent-coordinator/internal/store"
 )
 
 func TestNormalizePaths(t *testing.T) {
@@ -218,8 +221,8 @@ func TestSubagentStartRegistersChild(t *testing.T) {
 		r.SessionID != "3cdc4c5b-e78d-4fbb-9859-f18d8dc2b200" {
 		t.Fatalf("daemon saw %+v", r)
 	}
-	if out.Len() != 0 {
-		t.Fatalf("SubagentStart must emit nothing, got %s", out.String())
+	if !strings.Contains(out.String(), "additionalContext") || !strings.Contains(out.String(), "amber-fox/explore-1") {
+		t.Fatalf("SubagentStart must introduce the child, got %s", out.String())
 	}
 }
 
@@ -287,12 +290,14 @@ func TestEventNameVariantNormalization(t *testing.T) {
 			t.Fatalf("%s: stdout %s", name, out.String())
 		}
 	}
-	// pre_tool_use for an ordinary tool: allowed, no round trip, no output.
 	sock, got := fakeDaemon(t, protocol.Response{OK: true})
 	var out bytes.Buffer
 	Run(strings.NewReader(`{"sessionId":"s1","cwd":"/x","hookEventName":"pre_tool_use","toolName":"Bash","toolInput":{"command":"ls"}}`), &out, sock)
-	if len(*got) != 0 || out.Len() != 0 {
-		t.Fatalf("pre_tool_use for Bash must be a silent allow: got=%+v out=%s", got, out.String())
+	if out.Len() != 0 {
+		t.Fatalf("pre_tool_use for Bash must not deny: %s", out.String())
+	}
+	if len(*got) != 1 || (*got)[0].Op != protocol.OpEvent || (*got)[0].Tool != "Bash" || (*got)[0].Activity == "" || len((*got)[0].Writes) != 0 {
+		t.Fatalf("pre_tool_use for Bash must record a start: %+v", *got)
 	}
 }
 
@@ -324,14 +329,20 @@ func TestPreToolUseAllowsParentRead(t *testing.T) {
 	var out bytes.Buffer
 	Run(strings.NewReader(`{"session_id":"parent-sess","cwd":"/x","hook_event_name":"PreToolUse",`+
 		`"tool_name":"mcp__agent-coordinator__read_messages","tool_input":{}}`), &out, sock)
-	if len(*got) != 0 || out.Len() != 0 {
-		t.Fatalf("parent read must be a silent allow: got=%+v out=%s", got, out.String())
+	if out.Len() != 0 {
+		t.Fatalf("parent read must not deny: %s", out.String())
+	}
+	if len(*got) != 1 || (*got)[0].Op != protocol.OpEvent || (*got)[0].Tool != "mcp__agent-coordinator__read_messages" {
+		t.Fatalf("parent read must record a start: %+v", *got)
 	}
 }
 
 func TestPreToolUseAllowsSubagentReadWithFrom(t *testing.T) {
-	sock, got := fakeDaemonFunc(t, func(protocol.Request) protocol.Response {
-		return protocol.Response{OK: true, Name: "quick-wolf"} // the parent's name
+	sock, got := fakeDaemonFunc(t, func(r protocol.Request) protocol.Response {
+		if r.Op == protocol.OpWhoami {
+			return protocol.Response{OK: true, Name: "quick-wolf"}
+		}
+		return protocol.Response{OK: true}
 	})
 	var out bytes.Buffer
 	Run(strings.NewReader(`{"session_id":"parent-sess","cwd":"/x","hook_event_name":"PreToolUse",`+
@@ -340,8 +351,8 @@ func TestPreToolUseAllowsSubagentReadWithFrom(t *testing.T) {
 	if out.Len() != 0 {
 		t.Fatalf("read with own from must be a silent allow: %s", out.String())
 	}
-	if len(*got) != 1 || (*got)[0].Op != protocol.OpWhoami || (*got)[0].SessionID != "parent-sess" {
-		t.Fatalf("want a single parent-name lookup: %+v", *got)
+	if len(*got) != 2 || (*got)[0].Op != protocol.OpWhoami || (*got)[1].Op != protocol.OpEvent {
+		t.Fatalf("want parent-name lookup then start: %+v", *got)
 	}
 }
 
@@ -380,29 +391,34 @@ func TestPreToolUseAllowsVariantsWithFrom(t *testing.T) {
 			`"agent_id":"a828b0d3d8ca1b28e","agent_type":"Explore"}`,
 	}
 	for label, input := range variants {
-		sock, got := fakeDaemonFunc(t, func(protocol.Request) protocol.Response {
-			return protocol.Response{OK: true, Name: "quick-wolf"} // the parent's name
+		sock, got := fakeDaemonFunc(t, func(r protocol.Request) protocol.Response {
+			if r.Op == protocol.OpWhoami {
+				return protocol.Response{OK: true, Name: "quick-wolf"}
+			}
+			return protocol.Response{OK: true}
 		})
 		var out bytes.Buffer
 		Run(strings.NewReader(input), &out, sock)
 		if out.Len() != 0 {
 			t.Fatalf("%s: read with own from must be a silent allow: %s", label, out.String())
 		}
-		if len(*got) != 1 || (*got)[0].Op != protocol.OpWhoami {
-			t.Fatalf("%s: want only a parent-name lookup: %+v", label, *got)
+		if len(*got) != 2 || (*got)[0].Op != protocol.OpWhoami || (*got)[1].Op != protocol.OpEvent {
+			t.Fatalf("%s: want parent-name lookup then start: %+v", label, *got)
 		}
 	}
 }
 
-// use_tool calls for unrelated tools are never touched.
 func TestPreToolUseIgnoresUnrelatedUseTool(t *testing.T) {
 	sock, got := fakeDaemon(t, protocol.Response{OK: true})
 	var out bytes.Buffer
 	Run(strings.NewReader(`{"session_id":"parent-sess","cwd":"/x","hook_event_name":"PreToolUse",`+
 		`"tool_name":"use_tool","tool_input":{"name":"send_message","args":{}},`+
 		`"agent_id":"a828b0d3d8ca1b28e","agent_type":"Explore"}`), &out, sock)
-	if len(*got) != 0 || out.Len() != 0 {
-		t.Fatalf("unrelated use_tool must be a silent allow: got=%+v out=%s", got, out.String())
+	if out.Len() != 0 {
+		t.Fatalf("unrelated use_tool must not deny: %s", out.String())
+	}
+	if len(*got) != 1 || (*got)[0].Op != protocol.OpEvent || (*got)[0].Tool != "send_message" {
+		t.Fatalf("unrelated use_tool must record a start: %+v", *got)
 	}
 }
 
@@ -477,8 +493,11 @@ func TestPreToolUseAllowsParentWhoami(t *testing.T) {
 	var out bytes.Buffer
 	Run(strings.NewReader(`{"session_id":"parent-sess","cwd":"/x","hook_event_name":"PreToolUse",`+
 		`"tool_name":"mcp__agent-coordinator__whoami","tool_input":{}}`), &out, sock)
-	if len(*got) != 0 || out.Len() != 0 {
-		t.Fatalf("parent whoami must be a silent allow: got=%+v out=%s", *got, out.String())
+	if out.Len() != 0 {
+		t.Fatalf("parent whoami must not deny: %s", out.String())
+	}
+	if len(*got) != 1 || (*got)[0].Op != protocol.OpEvent || (*got)[0].Tool != "mcp__agent-coordinator__whoami" {
+		t.Fatalf("parent whoami must record a start: %+v", *got)
 	}
 }
 
@@ -541,5 +560,203 @@ func TestGarbageInputIsSilent(t *testing.T) {
 	Run(strings.NewReader("not json at all"), &out, sock)
 	if out.Len() != 0 {
 		t.Fatalf("garbage must be swallowed, got %s", out.String())
+	}
+}
+
+func TestCompactNotifiesPeersWithoutTaskClobber(t *testing.T) {
+	for _, event := range []string{"PreCompact", "PostCompact"} {
+		t.Run(event, func(t *testing.T) {
+			sock, got := fakeDaemon(t, protocol.Response{OK: true, Name: "solid-orca"})
+			var out bytes.Buffer
+			Run(strings.NewReader(`{"session_id":"s1","cwd":"/x","hook_event_name":"`+event+`"}`), &out, sock)
+			if out.Len() != 0 {
+				t.Fatalf("compact must not emit hook output, got %s", out.String())
+			}
+			if len(*got) != 2 {
+				t.Fatalf("want event+broadcast, got %+v", *got)
+			}
+			ev, bc := (*got)[0], (*got)[1]
+			if ev.Op != protocol.OpEvent || ev.Tool != event || ev.Activity == "" || ev.ReplaceTasks || len(ev.Files) != 0 || len(ev.Tasks) != 0 {
+				t.Fatalf("event = %+v", ev)
+			}
+			if bc.Op != protocol.OpBroadcast || !strings.Contains(bc.Body, "details may need restating") {
+				t.Fatalf("broadcast = %+v", bc)
+			}
+		})
+	}
+}
+
+func TestPermissionRequestAndInterruptRecordPresence(t *testing.T) {
+	sock, got := fakeDaemon(t, protocol.Response{OK: true})
+	var out bytes.Buffer
+	Run(strings.NewReader(`{"session_id":"s1","cwd":"/x","hook_event_name":"PermissionRequest","tool_name":"Bash"}`), &out, sock)
+	if out.Len() != 0 || len(*got) != 1 || (*got)[0].Op != protocol.OpEvent || (*got)[0].Tool != "PermissionRequest" || (*got)[0].ReplaceTasks {
+		t.Fatalf("PermissionRequest: out=%s req=%+v", out.String(), *got)
+	}
+	sock, got = fakeDaemon(t, protocol.Response{OK: true})
+	out.Reset()
+	Run(strings.NewReader(`{"session_id":"s1","cwd":"/x","hook_event_name":"Interrupt"}`), &out, sock)
+	if out.Len() != 0 || len(*got) != 1 || (*got)[0].Op != protocol.OpIdle || (*got)[0].Activity != "" {
+		t.Fatalf("Interrupt: out=%s req=%+v", out.String(), *got)
+	}
+}
+
+func startHookDaemon(t *testing.T) string {
+	t.Helper()
+	dir := socktest.Dir(t)
+	sock := filepath.Join(dir, "d.sock")
+	st, err := store.Open(filepath.Join(dir, "d.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	exited := make(chan struct{})
+	go func() { _ = daemon.Serve(l, st, time.Minute); close(exited) }()
+	t.Cleanup(func() { l.Close(); <-exited })
+	return sock
+}
+
+func daemonReq(t *testing.T, sock string, req protocol.Request) protocol.Response {
+	t.Helper()
+	conn, err := net.DialTimeout("unix", sock, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		t.Fatal(err)
+	}
+	line, err := bufio.NewReader(conn).ReadBytes('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp protocol.Response
+	if err := json.Unmarshal(line, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK {
+		t.Fatalf("daemon %s: %+v", req.Op, resp)
+	}
+	return resp
+}
+
+func TestCompactBroadcastReachesLivePeersOnly(t *testing.T) {
+	sock := startHookDaemon(t)
+	t.Setenv("AC_NO_SPAWN", "1")
+	scope, other := "/compact-peer", "/compact-other"
+	a := daemonReq(t, sock, protocol.Request{Op: protocol.OpRegister, Scope: scope, SessionID: "sess-a", Source: "hook"})
+	b := daemonReq(t, sock, protocol.Request{Op: protocol.OpRegister, Scope: scope, SessionID: "sess-b", Source: "hook"})
+	c := daemonReq(t, sock, protocol.Request{Op: protocol.OpRegister, Scope: other, SessionID: "sess-c", Source: "hook"})
+	t.Setenv("AC_SCOPE", scope)
+	var out bytes.Buffer
+	Run(strings.NewReader(`{"session_id":"sess-a","cwd":"/x","hook_event_name":"PreCompact"}`), &out, sock)
+	if out.Len() != 0 {
+		t.Fatalf("compact hook output %s", out.String())
+	}
+	board := daemonReq(t, sock, protocol.Request{Op: protocol.OpBoard, Scope: scope})
+	var activity string
+	for _, agent := range board.Agents {
+		if agent.Name == a.Name {
+			activity = agent.Activity
+		}
+	}
+	if activity != "Compacting session" {
+		t.Fatalf("compactor activity = %q agents=%+v", activity, board.Agents)
+	}
+	mailB := daemonReq(t, sock, protocol.Request{Op: protocol.OpRead, Scope: scope, SessionID: "sess-b", From: b.Name})
+	if len(mailB.Messages) != 1 || mailB.Messages[0].From != a.Name || !strings.Contains(mailB.Messages[0].Body, "details may need restating") || !mailB.Messages[0].Broadcast {
+		t.Fatalf("peer mail = %+v", mailB.Messages)
+	}
+	mailC := daemonReq(t, sock, protocol.Request{Op: protocol.OpRead, Scope: other, SessionID: "sess-c", From: c.Name})
+	if len(mailC.Messages) != 0 {
+		t.Fatalf("other scope got compact mail: %+v", mailC.Messages)
+	}
+}
+
+func TestPresenceHooksPreservePendingNotices(t *testing.T) {
+	sock := startHookDaemon(t)
+	t.Setenv("AC_NO_SPAWN", "1")
+	t.Setenv("AC_SCOPE", "/notice-keep")
+	scope := "/notice-keep"
+	a := daemonReq(t, sock, protocol.Request{Op: protocol.OpRegister, Scope: scope, SessionID: "sess-a", Source: "hook"})
+	b := daemonReq(t, sock, protocol.Request{Op: protocol.OpRegister, Scope: scope, SessionID: "sess-b", Source: "hook"})
+	daemonReq(t, sock, protocol.Request{Op: protocol.OpSend, Scope: scope, SessionID: "sess-b", From: b.Name, To: a.Name, Body: "ping"})
+	var out bytes.Buffer
+	Run(strings.NewReader(`{"session_id":"sess-a","cwd":"/x","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}`), &out, sock)
+	if out.Len() != 0 {
+		t.Fatalf("PreToolUse consumed the notice: %s", out.String())
+	}
+	out.Reset()
+	Run(strings.NewReader(`{"session_id":"sess-a","cwd":"/x","hook_event_name":"Stop"}`), &out, sock)
+	if !strings.Contains(out.String(), "1 new message") || !strings.Contains(out.String(), b.Name) {
+		t.Fatalf("Stop should still see the notice: %s", out.String())
+	}
+}
+
+func TestCompactChildDoesNotOverwriteParent(t *testing.T) {
+	sock := startHookDaemon(t)
+	t.Setenv("AC_NO_SPAWN", "1")
+	t.Setenv("AC_SCOPE", "/compact-child")
+	scope := "/compact-child"
+	a := daemonReq(t, sock, protocol.Request{Op: protocol.OpRegister, Scope: scope, SessionID: "sess-a", Source: "hook"})
+	b := daemonReq(t, sock, protocol.Request{Op: protocol.OpRegister, Scope: scope, SessionID: "sess-b", Source: "hook"})
+	daemonReq(t, sock, protocol.Request{Op: protocol.OpEvent, Scope: scope, SessionID: "sess-a", Tool: "Read", Activity: "Reading x"})
+	var out bytes.Buffer
+	Run(strings.NewReader(`{"session_id":"sess-a","cwd":"/x","hook_event_name":"PreCompact","agent_id":"child1","agent_type":"Explore"}`), &out, sock)
+	if out.Len() != 0 {
+		t.Fatalf("compact output %s", out.String())
+	}
+	board := daemonReq(t, sock, protocol.Request{Op: protocol.OpBoard, Scope: scope})
+	var parentAct, childAct, childName string
+	for _, agent := range board.Agents {
+		switch {
+		case agent.Name == a.Name:
+			parentAct = agent.Activity
+		case agent.Parent == a.Name:
+			childAct = agent.Activity
+			childName = agent.Name
+		}
+	}
+	if parentAct != "Reading x" {
+		t.Fatalf("parent activity overwritten: %q board=%+v", parentAct, board.Agents)
+	}
+	if childAct != "Compacting session" || childName == "" {
+		t.Fatalf("child compact missing: parent=%q child=%q/%q", parentAct, childName, childAct)
+	}
+	mailB := daemonReq(t, sock, protocol.Request{Op: protocol.OpRead, Scope: scope, SessionID: "sess-b", From: b.Name})
+	if len(mailB.Messages) != 1 || mailB.Messages[0].From != childName {
+		t.Fatalf("peer mail should be from child %s: %+v", childName, mailB.Messages)
+	}
+}
+
+func TestFirstChildPreToolUseIntroducesWithoutEatingMail(t *testing.T) {
+	sock := startHookDaemon(t)
+	t.Setenv("AC_NO_SPAWN", "1")
+	t.Setenv("AC_SCOPE", "/child-intro")
+	scope := "/child-intro"
+	a := daemonReq(t, sock, protocol.Request{Op: protocol.OpRegister, Scope: scope, SessionID: "sess-a", Source: "hook"})
+	b := daemonReq(t, sock, protocol.Request{Op: protocol.OpRegister, Scope: scope, SessionID: "sess-b", Source: "hook"})
+	daemonReq(t, sock, protocol.Request{Op: protocol.OpSend, Scope: scope, SessionID: "sess-b", From: b.Name, To: a.Name, Body: "ping"})
+	var out bytes.Buffer
+	Run(strings.NewReader(`{"session_id":"sess-a","cwd":"/x","hook_event_name":"PreToolUse","agent_id":"child1","agent_type":"Explore","tool_name":"Bash","tool_input":{"command":"ls"}}`), &out, sock)
+	if !strings.Contains(out.String(), "additionalContext") || !strings.Contains(out.String(), "you are") || !strings.Contains(out.String(), a.Name+"/") {
+		t.Fatalf("first child PreToolUse must introduce: %s", out.String())
+	}
+	if strings.Contains(out.String(), "1 new message") {
+		t.Fatalf("intro must not consume parent mail: %s", out.String())
+	}
+	out.Reset()
+	Run(strings.NewReader(`{"session_id":"sess-a","cwd":"/x","hook_event_name":"PostToolUse","agent_id":"child1","agent_type":"Explore","tool_name":"Bash","tool_input":{"command":"ls"}}`), &out, sock)
+	if strings.Contains(out.String(), "you are") {
+		t.Fatalf("later PostToolUse re-introduced the child: %s", out.String())
+	}
+	out.Reset()
+	Run(strings.NewReader(`{"session_id":"sess-a","cwd":"/x","hook_event_name":"Stop"}`), &out, sock)
+	if !strings.Contains(out.String(), "1 new message") || !strings.Contains(out.String(), b.Name) {
+		t.Fatalf("parent Stop should still see the notice: %s", out.String())
 	}
 }

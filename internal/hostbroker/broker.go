@@ -24,10 +24,15 @@ const (
 	minBackoff     = 250 * time.Millisecond
 	maxBackoff     = 5 * time.Second
 	maxMessageBody = 128 << 10
+	// progressInterval is how often a running task reports in, whether or not
+	// its event stream said anything. The frame is tiny and the daemon
+	// throttles the requester's mail separately, so this only has to be fast
+	// enough that the task row never looks frozen.
+	progressInterval = 5 * time.Second
 )
 
 type Runner interface {
-	Run(context.Context, hostrunner.Task) (hostrunner.Result, error)
+	Run(context.Context, hostrunner.Task, hostrunner.ProgressFunc) (hostrunner.Result, error)
 	Cancel(string) error
 }
 
@@ -37,14 +42,15 @@ type Unlock func() error
 var ErrBrokerAlreadyRunning = errors.New("another host broker is already running for this user")
 
 type Options struct {
-	ComputerName    string
-	DefaultProvider string
-	PollInterval    time.Duration
-	BackoffMin      time.Duration
-	BackoffMax      time.Duration
-	Sleep           func(context.Context, time.Duration) error
-	Jitter          func(time.Duration) time.Duration
-	AcquireLock     func() (Unlock, error)
+	ComputerName     string
+	DefaultProvider  string
+	PollInterval     time.Duration
+	BackoffMin       time.Duration
+	BackoffMax       time.Duration
+	Sleep            func(context.Context, time.Duration) error
+	Jitter           func(time.Duration) time.Duration
+	AcquireLock      func() (Unlock, error)
+	ProgressInterval time.Duration // how often a running task reports liveness; defaults to progressInterval
 }
 
 type Broker struct {
@@ -86,6 +92,12 @@ func New(relay Relay, store CredentialStore, journal Journal, runner Runner, pro
 	}
 	if opts.BackoffMin <= 0 || opts.BackoffMin > opts.BackoffMax || opts.BackoffMax > time.Minute {
 		return nil, errors.New("invalid reconnect backoff")
+	}
+	if opts.ProgressInterval == 0 {
+		opts.ProgressInterval = progressInterval
+	}
+	if opts.ProgressInterval < 0 || opts.ProgressInterval > time.Minute {
+		return nil, errors.New("invalid task progress interval")
 	}
 	if opts.Sleep == nil {
 		opts.Sleep = sleepContext
@@ -313,7 +325,9 @@ func (b *Broker) execute(lifecycle, taskCtx context.Context, record TaskRecord, 
 	}); err != nil {
 		record.State, record.Terminal = recordTerminal, failedBody(launch.TaskID, err)
 	} else {
-		result, runErr := b.runner.Run(taskCtx, task)
+		report, stopProgress := b.progressReporter(taskCtx, record, child)
+		result, runErr := b.runner.Run(taskCtx, task, report)
+		stopProgress()
 		if runErr != nil {
 			record.State, record.Terminal = recordTerminal, failedBody(launch.TaskID, runErr)
 		} else {
@@ -321,6 +335,62 @@ func (b *Broker) execute(lifecycle, taskCtx context.Context, record TaskRecord, 
 		}
 	}
 	_ = b.superviseTerminal(lifecycle, record)
+}
+
+// progressReporter is how a running task stays visible: one frame per interval,
+// sent by the task's own child to the requester's workspace, where the daemon
+// stamps it onto the task row. The frame goes out on the clock rather than on
+// the event stream, so a task that is merely slow still proves it is alive
+// while its turn count truthfully stands still; a quiet task therefore stays
+// quiet in the requester's inbox, which mails only on a turn advance. Frames
+// carry a turn count and a tool NAME only, never anything read from the page.
+// Reporting is best-effort and never gates the outcome: the returned stop
+// cancels a frame still in flight instead of waiting for it, so the terminal
+// result goes out the moment the run ends.
+func (b *Broker) progressReporter(ctx context.Context, record TaskRecord, child childIdentity) (hostrunner.ProgressFunc, func()) {
+	launch, started := record.Launch, time.Now()
+	sendCtx, stop := context.WithCancel(ctx)
+	done := make(chan struct{})
+	var mu sync.Mutex
+	var latest hostrunner.Progress
+	publish := func() {
+		mu.Lock()
+		sample := latest
+		mu.Unlock()
+		body, err := json.Marshal(protocol.TaskProgressMsg{Type: protocol.TaskProgress, TaskID: launch.TaskID,
+			Turns: sample.Turns, Tool: sample.Tool, ElapsedS: int(time.Since(started) / time.Second)})
+		if err != nil {
+			return
+		}
+		callCtx, cancel := context.WithTimeout(sendCtx, callTimeout)
+		defer cancel()
+		_ = b.withFreshToken(callCtx, func(launcher Session) error {
+			session := Session{Token: launcher.Token, ID: child.session.ID, Secret: child.session.Secret}
+			return b.send(callCtx, session, launch.ReplyTo, launch.TaskID, body)
+		})
+	}
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(b.opts.ProgressInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				publish()
+			case <-sendCtx.Done():
+				return // stopped, cancelled or timed out: the terminal frame says the rest
+			}
+		}
+	}()
+	report := func(sample hostrunner.Progress) {
+		mu.Lock()
+		latest = sample
+		mu.Unlock()
+	}
+	return report, func() {
+		stop()
+		<-done
+	}
 }
 
 func (b *Broker) prepareTerminal(ctx context.Context, record TaskRecord) error {

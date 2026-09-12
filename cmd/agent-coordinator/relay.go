@@ -119,12 +119,18 @@ func runEyes(args []string) {
 	fs := flag.NewFlagSet("eyes", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	asJSON := fs.Bool("json", false, "machine-readable JSON output")
+	tasks := fs.Bool("tasks", false, "list the eyes task ledger instead of the eyes agents")
+	mine := fs.Bool("mine", false, "with --tasks, list only the tasks this workspace session requested")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(os.Stderr, "usage: agent-coordinator eyes [--json]")
+		fmt.Fprintln(os.Stderr, "usage: agent-coordinator eyes [--tasks] [--mine] [--json]")
 		os.Exit(2)
+	}
+	if *tasks {
+		runEyesTasks(*asJSON, *mine)
+		return
 	}
 	resp := mustOnce("eyes", protocol.Request{Op: protocol.OpListEyes, Scope: cwdScope()})
 	if *asJSON {
@@ -142,6 +148,93 @@ func runEyes(args []string) {
 	for _, a := range resp.Agents {
 		fmt.Printf("%-16s %-8s id=%s kind=%s scope=%s\n", a.Name, a.Status, a.AgentID, a.Kind, a.Scope)
 	}
+}
+
+// runEyesTasks lists the eyes task ledger for this workspace, still-running
+// tasks first, so somebody watching a brief that has gone quiet can see
+// whether it is alive and how long it has left. --mine narrows it to the
+// tasks this session asked for.
+func runEyesTasks(asJSON, mine bool) {
+	resp := mustOnce("eyes", protocol.Request{Op: protocol.OpListEyesTasks, Scope: cwdScope(), Mine: mine})
+	if asJSON {
+		tasks := resp.EyesTasks
+		if tasks == nil {
+			tasks = []protocol.EyesTaskInfo{}
+		}
+		emitJSON(tasks)
+		return
+	}
+	if len(resp.EyesTasks) == 0 {
+		fmt.Println("no eyes tasks")
+		return
+	}
+	for _, t := range resp.EyesTasks {
+		fmt.Println(eyesTaskLine(t))
+	}
+}
+
+// eyesTaskLine is one ledger row as a human reads it: what it is, how long it
+// has been going, how long it has left, and whether it is still moving.
+func eyesTaskLine(t protocol.EyesTaskInfo) string {
+	return fmt.Sprintf("%-20s %-7s %-9s elapsed=%-8s %-20s %-28s %s@%s",
+		t.TaskID, t.Runtime, t.State, humanDur(t.ElapsedS), eyesRemaining(t), eyesProgress(t),
+		t.RequesterAgentID, t.RequesterScope)
+}
+
+// eyesLiveStates are the states a task is still supposed to be running in, so
+// a deadline still means something to it.
+var eyesLiveStates = map[string]bool{"queued": true, "accepted": true}
+
+// eyesRemaining is the deadline cell. An overdue task says so in words rather
+// than as a negative number: its deadline passed with no completion or
+// cancellation confirmed, so nobody can say whether it is still running.
+func eyesRemaining(t protocol.EyesTaskInfo) string {
+	switch {
+	case t.Overdue:
+		return "OVERDUE by " + humanDur(t.RemainingS)
+	case !eyesLiveStates[t.State]:
+		return "remaining=-"
+	}
+	return "remaining=" + humanDur(t.RemainingS)
+}
+
+// eyesProgress is the liveness cell: turns taken, the NAME of the tool last
+// used, and how long ago the task last showed a sign of life. A task that has
+// gone quiet says STALE, because a stalled task sends no mail and this is the
+// only warning a reader gets.
+func eyesProgress(t protocol.EyesTaskInfo) string {
+	var cells []string
+	if t.Turns > 0 {
+		cells = append(cells, fmt.Sprintf("turns=%d", t.Turns))
+	}
+	if t.Tool != "" {
+		cells = append(cells, "tool="+t.Tool)
+	}
+	switch {
+	case t.HeartbeatAt == 0 && t.HeartbeatStale:
+		cells = append(cells, "hb=STALE:never")
+	case t.HeartbeatAt == 0:
+		cells = append(cells, "hb=-")
+	case t.HeartbeatStale:
+		cells = append(cells, "hb=STALE:"+humanDur(t.HeartbeatAgeS))
+	default:
+		cells = append(cells, "hb="+humanDur(t.HeartbeatAgeS))
+	}
+	return strings.Join(cells, " ")
+}
+
+// humanDur renders a second count the way a waiting reader scans it.
+func humanDur(s int) string {
+	if s < 0 {
+		s = -s
+	}
+	switch {
+	case s < 60:
+		return fmt.Sprintf("%ds", s)
+	case s < 3600:
+		return fmt.Sprintf("%dm%02ds", s/60, s%60)
+	}
+	return fmt.Sprintf("%dh%02dm", s/3600, (s%3600)/60)
 }
 
 func runRelay(args []string) {

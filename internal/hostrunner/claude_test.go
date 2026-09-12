@@ -6,11 +6,21 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 )
+
+// Credential files must stay owner-only; Windows just cannot report that.
+func restrictedFileMode(mode os.FileMode) bool {
+	perm := mode.Perm()
+	if perm == 0o600 {
+		return true
+	}
+	return runtime.GOOS == "windows" && perm == 0o666
+}
 
 func TestClaudeProviderBuildsChromeOnlyStdinInvocation(t *testing.T) {
 	executable, err := os.Executable()
@@ -41,7 +51,7 @@ func TestClaudeProviderBuildsChromeOnlyStdinInvocation(t *testing.T) {
 		"--permission-mode", "dontAsk",
 		"--model", claudeDefaultModel,
 		"--allowedTools", claudeChromeTools,
-		"--output-format", "json",
+		"--output-format", "stream-json", "--verbose",
 		"--json-schema", reportSchema,
 		"--settings", filepath.Join(scratch, "claude-settings.json"),
 		"--setting-sources", "",
@@ -57,7 +67,8 @@ func TestClaudeProviderBuildsChromeOnlyStdinInvocation(t *testing.T) {
 	if !strings.Contains(string(invocation.Prompt), task.Brief) {
 		t.Fatal("task brief was not delivered through stdin")
 	}
-	if !reflect.DeepEqual(invocation.Env, []string{"PATH=/safe"}) || !invocation.ReportFromStdout || invocation.ConfigKey != "CLAUDE_CONFIG_DIR" || invocation.ConfigDir != configDir || invocation.Warning != "" {
+	if !reflect.DeepEqual(invocation.Env, []string{"PATH=/safe"}) || invocation.ReportFromStdout || invocation.Stream == nil ||
+		invocation.ConfigKey != "CLAUDE_CONFIG_DIR" || invocation.ConfigDir != configDir || invocation.Warning != "" {
 		t.Fatalf("unexpected invocation result path/environment: %+v", invocation)
 	}
 
@@ -81,7 +92,7 @@ func TestClaudeProviderBuildsChromeOnlyStdinInvocation(t *testing.T) {
 	}
 	for _, name := range []string{"claude-settings.json", "claude-mcp.json"} {
 		info, err := os.Stat(filepath.Join(scratch, name))
-		if err != nil || info.Mode().Perm() != 0o600 {
+		if err != nil || !restrictedFileMode(info.Mode()) {
 			t.Fatalf("isolated %s mode/error = %v/%v", name, info, err)
 		}
 	}
@@ -210,7 +221,7 @@ func TestClaudeProviderRefreshesIsolatedCredentials(t *testing.T) {
 			if err != nil || string(data) != testCase.want {
 				t.Fatalf("isolated credentials = (%q, %v), want %q", data, err, testCase.want)
 			}
-			if info, err := os.Stat(destination); err != nil || info.Mode().Perm() != 0o600 {
+			if info, err := os.Stat(destination); err != nil || !restrictedFileMode(info.Mode()) {
 				t.Fatalf("isolated credentials mode/error = %v/%v", info, err)
 			}
 		})

@@ -20,6 +20,7 @@ const (
 	// the daemon's TCP path allowlists them and binds identity itself.
 	OpListWorkspaces = "list_workspaces"
 	OpListEyes       = "list_eyes"
+	OpListEyesTasks  = "list_eyes_tasks"
 	OpSendWorkspace  = "send_workspace"
 	OpRequestEyes    = "request_eyes"
 	OpCancelEyes     = "cancel_eyes"
@@ -89,6 +90,9 @@ type Request struct {
 	Target *AgentRef `json:"target,omitempty"`
 	// TaskID identifies an eyes job (OpCancelEyes, and responses to OpRequestEyes).
 	TaskID string `json:"task_id,omitempty"`
+	// Mine narrows OpListEyesTasks to the caller's own tasks. The default
+	// lists the workspace's; cancellation is unaffected either way.
+	Mine bool `json:"mine,omitempty"`
 	// Platform / Capabilities are advertised at register by a host broker.
 	Platform     string   `json:"platform,omitempty"`
 	Capabilities []string `json:"capabilities,omitempty"`
@@ -114,6 +118,7 @@ const (
 	TaskLaunch   = "task.launch"
 	TaskCancel   = "task.cancel"
 	TaskAccepted = "task.accepted"
+	TaskProgress = "task.progress"
 	TaskResult   = "task.result"
 	TaskFailed   = "task.failed"
 )
@@ -140,6 +145,18 @@ type TaskAcceptedMsg struct {
 	Type   string    `json:"type"`
 	TaskID string    `json:"task_id"`
 	Child  *AgentRef `json:"child,omitempty"`
+}
+
+// TaskProgressMsg is one liveness sample from a running task. It is
+// deliberately content-free: a turn count, the NAME of the tool last used and
+// the elapsed time are all a watcher needs to see motion, and page text, tool
+// arguments and tool results must never travel in it.
+type TaskProgressMsg struct {
+	Type     string `json:"type"`
+	TaskID   string `json:"task_id"`
+	Turns    int    `json:"turns"`
+	Tool     string `json:"tool,omitempty"`
+	ElapsedS int    `json:"elapsed_s"`
 }
 
 // TaskResultMsg is the eyes report DMed to reply_to.
@@ -187,6 +204,40 @@ type AgentInfo struct {
 	Origin       string   `json:"origin,omitempty"`
 	Platform     string   `json:"platform,omitempty"`
 	Capabilities []string `json:"capabilities,omitempty"`
+}
+
+// EyesTaskInfo is one eyes task rendered for a reader. Elapsed and Remaining
+// are measured by the daemon, on the same clock the deadline sweep judges by,
+// so a caller answers "is it alive and how long has it got?" without
+// reconciling its own clock. A settled task is measured to when it settled.
+type EyesTaskInfo struct {
+	TaskID           string `json:"task_id"`
+	Runtime          string `json:"runtime,omitempty"`
+	State            string `json:"state"` // queued|accepted|done|failed|cancelled
+	RequesterScope   string `json:"requester_scope"`
+	RequesterAgentID string `json:"requester_agent_id"`
+	LauncherScope    string `json:"launcher_scope,omitempty"`
+	CreatedAt        int64  `json:"created_at"`
+	UpdatedAt        int64  `json:"updated_at"`
+	DeadlineS        int    `json:"deadline_s"`
+	ElapsedS         int    `json:"elapsed_s"`
+	// RemainingS goes negative once the deadline has passed.
+	RemainingS int `json:"remaining_s"`
+	// Overdue is a live task whose deadline passed with no completion or
+	// cancellation confirmed - whether it still runs is unknown.
+	Overdue     bool `json:"overdue,omitempty"`
+	CancelAcked bool `json:"cancel_acked,omitempty"`
+	// Turns and Tool are the last progress sample the task reported: how many
+	// model turns it has taken and the name of the tool it last used.
+	Turns int    `json:"turns,omitempty"`
+	Tool  string `json:"tool,omitempty"`
+	// HeartbeatAt is when the broker last reported the run alive, 0 if never,
+	// and HeartbeatAgeS is how long ago that was on the daemon's clock.
+	HeartbeatAt   int64 `json:"heartbeat_at,omitempty"`
+	HeartbeatAgeS int   `json:"heartbeat_age_s,omitempty"`
+	// HeartbeatStale means no recent report arrived - the run may be fine and
+	// the path to it quiet. It is a reason to look, not proof anything failed.
+	HeartbeatStale bool `json:"heartbeat_stale,omitempty"`
 }
 
 // ClaimInfo is one row of the claims ledger, holder resolved live.
@@ -245,8 +296,10 @@ type Response struct {
 	Claims  []ClaimInfo   `json:"claims,omitempty"`
 	History []HistoryInfo `json:"history,omitempty"`
 	// Workspaces is the occupancy directory from OpListWorkspaces.
-	Workspaces    []WorkspaceInfo `json:"workspaces,omitempty"`
-	TaskID        string          `json:"task_id,omitempty"`
-	Launcher      *AgentRef       `json:"launcher,omitempty"`
-	SessionSecret string          `json:"session_secret,omitempty"`
+	Workspaces []WorkspaceInfo `json:"workspaces,omitempty"`
+	// EyesTasks is the task ledger from OpListEyesTasks.
+	EyesTasks     []EyesTaskInfo `json:"eyes_tasks,omitempty"`
+	TaskID        string         `json:"task_id,omitempty"`
+	Launcher      *AgentRef      `json:"launcher,omitempty"`
+	SessionSecret string         `json:"session_secret,omitempty"`
 }

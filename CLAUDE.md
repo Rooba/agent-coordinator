@@ -6,6 +6,14 @@ one agent or session may share a workspace, USING IT IS NOT OPTIONAL - it marked
 prevents duplicated or conflicting work. The tools below are exposed via the `agent-coordinator`
 MCP server; the `agent-coordinator` CLI provides the `wait` wake-lever.
 
+## Commit checkpoints
+
+Commit coherent, validated work at sensible milestones without waiting for another request.
+Keep commits scoped to the task, preserve unrelated edits, and prefer new checkpoints over
+rewriting existing commits. Push to remotes or open PRs only when the user has authorized it.
+Keep tracked files and commit messages specific to this repository; use neutral example
+names when testing URL construction.
+
 ## Your identity
 
 At SessionStart the coordinator hook injects your name:
@@ -29,7 +37,8 @@ it. Do not grep the filesystem for it.
 ## Cross-workspace relay and Windows eyes (For WSL)
 
 - `list_workspaces` - discover scopes with live agents before addressing another workspace.
-- `list_eyes` - list connected host launchers and active eyes tasks across workspaces.
+- `list_eyes` - list connected host launchers and eyes agents across workspaces.
+- `list_eyes_tasks` - inspect task state, elapsed time, and observed progress in this workspace.
 - `relay(body, target, from?)` - send across scopes. Prefer the structured
   `target={scope, agent_id, name}` returned in `reply_to`; `agent_id` wins over `name`.
 - `request_eyes(brief, runtime="claude", timeout=300, from?)` - ask the optional Windows host
@@ -40,7 +49,7 @@ it. Do not grep the filesystem for it.
 The Windows bridge is optional and must already be paired and running; an empty `list_eyes` means no
 host broker is available. Eyes tasks are one-shot reports, not interactive browser sessions. The v1
 host broker advertises Claude only, so request `runtime="claude"` (or omit it). Setup and security
-details are in the agent-coordinator README under "Optional Windows host Chrome eyes bridge."
+details are in the coordinator's [eyes guide](https://github.com/Rooba/agent-coordinator/blob/main/docs/eyes.md).
 
 ## Wake pattern (be woken, do not busy-poll)
 
@@ -69,6 +78,8 @@ about) block on the wait in the FOREGROUND as the last action of the turn.
   coordinated, they are normal-impact.
 - Retry with backoff on a transient `daemon unreachable` / socket i/o timeout (seen under ~30-agent load).
 - Key durable work artifacts by your stable `agent_id`, not by display name (names can collide).
+- Compaction notices mean a peer may need key constraints or decisions restated. Use
+  `message_history` and written handoffs to recover context; avoid repeating entire transcripts.
 
 ## DON'T
 

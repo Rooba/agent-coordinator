@@ -107,9 +107,15 @@ func validateScheduleExecutable(action ScheduleAction, executable string) error 
 	return nil
 }
 
-func scheduleName(sid string) string {
+// ScheduleTaskName is the Task Scheduler entry for one Windows user's broker,
+// so anything that needs to find that task derives the name the same way.
+func ScheduleTaskName(sid string) string {
 	hash := sha256.Sum256([]byte(sid))
-	return `\Agent Coordinator Host Broker-` + hex.EncodeToString(hash[:6])
+	return "Agent Coordinator Host Broker-" + hex.EncodeToString(hash[:6])
+}
+
+func scheduleName(sid string) string {
+	return `\` + ScheduleTaskName(sid)
 }
 
 func scheduleXML(executable, sid string) (string, error) {

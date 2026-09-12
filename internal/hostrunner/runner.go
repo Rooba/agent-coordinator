@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -97,7 +98,10 @@ func (r *Runner) Cancel(taskID string) error {
 	return nil
 }
 
-func (r *Runner) Run(ctx context.Context, task Task) (Result, error) {
+// Run executes one task. Samples reach progress while the provider is still
+// running, so a long task is observable instead of silent until it exits; a
+// nil progress func simply drops them.
+func (r *Runner) Run(ctx context.Context, task Task, progress ProgressFunc) (Result, error) {
 	if err := task.Validate(); err != nil {
 		return Result{}, err
 	}
@@ -138,7 +142,17 @@ func (r *Runner) Run(ctx context.Context, task Task) (Result, error) {
 	if invocation.ConfigKey != "" {
 		cmd.Env = append(cmd.Env, invocation.ConfigKey+"="+invocation.ConfigDir)
 	}
+	// The stream reader sees every byte even after the diagnostic buffer caps
+	// out, so a long event stream never costs the report it ends with.
+	var stream *streamReader
 	cmd.Stdout, cmd.Stderr = stdout, stderr
+	if invocation.Stream != nil {
+		stream = newStreamReader(invocation.Stream, progress)
+		// Close is idempotent, so the publisher is shut down even when the
+		// process never starts - the ordered close below still runs first.
+		defer stream.Close()
+		cmd.Stdout = io.MultiWriter(stdout, stream)
+	}
 	cmd.WaitDelay = r.opts.waitDelay
 	guard, err := newProcessGuard()
 	if err != nil {
@@ -163,7 +177,15 @@ func (r *Runner) Run(ctx context.Context, task Task) (Result, error) {
 		_ = cmd.Process.Kill()
 	})
 	guard.Close() // also retires descendants after a clean root exit
+	payload := []byte(nil)
+	if stream != nil {
+		stream.Close() // the process is reaped, so no sample outlives it
+		payload = stream.Final()
+	}
 	result := capture(stdout, stderr)
+	if stream == nil {
+		payload = result.Stdout
+	}
 	result.Warning = invocation.Warning
 	if interrupted && waitErr != nil {
 		return result, runCtx.Err()
@@ -174,7 +196,7 @@ func (r *Runner) Run(ctx context.Context, task Task) (Result, error) {
 	if invocation.ReportFromStdout && result.StdoutTruncated {
 		return result, ErrOutputLimit
 	}
-	report, err := invocation.Decode(result.Stdout)
+	report, err := invocation.Decode(payload)
 	if err != nil {
 		return result, err
 	}

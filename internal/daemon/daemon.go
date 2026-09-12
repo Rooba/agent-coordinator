@@ -164,7 +164,8 @@ func Serve(l net.Listener, st *store.Store, idleTimeout time.Duration) error {
 
 	go func() {
 		defer close(watchdogDone)
-		tick := time.NewTicker(idleTimeout / 4)
+		// Deadlines must settle promptly even when the broker stops responding.
+		tick := time.NewTicker(min(idleTimeout/4, 5*time.Second))
 		house := time.NewTicker(time.Hour)
 		defer tick.Stop()
 		defer house.Stop()
@@ -174,6 +175,9 @@ func Serve(l net.Listener, st *store.Store, idleTimeout time.Duration) error {
 				if time.Since(time.Unix(0, lastActivity.Load())) > idleTimeout {
 					closeListeners()
 					return
+				}
+				if _, err := st.ExpireEyesTasks(st.Now()); err != nil {
+					relayLog("expire eyes tasks: %v", err)
 				}
 			case <-house.C:
 				st.Housekeep()
@@ -274,7 +278,7 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 	childSession, childName := "", ""
 	if req.AgentID != "" {
 		switch req.Op {
-		case protocol.OpRegister, protocol.OpEvent, protocol.OpDeregister:
+		case protocol.OpRegister, protocol.OpEvent, protocol.OpDeregister, protocol.OpIdle, protocol.OpBroadcast:
 			childSession = store.ChildSessionID(req.SessionID, req.AgentID)
 			if req.Op != protocol.OpDeregister {
 				name, created, err := st.RegisterChild(req.Scope, req.SessionID, req.AgentID, req.AgentType)
@@ -283,6 +287,9 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 				}
 				if req.Op == protocol.OpRegister {
 					return protocol.Response{OK: true, Name: name}
+				}
+				if req.Op == protocol.OpBroadcast {
+					req.From = name
 				}
 				if created {
 					childName = name // introduce a newly discovered child exactly once
@@ -358,13 +365,20 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 			return fail(err)
 		}
 	case protocol.OpIdle:
-		if err := st.SetStatus(req.Scope, req.SessionID, "idle"); err != nil {
+		sess := req.SessionID
+		if childSession != "" {
+			sess = childSession
+		}
+		if err := st.SetStatus(req.Scope, sess, "idle"); err != nil {
 			return fail(err)
+		}
+		if req.Source == "presence" {
+			return protocol.Response{OK: true}
 		}
 		// Drain pending notices at turn end so the Stop hook can nudge the
 		// model. notice_sent_at makes this once-only: a repeat idle with
 		// unread-but-noticed mail returns nothing (no Stop loop).
-		notices, err := st.PendingNotices(req.Scope, req.SessionID)
+		notices, err := st.PendingNotices(req.Scope, sess)
 		if err != nil {
 			return fail(err)
 		}
@@ -460,6 +474,8 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 			return fail(err)
 		}
 		return protocol.Response{OK: true, Agents: eyes}
+	case protocol.OpListEyesTasks:
+		return listEyesTasks(st, req, actor)
 	case protocol.OpSendWorkspace:
 		// The sender and the return address are the actor resolved above, so a
 		// reply can never be redirected by whatever the caller put in reply_to.

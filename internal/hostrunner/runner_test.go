@@ -76,7 +76,7 @@ func helperTask(id uint64) Task {
 func TestRunnerExecutesAndParsesReport(t *testing.T) {
 	promptPath := filepath.Join(t.TempDir(), "prompt.txt")
 	runner := newHelperRunner(t, &helperProvider{mode: "success", promptPath: promptPath}, 1024)
-	result, err := runner.Run(context.Background(), helperTask(1))
+	result, err := runner.Run(context.Background(), helperTask(1), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func TestRunnerExecutesAndParsesReport(t *testing.T) {
 
 func TestRunnerBoundsStdoutAndStderr(t *testing.T) {
 	runner := newHelperRunner(t, &helperProvider{mode: "large"}, 17)
-	result, err := runner.Run(context.Background(), helperTask(2))
+	result, err := runner.Run(context.Background(), helperTask(2), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func TestRunnerBoundsStdoutAndStderr(t *testing.T) {
 
 func TestRunnerRejectsTruncatedStdoutReport(t *testing.T) {
 	runner := newHelperRunner(t, &helperProvider{mode: "large", stdoutReport: true}, 17)
-	result, err := runner.Run(context.Background(), helperTask(10))
+	result, err := runner.Run(context.Background(), helperTask(10), nil)
 	if !errors.Is(err, ErrOutputLimit) || !result.StdoutTruncated || result.Report.Status != "" {
 		t.Fatalf("overflow result = (%+v, %v)", result, err)
 	}
@@ -119,7 +119,7 @@ func TestRunnerTimeoutTerminatesProcess(t *testing.T) {
 	started := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	result, err := runner.Run(ctx, helperTask(3))
+	result, err := runner.Run(ctx, helperTask(3), nil)
 	if !errors.Is(err, context.DeadlineExceeded) || result.Report.Status != "" {
 		t.Fatalf("timeout result = (%+v, %v)", result, err)
 	}
@@ -138,14 +138,14 @@ func TestRunnerBusyAndExplicitCancel(t *testing.T) {
 	done := make(chan outcome, 1)
 	first := helperTask(4)
 	go func() {
-		result, err := runner.Run(context.Background(), first)
+		result, err := runner.Run(context.Background(), first, nil)
 		done <- outcome{result, err}
 	}()
 	waitForFile(t, readyPath)
 	if id, busy := runner.Busy(); !busy || id != first.ID {
 		t.Fatalf("busy = (%q, %v)", id, busy)
 	}
-	if _, err := runner.Run(context.Background(), helperTask(5)); !errors.Is(err, ErrBusy) {
+	if _, err := runner.Run(context.Background(), helperTask(5), nil); !errors.Is(err, ErrBusy) {
 		t.Fatalf("second task error = %v", err)
 	}
 	if err := runner.Cancel("other"); !errors.Is(err, ErrTaskNotActive) {
@@ -164,7 +164,7 @@ func TestRunnerKeepsCompletedResultWhenContextIsCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	provider := &helperProvider{mode: "success", decode: cancel}
 	runner := newHelperRunner(t, provider, 1024)
-	result, err := runner.Run(ctx, helperTask(11))
+	result, err := runner.Run(ctx, helperTask(11), nil)
 	if err != nil || result.Report.Status != ReportSucceeded || !errors.Is(ctx.Err(), context.Canceled) {
 		t.Fatalf("completed cancellation result = (%+v, %v), context=%v", result, err, ctx.Err())
 	}
@@ -183,7 +183,7 @@ func TestAwaitProcessKeepsNilExitWhenCancellationWins(t *testing.T) {
 func TestRunnerWaitDelayBoundsInheritedPipes(t *testing.T) {
 	runner := newHelperRunner(t, &helperProvider{mode: "orphan-pipes"}, 1024)
 	started := time.Now()
-	result, err := runner.Run(context.Background(), helperTask(12))
+	result, err := runner.Run(context.Background(), helperTask(12), nil)
 	if !errors.Is(err, exec.ErrWaitDelay) || result.Report.Status != "" {
 		t.Fatalf("inherited pipe result = (%+v, %v)", result, err)
 	}
@@ -194,13 +194,13 @@ func TestRunnerWaitDelayBoundsInheritedPipes(t *testing.T) {
 
 func TestRunnerPreservesStructuredFailureAndRejectsBadReport(t *testing.T) {
 	runner := newHelperRunner(t, &helperProvider{mode: "exit"}, 1024)
-	result, err := runner.Run(context.Background(), helperTask(6))
+	result, err := runner.Run(context.Background(), helperTask(6), nil)
 	if err == nil || result.Report.Status != "" {
 		t.Fatalf("exit result = (%+v, %v)", result, err)
 	}
 
 	runner = newHelperRunner(t, &helperProvider{mode: "bad-report"}, 1024)
-	result, err = runner.Run(context.Background(), helperTask(7))
+	result, err = runner.Run(context.Background(), helperTask(7), nil)
 	if !errors.Is(err, ErrInvalidReport) || result.Report.Status != "" {
 		t.Fatalf("bad report result = (%+v, %v)", result, err)
 	}
@@ -212,7 +212,7 @@ func TestRunnerRejectsUnknownProviderAndBadOptions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runner.Run(context.Background(), Task{ID: "task-000000000008", Provider: "unknown", Brief: "brief"}); !errors.Is(err, ErrUnknownProvider) {
+	if _, err := runner.Run(context.Background(), Task{ID: "task-000000000008", Provider: "unknown", Brief: "brief"}, nil); !errors.Is(err, ErrUnknownProvider) {
 		t.Fatalf("unknown provider error = %v", err)
 	}
 	if _, err := NewRunner(registry, Options{DefaultTimeout: -time.Second}); err == nil {
@@ -238,7 +238,7 @@ func TestRunnerDoesNotExposeRelayEnvironment(t *testing.T) {
 		"HOME=/home", "USERPROFILE=/user", "APPDATA=/app", "LOCALAPPDATA=/local", "CODEX_HOME=/codex", "CLAUDE_CONFIG_DIR=/claude",
 	}}
 	runner := newHelperRunner(t, provider, 1024)
-	result, err := runner.Run(context.Background(), helperTask(9))
+	result, err := runner.Run(context.Background(), helperTask(9), nil)
 	if err != nil || result.Report.Status != ReportSucceeded {
 		t.Fatalf("environment result = (%+v, %v)", result, err)
 	}
@@ -289,6 +289,40 @@ func runHostrunnerHelper() int {
 		fmt.Fprint(os.Stdout, strings.Repeat("o", 4096))
 		fmt.Fprint(os.Stderr, strings.Repeat("e", 4096))
 		return writeHelperReport(resultPath, successReport(), 0)
+	case "stream":
+		// A Claude-shaped stream-json turn sequence: tool arguments and tool
+		// results carry a marker the progress path must never surface.
+		fmt.Fprintln(os.Stdout, `{"type":"system","subtype":"init","session_id":"s"}`)
+		for turn := 0; turn < streamHelperTurns; turn++ {
+			fmt.Fprintf(os.Stdout, `{"type":"assistant","message":{"content":[{"type":"tool_use","name":%q,`+
+				`"input":{"url":"https://%s.example/s?token=%s"}}]}}`+"\n", streamHelperTool, streamHelperSecret, streamHelperSecret)
+			fmt.Fprintf(os.Stdout, `{"type":"user","message":{"content":[{"type":"tool_result","content":"%s page text"}]}}`+"\n", streamHelperSecret)
+		}
+		data, err := json.Marshal(successReport())
+		if err != nil {
+			return 104
+		}
+		fmt.Fprintf(os.Stdout, `{"type":"result","subtype":"success","is_error":false,"structured_output":%s}`+"\n", data)
+		return 0
+	case "blob":
+		data, err := json.Marshal(successReport())
+		if err != nil {
+			return 104
+		}
+		fmt.Fprintf(os.Stdout, `{"type":"result","subtype":"success","is_error":false,"structured_output":%s}`, data)
+		return 0
+	case "stream-limit", "blob-limit":
+		envelope, err := claudeResultEnvelope(nearLimitReport())
+		if err != nil {
+			return 105
+		}
+		if mode == "blob-limit" {
+			fmt.Fprint(os.Stdout, envelope)
+			return 0
+		}
+		fmt.Fprintf(os.Stdout, `{"type":"assistant","message":{"content":[{"type":"tool_use","name":%q}]}}`+"\n", streamHelperTool)
+		fmt.Fprintln(os.Stdout, envelope)
+		return 0
 	case "sleep":
 		time.Sleep(30 * time.Second)
 		return 94

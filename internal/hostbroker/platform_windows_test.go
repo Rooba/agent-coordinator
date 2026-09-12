@@ -5,13 +5,19 @@ package hostbroker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 )
 
 func TestWindowsCredentialAndDPAPISeamsDoNotCallPlatform(t *testing.T) {
 	var blob []byte
 	store := windowsCredentialStore{
-		read: func() ([]byte, error) { return append([]byte(nil), blob...), nil },
+		read: func() ([]byte, error) {
+			if len(blob) == 0 {
+				return nil, ErrCredentialNotFound
+			}
+			return append([]byte(nil), blob...), nil
+		},
 		write: func(value []byte) error {
 			blob = append([]byte(nil), value...)
 			return nil
@@ -39,5 +45,18 @@ func TestWindowsCredentialAndDPAPISeamsDoNotCallPlatform(t *testing.T) {
 	opened, err := protector.Open(sealed)
 	if err != nil || !bytes.Equal(opened, plain) || len(directions) != 2 || !directions[0] || directions[1] {
 		t.Fatalf("DPAPI seam = (%q, %v, %v)", opened, directions, err)
+	}
+}
+
+// A corrupt credential must surface as a decode error, never as "unpaired" -
+// reporting it as not-found would silently re-pair over a damaged secret.
+func TestWindowsMalformedCredentialBlobIsRejected(t *testing.T) {
+	store := windowsCredentialStore{
+		read:  func() ([]byte, error) { return []byte("not json"), nil },
+		write: func([]byte) error { return errors.New("write must not run") },
+		lock:  func(context.Context) (Unlock, error) { return func() error { return nil }, nil },
+	}
+	if _, err := store.Load(context.Background()); err == nil || errors.Is(err, ErrCredentialNotFound) {
+		t.Fatalf("malformed blob Load err = %v, want a decode error", err)
 	}
 }

@@ -4,6 +4,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1418,5 +1420,246 @@ func TestReissueEyesChildAfterACrashAndCancel(t *testing.T) {
 	}
 	if n := count(t, s, `SELECT COUNT(*) FROM messages WHERE task_id=?`, task.TaskID); n != before {
 		t.Fatalf("the ack is not news for the requester: %d task messages, was %d", n, before)
+	}
+}
+
+// seedTaskAged writes one ledger row created age seconds ago with its own
+// deadline: the pair the elapsed / remaining render is read from.
+func seedTaskAged(t *testing.T, s *Store, scope, requester, taskID, state string, age, deadline int) {
+	t.Helper()
+	seedTaskSettledAfter(t, s, scope, requester, taskID, state, age, 0, deadline)
+}
+
+// seedTaskSettledAfter also stamps updated_at, so a terminal row carries the
+// moment it settled rather than the moment it was created.
+func seedTaskSettledAfter(t *testing.T, s *Store, scope, requester, taskID, state string,
+	age, settledAfter, deadline int) {
+	t.Helper()
+	created := s.Now().Unix() - int64(age)
+	if _, err := s.db.Exec(`INSERT INTO eyes_tasks
+		(task_id, requester_scope, requester_agent_id, launcher_session, launcher_scope,
+		 runtime, state, deadline_s, created_at, updated_at)
+		VALUES (?,?,?,'broker-1','host:BOX','claude',?,?,?,?)`,
+		taskID, scope, requester, state, deadline, created, created+int64(settledAfter)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The listing exists so a human can answer "is it alive and how long has it
+// got?". A live task past its deadline is overdue: nothing has confirmed it
+// finished or was cancelled, so whether it still runs is unknown. A settled
+// task is measured to the moment it settled - never overdue, never negative,
+// however long ago that was.
+func TestListEyesTasksElapsedRemainingAndOverdue(t *testing.T) {
+	s := open(t)
+	s.Now = func() time.Time { return time.Unix(2000000, 0) }
+	cases := []struct {
+		name, taskID, state string
+		age, settledAfter   int
+		deadline            int
+		elapsed, remaining  int
+		overdue             bool
+	}{
+		{name: "queued", taskID: "task-queued", state: "queued",
+			age: 12, deadline: 300, elapsed: 12, remaining: 288},
+		{name: "accepted", taskID: "task-accepted", state: "accepted",
+			age: 780, deadline: 1800, elapsed: 780, remaining: 1020},
+		{name: "overdue accepted", taskID: "task-overdue", state: "accepted",
+			age: 780, deadline: 300, elapsed: 780, remaining: -480, overdue: true},
+		{name: "cancelled awaiting ack", taskID: "task-cancelled", state: "cancelled",
+			age: 900, deadline: 300, elapsed: 900, remaining: -600, overdue: true},
+		{name: "terminal", taskID: "task-done", state: "done",
+			age: 90000, settledAfter: 120, deadline: 300, elapsed: 120, remaining: 180},
+		{name: "terminal past its deadline", taskID: "task-failed", state: "failed",
+			age: 90000, settledAfter: 900, deadline: 300, elapsed: 900, remaining: 0},
+	}
+	for _, c := range cases {
+		seedTaskSettledAfter(t, s, "/r", "aid-a", c.taskID, c.state, c.age, c.settledAfter, c.deadline)
+	}
+	got, err := s.ListEyesTasks(EyesTaskFilter{Scope: "/r"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(cases) {
+		t.Fatalf("want %d rows, got %d", len(cases), len(got))
+	}
+	byID := map[string]EyesTaskView{}
+	for _, v := range got {
+		byID[v.TaskID] = v
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			v, ok := byID[c.taskID]
+			if !ok {
+				t.Fatalf("%s missing from the listing", c.taskID)
+			}
+			if v.State != c.state || v.ElapsedS != c.elapsed || v.RemainingS != c.remaining ||
+				v.Overdue != c.overdue {
+				t.Fatalf("state=%s elapsed=%d remaining=%d overdue=%v", v.State, v.ElapsedS,
+					v.RemainingS, v.Overdue)
+			}
+			if v.Runtime != "claude" || v.DeadlineS != c.deadline || v.LauncherScope != "host:BOX" {
+				t.Fatalf("row detail: %+v", v)
+			}
+		})
+	}
+}
+
+// A task still holding its broker is what someone is waiting on, so it sorts
+// above settled history no matter how recent that history is.
+func TestListEyesTasksOrdersUnsettledFirst(t *testing.T) {
+	s := open(t)
+	s.Now = func() time.Time { return time.Unix(2000000, 0) }
+	seedTaskAged(t, s, "/r", "aid-a", "task-done", "done", 10, 300)
+	seedTaskAged(t, s, "/r", "aid-a", "task-old", "accepted", 500, 300)
+	seedTaskAged(t, s, "/r", "aid-a", "task-new", "queued", 100, 300)
+	got, err := s.ListEyesTasks(EyesTaskFilter{Scope: "/r"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	for _, v := range got {
+		order = append(order, v.TaskID)
+	}
+	want := []string{"task-new", "task-old", "task-done"}
+	if !slices.Equal(order, want) {
+		t.Fatalf("order %v, want %v", order, want)
+	}
+}
+
+// The workspace is the authorization boundary: a requester in another scope
+// must not see the row, and the unfiltered listing is the operator's own view.
+func TestListEyesTasksFiltersByScope(t *testing.T) {
+	s := open(t)
+	s.Now = func() time.Time { return time.Unix(2000000, 0) }
+	seedTaskAged(t, s, "/r", "aid-a", "task-mine", "accepted", 30, 300)
+	seedTaskAged(t, s, "/other", "aid-b", "task-theirs", "accepted", 30, 300)
+	for _, c := range []struct {
+		name, scope string
+		want        []string
+	}{
+		{name: "own scope", scope: "/r", want: []string{"task-mine"}},
+		{name: "other scope", scope: "/other", want: []string{"task-theirs"}},
+		{name: "unfiltered", scope: "", want: []string{"task-mine", "task-theirs"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := s.ListEyesTasks(EyesTaskFilter{Scope: c.scope})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var ids []string
+			for _, v := range got {
+				ids = append(ids, v.TaskID)
+			}
+			slices.Sort(ids)
+			if !slices.Equal(ids, c.want) {
+				t.Fatalf("scope %q listed %v, want %v", c.scope, ids, c.want)
+			}
+		})
+	}
+}
+
+// The opt-in owner view is the tasks its agent could cancel: its own, or its
+// parent's. An unrelated agent in the workspace is filtered out of that view,
+// though the default listing still shows it the workspace's tasks.
+func TestListEyesTasksFiltersByOwner(t *testing.T) {
+	s := open(t)
+	s.Now = func() time.Time { return time.Unix(2000000, 0) }
+	if _, err := s.Register("/r", "parent-sess", "hook"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.RegisterChild("/r", "parent-sess", "a1", "Explore"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Register("/r", "other-sess", "hook"); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := s.Identity("/r", "parent-sess")
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := s.Identity("/r", ChildSessionID("parent-sess", "a1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := s.Identity("/r", "other-sess")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedTaskAged(t, s, "/r", parent.AgentID, "task-parent", "accepted", 30, 300)
+	for _, c := range []struct {
+		name, agentID string
+		want          []string
+	}{
+		{name: "requester", agentID: parent.AgentID, want: []string{"task-parent"}},
+		{name: "bound child", agentID: child.AgentID, want: []string{"task-parent"}},
+		{name: "unrelated agent", agentID: other.AgentID},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := s.ListEyesTasks(EyesTaskFilter{Scope: "/r", OwnerAgentID: c.agentID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var ids []string
+			for _, v := range got {
+				ids = append(ids, v.TaskID)
+			}
+			if !slices.Equal(ids, c.want) {
+				t.Fatalf("agent %s listed %v, want %v", c.name, ids, c.want)
+			}
+		})
+	}
+}
+
+// The listing is bounded: the ledger keeps tasks for hours, and nothing that
+// reads it wants the whole table.
+func TestListEyesTasksBoundsRows(t *testing.T) {
+	s := open(t)
+	s.Now = func() time.Time { return time.Unix(2000000, 0) }
+	for i := range eyesTaskListMax + 10 {
+		seedTaskAged(t, s, "/r", "aid-a", fmt.Sprintf("task-%03d", i), "done", i, 300)
+	}
+	got, err := s.ListEyesTasks(EyesTaskFilter{Scope: "/r"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != eyesTaskListMax {
+		t.Fatalf("default listing returned %d rows, want the %d cap", len(got), eyesTaskListMax)
+	}
+	if got, err = s.ListEyesTasks(EyesTaskFilter{Scope: "/r", Limit: 3}); err != nil || len(got) != 3 {
+		t.Fatalf("limit 3 returned %d rows (%v)", len(got), err)
+	}
+}
+
+// A parentless agent stores an empty parent. An agent registered with an empty
+// session id must therefore never be mistaken for its parent, which would hand
+// out another agent's tasks and let it cancel them.
+func TestEmptySessionRowIsNobodysParent(t *testing.T) {
+	s := open(t)
+	s.Now = func() time.Time { return time.Unix(2000000, 0) }
+	if _, err := s.db.Exec(`INSERT INTO agents (scope, session_id, agent_id, name, status, registered_at, last_seen, source, parent_session_id)
+		VALUES ('/r', '', 'ghost-agent', 'ghost', 'active', 2000000, 2000000, 'hook', '')`); err != nil {
+		t.Skipf("an empty-session agent row cannot exist: %v", err)
+	}
+	if _, err := s.Register("/r", "loner-sess", "hook"); err != nil {
+		t.Fatal(err)
+	}
+	loner, err := s.Identity("/r", "loner-sess")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedTaskAged(t, s, "/r", "ghost-agent", "task-ghost", "accepted", 30, 300)
+
+	if s.actsFor(s.db, "/r", loner.AgentID, "ghost-agent") {
+		t.Fatal("a parentless agent must not act for the empty-session row")
+	}
+	tasks, err := s.ListEyesTasks(EyesTaskFilter{Scope: "/r", OwnerAgentID: loner.AgentID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, task := range tasks {
+		if task.TaskID == "task-ghost" {
+			t.Fatal("mine listed a task owned by the empty-session row")
+		}
 	}
 }

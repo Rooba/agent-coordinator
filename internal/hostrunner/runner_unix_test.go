@@ -19,7 +19,7 @@ func TestRunnerTerminatesDescendants(t *testing.T) {
 	runner := newHelperRunner(t, &helperProvider{mode: "tree", childPIDPath: childPIDPath}, 1024)
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
-	_, err := runner.Run(ctx, helperTask(13))
+	_, err := runner.Run(ctx, helperTask(13), nil)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("tree timeout error = %v", err)
 	}

@@ -7,11 +7,21 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/Rooba/agent-coordinator/internal/protocol"
 )
+
+// Credential files must stay owner-only; Windows just cannot report that.
+func restrictedFileMode(mode os.FileMode) bool {
+	perm := mode.Perm()
+	if perm == 0o600 {
+		return true
+	}
+	return runtime.GOOS == "windows" && perm == 0o666
+}
 
 type testProtector struct{}
 
@@ -54,7 +64,7 @@ func TestPairAndCredentialFileNeverStorePlainToken(t *testing.T) {
 	if bytes.Contains(raw, []byte(testToken)) {
 		t.Fatal("credential token stored in plaintext")
 	}
-	if info, _ := os.Stat(path); info.Mode().Perm() != 0o600 {
+	if info, _ := os.Stat(path); !restrictedFileMode(info.Mode()) {
 		t.Fatalf("credential mode = %o", info.Mode().Perm())
 	}
 	if err := store.Save(context.Background(), credential); err != nil {

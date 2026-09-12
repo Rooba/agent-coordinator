@@ -302,6 +302,9 @@ func (s *server) callTool(p callParams) map[string]any {
 		req.Op = protocol.OpListWorkspaces
 	case "list_eyes":
 		req.Op = protocol.OpListEyes
+	case "list_eyes_tasks":
+		req.Op = protocol.OpListEyesTasks
+		req.Mine, _ = p.Arguments["mine"].(bool)
 	case "relay":
 		req.Op = protocol.OpSendWorkspace
 		req.From, req.Body = arg(p.Arguments, "from"), arg(p.Arguments, "body")
@@ -389,6 +392,12 @@ func (s *server) callTool(p callParams) map[string]any {
 		text = string(b)
 		if len(resp.Agents) == 0 {
 			text = "no eyes agents"
+		}
+	case "list_eyes_tasks":
+		b, _ := json.MarshalIndent(resp.EyesTasks, "", "  ")
+		text = string(b)
+		if len(resp.EyesTasks) == 0 {
+			text = "no eyes tasks in this workspace"
 		}
 	case "request_eyes":
 		if resp.TaskID == "" {
@@ -614,6 +623,13 @@ var toolDefs = []map[string]any{
 		"name":        "list_eyes",
 		"description": "Live eyes and launcher agents across workspaces (kind, scope, platform, capabilities). Empty means no host broker is connected.",
 		"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
+	},
+	{
+		"name":        "list_eyes_tasks",
+		"description": "Eyes tasks in this workspace, still-running first: state, elapsed_s and remaining_s against the deadline, plus turns, the name of the tool last used and heartbeat_age_s. overdue=true means the deadline passed with no completion or cancellation confirmed - whether it still runs is unknown. heartbeat_stale=true means no recent liveness report arrived - a reason to look, not proof the run failed. Pass mine=true for only your own tasks.",
+		"inputSchema": map[string]any{"type": "object", "properties": map[string]any{
+			"mine": map[string]any{"type": "boolean", "description": "List only tasks you or your parent requested."},
+		}},
 	},
 	{
 		"name":        "relay",

@@ -95,13 +95,19 @@ type fakeRunner struct {
 	result  hostrunner.Result
 	err     error
 	wait    bool
+	samples []hostrunner.Progress
 }
 
-func (r *fakeRunner) Run(ctx context.Context, task hostrunner.Task) (hostrunner.Result, error) {
+func (r *fakeRunner) Run(ctx context.Context, task hostrunner.Task, progress hostrunner.ProgressFunc) (hostrunner.Result, error) {
 	r.mu.Lock()
 	r.runs = append(r.runs, task)
-	wait, result, err := r.wait, r.result, r.err
+	wait, result, err, samples := r.wait, r.result, r.err, r.samples
 	r.mu.Unlock()
+	for _, sample := range samples {
+		if progress != nil {
+			progress(sample)
+		}
+	}
 	if wait {
 		<-ctx.Done()
 		return hostrunner.Result{}, ctx.Err()

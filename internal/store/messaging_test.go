@@ -17,6 +17,21 @@ func twoAgents(t *testing.T) (*Store, string, string) {
 	return s, nA, nB
 }
 
+func TestPresenceEventDoesNotConsumeNotices(t *testing.T) {
+	s, nA, nB := twoAgents(t)
+	if err := s.Send("/r", nA, nB, "ping"); err != nil {
+		t.Fatal(err)
+	}
+	notices, err := s.RecordEvent("/r", "sess-b", protocol.Request{Source: "presence", Tool: "Bash", Activity: "Running: ls"})
+	if err != nil || len(notices) != 0 {
+		t.Fatalf("presence event notices=%v err=%v", notices, err)
+	}
+	notices, err = s.RecordEvent("/r", "sess-b", protocol.Request{Tool: "Read", Activity: "Reading x"})
+	if err != nil || len(notices) != 1 || !strings.Contains(notices[0], nA) {
+		t.Fatalf("later event should still see the notice: %v %v", notices, err)
+	}
+}
+
 func TestSendNoticeOnceThenRead(t *testing.T) {
 	s, nA, nB := twoAgents(t)
 	if err := s.Send("/r", nA, nB, "ping"); err != nil {

@@ -57,14 +57,18 @@ func parseHookInput(raw []byte) (hookInput, error) {
 // canonicalEvent folds event-name variants (SessionStart, session_start,
 // sessionStart, pre_tool_use, ...) onto the canonical Claude spelling.
 var canonicalEvents = map[string]string{
-	"sessionstart":     "SessionStart",
-	"sessionend":       "SessionEnd",
-	"stop":             "Stop",
-	"userpromptsubmit": "UserPromptSubmit",
-	"pretooluse":       "PreToolUse",
-	"posttooluse":      "PostToolUse",
-	"subagentstart":    "SubagentStart",
-	"subagentstop":     "SubagentStop",
+	"sessionstart":      "SessionStart",
+	"sessionend":        "SessionEnd",
+	"stop":              "Stop",
+	"userpromptsubmit":  "UserPromptSubmit",
+	"pretooluse":        "PreToolUse",
+	"posttooluse":       "PostToolUse",
+	"subagentstart":     "SubagentStart",
+	"subagentstop":      "SubagentStop",
+	"permissionrequest": "PermissionRequest",
+	"interrupt":         "Interrupt",
+	"precompact":        "PreCompact",
+	"postcompact":       "PostCompact",
 }
 
 func canonicalEvent(name string) string {
@@ -97,6 +101,24 @@ func Run(stdin io.Reader, stdout io.Writer, socketPath string) {
 	case "Stop":
 		req.Op = protocol.OpIdle
 		refreshBindFile(sc, in.SessionID)
+	case "Interrupt":
+		req.Op = protocol.OpIdle
+		req.Source = "presence"
+		req.AgentID, req.AgentType = in.AgentID, in.AgentType
+		refreshBindFile(sc, in.SessionID)
+	case "PermissionRequest":
+		req.Op = protocol.OpEvent
+		req.Source = "presence"
+		req.Tool = "PermissionRequest"
+		req.Activity = "Permission requested"
+		if in.ToolName != "" {
+			req.Activity = "Permission requested: " + in.ToolName
+		}
+		req.AgentID, req.AgentType = in.AgentID, in.AgentType
+		refreshBindFile(sc, in.SessionID)
+	case "PreCompact", "PostCompact":
+		notifyCompact(event, in, sc, socketPath)
+		return
 	case "UserPromptSubmit":
 		req.Op = protocol.OpEvent
 		req.Tool = "UserPromptSubmit"
@@ -142,6 +164,12 @@ func Run(stdin io.Reader, stdout io.Writer, socketPath string) {
 		return
 	}
 	switch event {
+	case "SubagentStart":
+		if resp.Name != "" {
+			emit(stdout, event, fmt.Sprintf(
+				"[coordinator] you are '%s' in this workspace; use from='%s' on coordinator tools because the MCP connection is shared with the parent.",
+				resp.Name, resp.Name))
+		}
 	case "PostToolUse", "UserPromptSubmit":
 		notices := resp.Notices
 		if event == "PostToolUse" && in.AgentID != "" && resp.Name != "" {
@@ -175,30 +203,30 @@ func Run(stdin io.Reader, stdout io.Writer, socketPath string) {
 	}
 }
 
-// preToolUse guards coordinator identity tools for subagents, which share the
-// parent's MCP connection: bare read_messages (or one aimed at the parent's
-// name) would drain the PARENT inbox, and whoami reports the parent identity.
-// Deny those with the child's own name; everything else - parent events, other
-// tools, reads of any non-parent inbox, any resolution error - is allowed by
-// emitting nothing.
+// preToolUse records that a tool is starting, and guards coordinator identity
+// tools for subagents that share the parent MCP connection.
 func preToolUse(in hookInput, sc, socketPath string, stdout io.Writer) {
-	if in.AgentID == "" {
-		return // parent events are never denied
+	if in.AgentID != "" && denySubagentIdentity(in, sc, socketPath, stdout) {
+		return
 	}
+	recordToolStart(in, sc, socketPath, stdout)
+}
+
+func denySubagentIdentity(in hookInput, sc, socketPath string, stdout io.Writer) bool {
 	whoami, _ := coordToolCall(in.ToolName, in.ToolInput, "whoami")
 	read, from := coordToolCall(in.ToolName, in.ToolInput, "read_messages")
 	if !whoami && !read {
-		return
+		return false
 	}
 	if read && from != "" && from != parentName(sc, in.SessionID, socketPath) {
-		return
+		return false
 	}
 	resp, ok := roundTrip(socketPath, protocol.Request{
 		Op: protocol.OpRegister, Scope: sc, SessionID: in.SessionID,
 		Source: "hook-subagent", AgentID: in.AgentID, AgentType: in.AgentType,
 	})
 	if !ok || !resp.OK || resp.Name == "" {
-		return // fail-open: coordinator trouble must never block the host agent
+		return false // fail-open: coordinator trouble must never block the host agent
 	}
 	reason := fmt.Sprintf(
 		"subagents share the parent MCP connection: retry with from='%s' (your own inbox). Parent mail stays with the parent.", resp.Name)
@@ -218,6 +246,53 @@ func preToolUse(in hookInput, sc, socketPath string, stdout io.Writer) {
 	if b, err := json.Marshal(out); err == nil {
 		stdout.Write(b)
 	}
+	return true
+}
+
+func recordToolStart(in hookInput, sc, socketPath string, stdout io.Writer) {
+	tool, input := in.ToolName, in.ToolInput
+	if tool == "use_tool" && input != nil {
+		if n, _ := input["name"].(string); n != "" {
+			tool = n
+			if nested, ok := input["args"].(map[string]any); ok {
+				input = nested
+			} else if nested, ok := input["arguments"].(map[string]any); ok {
+				input = nested
+			}
+		}
+	}
+	act, _, _ := activity.Infer(tool, input)
+	if act == "" {
+		return
+	}
+	req := protocol.Request{
+		Op: protocol.OpEvent, Scope: sc, SessionID: in.SessionID,
+		Source: "presence", Tool: tool, Activity: act,
+		AgentID: in.AgentID, AgentType: in.AgentType,
+	}
+	resp, ok := roundTrip(socketPath, req)
+	refreshBindFile(sc, in.SessionID)
+	if ok && resp.OK && in.AgentID != "" && resp.Name != "" {
+		emit(stdout, in.HookEventName, fmt.Sprintf(
+			"[coordinator] you are '%s' in this workspace; use from='%s' on coordinator tools because the MCP connection is shared with the parent.",
+			resp.Name, resp.Name))
+	}
+}
+
+func notifyCompact(event string, in hookInput, sc, socketPath string) {
+	activity, body := "Compacting session", "compacting context; details may need restating"
+	if event == "PostCompact" {
+		activity, body = "Compacted session", "compacted context; details may need restating"
+	}
+	roundTrip(socketPath, protocol.Request{
+		Op: protocol.OpEvent, Scope: sc, SessionID: in.SessionID, Source: "presence",
+		Tool: event, Activity: activity, AgentID: in.AgentID, AgentType: in.AgentType,
+	})
+	refreshBindFile(sc, in.SessionID)
+	roundTrip(socketPath, protocol.Request{
+		Op: protocol.OpBroadcast, Scope: sc, SessionID: in.SessionID,
+		AgentID: in.AgentID, AgentType: in.AgentType, Body: body,
+	})
 }
 
 // parentName resolves the parent session's registered name; empty on any

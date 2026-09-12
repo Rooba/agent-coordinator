@@ -127,6 +127,10 @@ func Open(path string) (*Store, error) {
 		// task is proved by scope and session together - a session id that is
 		// registered again elsewhere inherits nothing.
 		`ALTER TABLE eyes_tasks ADD COLUMN launcher_scope TEXT NOT NULL DEFAULT ''`,
+		// What the task is doing right now, refreshed while it runs, so a
+		// long task is observable instead of silent until it finishes.
+		`ALTER TABLE eyes_tasks ADD COLUMN progress TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE eyes_tasks ADD COLUMN heartbeat_at INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := db.Exec(alter); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
@@ -420,6 +424,9 @@ func (s *Store) RecordEvent(scope, sessionID string, req protocol.Request) ([]st
 				return nil, err
 			}
 		}
+	}
+	if req.Source == "presence" {
+		return nil, nil
 	}
 	return s.noticesFor(scope, aid, req.Writes)
 }
@@ -969,66 +976,52 @@ func (s *Store) Agents(scope string) ([]protocol.AgentInfo, error) {
 
 // Board lists the scope's agents; gone rows are hidden unless includeGone.
 func (s *Store) Board(scope string, includeGone bool) ([]protocol.AgentInfo, error) {
-	// Read every agent row and close the cursor BEFORE per-agent enrichment:
-	// with SetMaxOpenConns(1) an open Rows holds the sole connection, so any
-	// QueryRow issued mid-iteration would deadlock waiting for that connection.
-	rows, err := s.db.Query(`SELECT session_id, agent_id, name, status, last_seen, parent_session_id, kind, origin, platform, caps FROM agents WHERE scope=? ORDER BY registered_at`, scope)
+	// One snapshot replaces five enrichment queries per agent. The store has
+	// one connection, so board polling must leave room for mail and heartbeats.
+	rows, err := s.db.Query(`
+		WITH task_counts AS (
+			SELECT agent_id, SUM(status='pending') pending, SUM(status='completed') completed
+			FROM tasks WHERE scope=? GROUP BY agent_id
+		)
+		SELECT a.agent_id, a.name, a.status, a.last_seen, a.kind, a.origin, a.platform, a.caps,
+			COALESCE(parent.name, ''), COALESCE(event.activity, ''), COALESCE(event.files, '[]'),
+			COALESCE(task_counts.pending, 0), COALESCE(task_counts.completed, 0),
+			COALESCE((SELECT subject FROM tasks WHERE scope=a.scope AND agent_id=a.agent_id
+				AND status='in_progress' ORDER BY updated_at DESC LIMIT 1), ''),
+			(SELECT json_group_array(path) FROM (
+				SELECT path FROM claims WHERE scope=a.scope AND agent_id=a.agent_id ORDER BY since, path
+			))
+		FROM agents a
+		LEFT JOIN agents parent ON a.parent_session_id != '' AND parent.scope=a.scope AND parent.session_id=a.parent_session_id
+		LEFT JOIN events event ON event.id=(
+			SELECT id FROM events WHERE scope=a.scope AND agent_id=a.agent_id ORDER BY ts DESC, id DESC LIMIT 1
+		)
+		LEFT JOIN task_counts ON task_counts.agent_id=a.agent_id
+		WHERE a.scope=? ORDER BY a.registered_at`, scope, scope)
 	if err != nil {
 		return nil, err
 	}
-	var all []protocol.AgentInfo
-	var parentSessions []string
-	nameBySession := map[string]string{} // every row, so a hidden parent still names its children
+	defer rows.Close()
+	var out []protocol.AgentInfo
 	for rows.Next() {
-		var sid, explicit, parentSession, capsJSON string
+		var explicit, capsJSON, filesJSON, claimsJSON string
 		var a protocol.AgentInfo
-		if err := rows.Scan(&sid, &a.AgentID, &a.Name, &explicit, &a.LastSeen, &parentSession,
-			&a.Kind, &a.Origin, &a.Platform, &capsJSON); err != nil {
-			rows.Close()
+		if err := rows.Scan(&a.AgentID, &a.Name, &explicit, &a.LastSeen,
+			&a.Kind, &a.Origin, &a.Platform, &capsJSON, &a.Parent, &a.Activity, &filesJSON,
+			&a.TasksPending, &a.TasksDone, &a.CurrentTask, &claimsJSON); err != nil {
 			return nil, err
 		}
 		a.Status = s.freshStatus(explicit, a.LastSeen)
-		json.Unmarshal([]byte(capsJSON), &a.Capabilities)
-		nameBySession[sid] = a.Name
-		parentSessions = append(parentSessions, parentSession)
-		all = append(all, a)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return nil, err
-	}
-	rows.Close()
-	var out []protocol.AgentInfo
-	for i, a := range all {
-		if ps := parentSessions[i]; ps != "" {
-			a.Parent = nameBySession[ps] // empty if the parent row was purged
-		}
 		if a.Status == "gone" && !includeGone {
 			continue
 		}
+		json.Unmarshal([]byte(capsJSON), &a.Capabilities)
+		json.Unmarshal([]byte(filesJSON), &a.Files)
+		json.Unmarshal([]byte(claimsJSON), &a.Claims)
 		out = append(out, a)
 	}
-
-	for i := range out {
-		a := &out[i]
-		var filesJSON string
-		if err := s.db.QueryRow(`SELECT activity, files FROM events WHERE scope=? AND agent_id=? ORDER BY ts DESC, id DESC LIMIT 1`,
-			scope, a.AgentID).Scan(&a.Activity, &filesJSON); err == nil {
-			json.Unmarshal([]byte(filesJSON), &a.Files)
-		}
-		s.db.QueryRow(`SELECT COUNT(*) FROM tasks WHERE scope=? AND agent_id=? AND status='pending'`, scope, a.AgentID).Scan(&a.TasksPending)
-		s.db.QueryRow(`SELECT COUNT(*) FROM tasks WHERE scope=? AND agent_id=? AND status='completed'`, scope, a.AgentID).Scan(&a.TasksDone)
-		s.db.QueryRow(`SELECT subject FROM tasks WHERE scope=? AND agent_id=? AND status='in_progress' ORDER BY updated_at DESC LIMIT 1`,
-			scope, a.AgentID).Scan(&a.CurrentTask)
-		if crows, err := s.db.Query(`SELECT path FROM claims WHERE scope=? AND agent_id=? ORDER BY since, path`, scope, a.AgentID); err == nil {
-			for crows.Next() {
-				var p string
-				if crows.Scan(&p) == nil {
-					a.Claims = append(a.Claims, p)
-				}
-			}
-			crows.Close()
-		}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	return out, nil
 }

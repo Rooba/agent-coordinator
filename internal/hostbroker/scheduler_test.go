@@ -9,9 +9,18 @@ import (
 	"time"
 )
 
+// Windows treats a leading slash as relative; keep these tests GOOS-absolute.
+func absPath(p string) string {
+	if filepath.IsAbs(p) {
+		return p
+	}
+	return `C:` + filepath.FromSlash(p)
+}
+
 func TestSchedulerDryRunUsesInteractiveLeastPrivilegeXML(t *testing.T) {
 	called := false
-	plan, err := applySchedule(context.Background(), ScheduleInstall, "/Program Files/ac<&>.exe", "S-1-5-21-100", "/Windows/System32/schtasks.exe", true,
+	executable := absPath("/Program Files/ac<&>.exe")
+	plan, err := applySchedule(context.Background(), ScheduleInstall, executable, "S-1-5-21-100", absPath("/Windows/System32/schtasks.exe"), true,
 		func(context.Context, string, ...string) error { called = true; return nil })
 	if err != nil {
 		t.Fatal(err)
@@ -19,7 +28,7 @@ func TestSchedulerDryRunUsesInteractiveLeastPrivilegeXML(t *testing.T) {
 	if called || len(plan.Steps) != 2 || plan.Steps[0][0] != "/Create" || plan.Steps[1][0] != "/Run" {
 		t.Fatalf("dry-run plan = %+v, called=%v", plan, called)
 	}
-	for _, required := range []string{"<LogonType>InteractiveToken</LogonType>", "<RunLevel>LeastPrivilege</RunLevel>", "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>", "<Arguments>host run</Arguments>", "/Program Files/ac&lt;&amp;&gt;.exe"} {
+	for _, required := range []string{"<LogonType>InteractiveToken</LogonType>", "<RunLevel>LeastPrivilege</RunLevel>", "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>", "<Arguments>host run</Arguments>", xmlEscape(executable)} {
 		if !strings.Contains(plan.XML, required) {
 			t.Fatalf("scheduler XML missing %q", required)
 		}
@@ -43,7 +52,7 @@ func TestScheduleUninstallDoesNotRequireExistingExecutable(t *testing.T) {
 
 func TestSchedulerUninstallEndsThenDeletes(t *testing.T) {
 	var calls [][]string
-	_, err := applySchedule(context.Background(), ScheduleUninstall, "/opt/ac.exe", "S-1-5-21-100", "/Windows/System32/schtasks.exe", false,
+	_, err := applySchedule(context.Background(), ScheduleUninstall, absPath("/opt/ac.exe"), "S-1-5-21-100", absPath("/Windows/System32/schtasks.exe"), false,
 		func(_ context.Context, _ string, args ...string) error {
 			calls = append(calls, append([]string(nil), args...))
 			return nil
@@ -71,7 +80,7 @@ func TestSchedulerUninstallRequiresConfirmedStop(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			calls := 0
-			_, err := applySchedule(context.Background(), ScheduleUninstall, "/opt/ac.exe", "S-1-5-21-100", "/Windows/System32/schtasks.exe", false,
+			_, err := applySchedule(context.Background(), ScheduleUninstall, absPath("/opt/ac.exe"), "S-1-5-21-100", absPath("/Windows/System32/schtasks.exe"), false,
 				func(_ context.Context, _ string, _ ...string) error {
 					calls++
 					if calls == 1 {
@@ -89,7 +98,7 @@ func TestSchedulerUninstallRequiresConfirmedStop(t *testing.T) {
 func TestSchedulerRollbackUsesCallerContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	calls := 0
-	_, err := applySchedule(ctx, ScheduleInstall, "/opt/ac.exe", "S-1-5-21-100", "/Windows/System32/schtasks.exe", false,
+	_, err := applySchedule(ctx, ScheduleInstall, absPath("/opt/ac.exe"), "S-1-5-21-100", absPath("/Windows/System32/schtasks.exe"), false,
 		func(callCtx context.Context, _ string, args ...string) error {
 			calls++
 			if args[0] == "/Run" {

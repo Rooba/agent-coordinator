@@ -870,3 +870,39 @@ func TestRelayWithoutFromTriggersBindOrRegister(t *testing.T) {
 		t.Fatalf("deregister request: %+v", (*got)[2])
 	}
 }
+
+// list_eyes_tasks is the surface that makes a silent eyes job legible, so the
+// tool must be offered and its reply must carry the deadline numbers - the
+// overdue mark included.
+func TestListEyesTasksTool(t *testing.T) {
+	sock, got := fakeDaemon(t, protocol.Response{OK: true, EyesTasks: []protocol.EyesTaskInfo{{
+		TaskID: "task-0123456789ab", Runtime: "claude", State: "accepted",
+		RequesterScope: cwd, RequesterAgentID: "aid-a", DeadlineS: 300,
+		ElapsedS: 780, RemainingS: -480, Overdue: true, Turns: 7,
+		Tool: "mcp__claude-in-chrome__click", HeartbeatAt: 1000000, HeartbeatAgeS: 310,
+		HeartbeatStale: true}}})
+	out := rpc(t, sock,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_eyes_tasks","arguments":{}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_eyes_tasks","arguments":{"mine":true}}}`)
+	if !strings.Contains(out[0], `"list_eyes_tasks"`) {
+		t.Fatalf("tools/list missing list_eyes_tasks: %s", out[0])
+	}
+	if len(*got) != 2 || (*got)[0].Op != protocol.OpListEyesTasks {
+		t.Fatalf("daemon saw %+v", *got)
+	}
+	// The default listing is the workspace's; mine=true is the opt-in narrowing.
+	if (*got)[0].Mine || !(*got)[1].Mine {
+		t.Fatalf("mine forwarding: %+v", *got)
+	}
+	// The reply carries the deadline numbers and the liveness sample, so a
+	// stalled task is visible without any further call.
+	for _, want := range []string{"task-0123456789ab", `\"state\": \"accepted\"`,
+		`\"elapsed_s\": 780`, `\"remaining_s\": -480`, `\"overdue\": true`,
+		`\"turns\": 7`, `\"tool\": \"mcp__claude-in-chrome__click\"`,
+		`\"heartbeat_age_s\": 310`, `\"heartbeat_stale\": true`} {
+		if !strings.Contains(out[1], want) {
+			t.Fatalf("reply missing %s: %s", want, out[1])
+		}
+	}
+}

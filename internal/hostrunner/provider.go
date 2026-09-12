@@ -25,9 +25,13 @@ type Invocation struct {
 	Prompt           []byte
 	Decode           func(stdout []byte) (Report, error)
 	ReportFromStdout bool
-	ConfigKey        string // provider-owned; never accepted through Environment
-	ConfigDir        string
-	Warning          string // non-fatal preparation diagnostic, e.g. a skipped credentials refresh
+	// Stream decodes the provider's line-delimited event stream while it runs.
+	// When set, the report is decoded from the line the stream marked final
+	// rather than from buffered stdout.
+	Stream    StreamDecoder
+	ConfigKey string // provider-owned; never accepted through Environment
+	ConfigDir string
+	Warning   string // non-fatal preparation diagnostic, e.g. a skipped credentials refresh
 }
 
 type Provider interface {
@@ -46,6 +50,10 @@ type ExecConfig struct {
 	Model       string
 	Credentials string
 	Environment []string
+	// NoStreamProgress falls back to the single-blob output mode: the provider
+	// reports only at exit and the task shows no progress until then. It is the
+	// escape hatch for a CLI build whose event stream cannot be decoded.
+	NoStreamProgress bool
 }
 
 type execConfig struct {
@@ -55,6 +63,7 @@ type execConfig struct {
 	model       string
 	credentials string
 	environment []string
+	noStream    bool
 }
 
 func (c execConfig) invocation(args []string, prompt []byte, stdoutReport bool, decode func([]byte) (Report, error)) Invocation {
@@ -93,6 +102,7 @@ func newExecConfig(name string, config ExecConfig) (execConfig, error) {
 		model:       config.Model,
 		credentials: cleanIfSet(config.Credentials),
 		environment: providerEnvironment(config.Environment),
+		noStream:    config.NoStreamProgress,
 	}, nil
 }
 
@@ -253,6 +263,11 @@ func (p *CodexProvider) Prepare(task Task, scratchDir string) (Invocation, error
 	invocation := p.invocation(args, eyesPrompt(task, "the configured browser tools"), false, func([]byte) (Report, error) {
 		return readReport(resultPath)
 	})
+	// Codex already emits --json events; decoding them costs nothing and is
+	// the only way the task is visible before it writes its result file.
+	if !p.noStream {
+		invocation.Stream = codexStreamEvent
+	}
 	invocation.ConfigKey, invocation.ConfigDir = "CODEX_HOME", p.configDir
 	return invocation, nil
 }
@@ -300,11 +315,28 @@ func (p *ClaudeProvider) Prepare(task Task, scratchDir string) (Invocation, erro
 	// dontAsk denies every tool not on the allow list, so the Chrome tools are the
 	// only ones Claude can use; an empty --tools list would strip them too.
 	args := []string{"--print", "--chrome", "--no-session-persistence", "--permission-mode", "dontAsk",
-		"--model", p.model, "--allowedTools", claudeChromeTools, "--output-format", "json", "--json-schema", reportSchema}
-	args = append(args, "--settings", settingsPath, "--setting-sources", "", "--mcp-config", mcpPath, "--strict-mcp-config")
-	invocation := p.invocation(args, eyesPrompt(task, "Claude in Chrome"), true, parseClaudeReport)
+		"--model", p.model, "--allowedTools", claudeChromeTools}
+	args = append(args, p.outputArgs()...)
+	args = append(args, "--json-schema", reportSchema,
+		"--settings", settingsPath, "--setting-sources", "", "--mcp-config", mcpPath, "--strict-mcp-config")
+	// The report parses identically either way: stream-json's terminal result
+	// event IS the json blob, delivered as the stream's last line.
+	invocation := p.invocation(args, eyesPrompt(task, "Claude in Chrome"), p.noStream, parseClaudeReport)
+	if !p.noStream {
+		invocation.Stream = claudeStreamEvent
+	}
 	invocation.ConfigKey, invocation.ConfigDir, invocation.Warning = "CLAUDE_CONFIG_DIR", p.configDir, warning
 	return invocation, nil
+}
+
+// outputArgs picks how Claude reports: one blob at exit, or a per-turn event
+// stream whose last line is that same blob. Streaming in --print mode requires
+// --verbose, which only affects what the stream carries, never the result.
+func (p *ClaudeProvider) outputArgs() []string {
+	if p.noStream {
+		return []string{"--output-format", "json"}
+	}
+	return []string{"--output-format", "stream-json", "--verbose"}
 }
 
 // refreshCredentials keeps the isolated login in step with the user's main Claude
@@ -388,4 +420,99 @@ func parseClaudeReport(stdout []byte) (Report, error) {
 		return Report{}, fmt.Errorf("%w: Claude result has no structured_output", ErrInvalidReport)
 	}
 	return parseReport(envelope.StructuredOutput)
+}
+
+// claudeStreamEvent reads one stream-json line. Only the event type and a tool
+// NAME are ever taken from it: the assistant text, the tool input and the tool
+// results all describe the page, and none of that may leave the host.
+func claudeStreamEvent(line []byte) StreamEvent {
+	var event struct {
+		Type    string `json:"type"`
+		Message struct {
+			Content []struct {
+				Type string `json:"type"`
+				Name string `json:"name"`
+			} `json:"content"`
+		} `json:"message"`
+	}
+	if json.Unmarshal(line, &event) != nil {
+		return StreamEvent{}
+	}
+	switch event.Type {
+	case "assistant":
+		sample := StreamEvent{Turn: true}
+		for _, part := range event.Message.Content {
+			if part.Type == "tool_use" {
+				sample.Tool = part.Name
+			}
+		}
+		return sample
+	case "result":
+		return StreamEvent{Final: true}
+	}
+	return StreamEvent{}
+}
+
+// codexStreamEvent reads one codex exec --json line, across both the msg-typed
+// and the item-typed event shapes. Like Claude's, it takes only event and tool
+// names - never a command, an argument, or a model message. A turn is counted
+// only where Codex reports one of its own turns complete, and a tool name only
+// where an event names an actual tool; anything else reports neither rather
+// than a plausible-looking number nobody observed.
+func codexStreamEvent(line []byte) StreamEvent {
+	var event struct {
+		Type string `json:"type"`
+		Msg  struct {
+			Type       string `json:"type"`
+			Invocation struct {
+				Server string `json:"server"`
+				Tool   string `json:"tool"`
+			} `json:"invocation"`
+		} `json:"msg"`
+		Item struct {
+			Type     string `json:"type"`
+			ItemType string `json:"item_type"`
+			Server   string `json:"server"`
+			Tool     string `json:"tool"`
+		} `json:"item"`
+	}
+	if json.Unmarshal(line, &event) != nil {
+		return StreamEvent{}
+	}
+	// The two wire spellings of Codex's own turn-completion event. Model
+	// messages and reasoning items are output within a turn, not turns.
+	if event.Msg.Type == "task_complete" || event.Type == "turn.completed" {
+		return StreamEvent{Turn: true}
+	}
+	switch event.Msg.Type {
+	case "mcp_tool_call_begin":
+		return StreamEvent{Tool: codexToolName(event.Msg.Invocation.Server, event.Msg.Invocation.Tool)}
+	case "exec_command_begin":
+		return StreamEvent{Tool: "exec_command"}
+	}
+	if event.Type != "item.started" && event.Type != "item.completed" {
+		return StreamEvent{}
+	}
+	kind := event.Item.ItemType
+	if kind == "" {
+		kind = event.Item.Type
+	}
+	switch kind {
+	case "command_execution":
+		return StreamEvent{Tool: "exec_command"}
+	case "web_search":
+		return StreamEvent{Tool: "web_search"}
+	case "mcp_tool_call":
+		return StreamEvent{Tool: codexToolName(event.Item.Server, event.Item.Tool)}
+	}
+	return StreamEvent{}
+}
+
+// codexToolName qualifies an MCP tool with its server, and reports nothing when
+// the event named no tool at all.
+func codexToolName(server, tool string) string {
+	if server != "" && tool != "" {
+		return server + "." + tool
+	}
+	return tool
 }

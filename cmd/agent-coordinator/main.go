@@ -29,6 +29,8 @@ func main() {
 		runWorkspaces(os.Args[2:])
 	case "eyes":
 		runEyes(os.Args[2:])
+	case "eyes-setup":
+		runEyesSetup(os.Args[2:])
 	case "relay":
 		runRelay(os.Args[2:])
 	case "summon", "request-eyes":
@@ -42,7 +44,7 @@ func main() {
 	case "version":
 		fmt.Println(version)
 	default:
-		fmt.Fprintln(os.Stderr, "usage: agent-coordinator daemon|hook|mcp|wait <name>|join|board|workspaces|eyes|relay|summon|request-eyes|cancel-eyes|host|install [--uninstall]|version")
+		fmt.Fprintln(os.Stderr, "usage: agent-coordinator daemon|hook|mcp|wait <name>|join|board|workspaces|eyes|eyes-setup|relay|summon|request-eyes|cancel-eyes|host|install [--uninstall]|version")
 		os.Exit(2)
 	}
 }

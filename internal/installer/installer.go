@@ -17,21 +17,30 @@ type hookEvent struct{ event, matcher string }
 var hookEvents = []hookEvent{
 	{"SessionStart", "startup|resume|clear|compact"},
 	{"UserPromptSubmit", ""},
-	// PreToolUse: subagent drain guard (blocks bare read_messages from
-	// subagents that share the parent session; fail-open otherwise).
-	{"PreToolUse", "mcp__agent-coordinator__read_messages|read_messages"},
+	{"PreToolUse", ""},
 	{"PostToolUse", ""},
+	{"PreCompact", ""},
+	{"PostCompact", ""},
 	{"Stop", ""},
 	{"SubagentStart", ""},
 	{"SubagentStop", ""},
 	{"SessionEnd", ""},
 }
 
+// Codex lifecycle events from official hooks docs (CLI 0.154+).
 var codexHookEvents = []hookEvent{
 	{"SessionStart", "startup|resume|clear|compact"},
+	{"SessionEnd", ""},
 	{"UserPromptSubmit", ""},
+	{"PreToolUse", ""},
+	{"PermissionRequest", ""},
 	{"PostToolUse", ""},
+	{"PreCompact", ""},
+	{"PostCompact", ""},
 	{"Stop", ""},
+	{"Interrupt", ""},
+	{"SubagentStart", ""},
+	{"SubagentStop", ""},
 }
 
 // grokHookEvents matches Claude's lifecycle set. Grok discovers hooks from
@@ -39,8 +48,10 @@ var codexHookEvents = []hookEvent{
 var grokHookEvents = []hookEvent{
 	{"SessionStart", "startup|resume|clear|compact"},
 	{"UserPromptSubmit", ""},
-	{"PreToolUse", "mcp__agent-coordinator__read_messages|use_tool|agent-coordinator__read_messages"},
+	{"PreToolUse", ""},
 	{"PostToolUse", ""},
+	{"PreCompact", ""},
+	{"PostCompact", ""},
 	{"Stop", ""},
 	{"SubagentStart", ""},
 	{"SubagentStop", ""},
@@ -117,15 +128,15 @@ func mergeHooks(settings []byte, binPath string, events []hookEvent) ([]byte, bo
 			}
 			entries = list
 		}
-		if containsCommand(entries, cmd) {
-			continue
+		timeout := 5
+		if he.event == "SessionEnd" || he.event == "Interrupt" {
+			timeout = 3 // harnesses cap these so the session can exit
 		}
-		entries = append(entries, map[string]any{
-			"matcher": he.matcher,
-			"hooks":   []any{map[string]any{"type": "command", "command": cmd, "timeout": 5}},
-		})
-		hooks[he.event] = entries
-		changed = true
+		updated, hookChanged := upsertOurHook(entries, cmd, he, timeout)
+		if hookChanged {
+			hooks[he.event] = updated
+			changed = true
+		}
 	}
 	if !changed {
 		return settings, false, nil
@@ -201,18 +212,94 @@ func RemoveHooks(settings []byte, binPath string) ([]byte, bool, error) {
 	return out, changed, err
 }
 
-func containsCommand(entries []any, cmd string) bool {
+func upsertOurHook(entries []any, cmd string, he hookEvent, timeout int) ([]any, bool) {
+	changed := false
+	need := true
+	out := make([]any, 0, len(entries)+1)
+	canonical := map[string]any{
+		"matcher": he.matcher,
+		"hooks":   []any{map[string]any{"type": "command", "command": cmd, "timeout": timeout}},
+	}
 	for _, e := range entries {
-		group, _ := e.(map[string]any)
+		group, ok := e.(map[string]any)
+		if !ok {
+			out = append(out, e)
+			continue
+		}
 		inner, _ := group["hooks"].([]any)
-		for _, h := range inner {
-			hm, _ := h.(map[string]any)
-			if c, _ := hm["command"].(string); c == cmd {
-				return true
-			}
+		ours, onlyOurs := commandInGroup(inner, cmd)
+		if !ours {
+			out = append(out, e)
+			continue
+		}
+		if onlyOurs && groupMatcher(group) == he.matcher && groupTimeout(inner) == timeout {
+			out = append(out, e)
+			need = false
+			continue
+		}
+		if onlyOurs {
+			out = append(out, canonical)
+			need = false
+			changed = true
+			continue
+		}
+		kept := stripCommand(inner, cmd)
+		if len(kept) > 0 {
+			group["hooks"] = kept
+			out = append(out, group)
+		}
+		changed = true
+	}
+	if need {
+		out = append(out, canonical)
+		changed = true
+	}
+	return out, changed
+}
+
+func stripCommand(inner []any, cmd string) []any {
+	var kept []any
+	for _, h := range inner {
+		hm, _ := h.(map[string]any)
+		if c, _ := hm["command"].(string); c == cmd {
+			continue
+		}
+		kept = append(kept, h)
+	}
+	return kept
+}
+
+func commandInGroup(inner []any, cmd string) (ours, onlyOurs bool) {
+	foreign := 0
+	for _, h := range inner {
+		hm, _ := h.(map[string]any)
+		if c, _ := hm["command"].(string); c == cmd {
+			ours = true
+		} else {
+			foreign++
 		}
 	}
-	return false
+	return ours, ours && foreign == 0
+}
+
+func groupMatcher(group map[string]any) string {
+	s, _ := group["matcher"].(string)
+	return s
+}
+
+func groupTimeout(inner []any) int {
+	if len(inner) == 0 {
+		return 0
+	}
+	hm, _ := inner[0].(map[string]any)
+	switch v := hm["timeout"].(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	default:
+		return 0
+	}
 }
 
 func mergeOpenCodeConfig(config []byte, binPath string) ([]byte, bool, error) {
