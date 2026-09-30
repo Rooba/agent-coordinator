@@ -14,6 +14,17 @@ demand, and shuts down when idle.
 
 ## Install
 
+**Claude Code plugin** (no PATH setup, no separate download):
+
+```sh
+claude plugin marketplace add https://github.com/Rooba/agent-coordinator
+claude plugin install agent-coordinator@agent-coordinator
+```
+
+Do not combine it with `agent-coordinator install`; hooks would fire twice.
+
+**Other clients, or Claude Code without the plugin:**
+
 Download your platform's binary from [Releases](https://github.com/Rooba/agent-coordinator/releases),
 name it `agent-coordinator` (`agent-coordinator.exe` on Windows), and put it on your PATH. Then run:
 

@@ -61,6 +61,51 @@ working directory selects its workspace; launch it in the repository the agents
 share. MCP provides messaging and presence even when the client has no lifecycle
 hook integration. Automatic tool activity and session tracking require hooks.
 
+### Claude Code plugin
+
+```
+claude plugin marketplace add https://github.com/Rooba/agent-coordinator
+claude plugin install agent-coordinator@agent-coordinator
+```
+
+Inside a session, use `/plugin marketplace add https://github.com/Rooba/agent-coordinator` and
+`/plugin install agent-coordinator@agent-coordinator`. A listing in the official
+Claude Code plugin directory is being submitted; once approved, it installs from
+there too.
+
+The plugin registers the same ten Claude Code hooks and the same
+`agent-coordinator` MCP server as `agent-coordinator install`, plus a skill with
+the usage guide. No PATH setup or separate binary download is needed.
+
+On first use, the launcher (`bin/agent-coordinator` in the plugin) downloads the
+release binary matching the plugin's version (`v<version>`, asset
+`agent-coordinator_<os>_<arch>[.exe]`) from GitHub Releases into
+`$CLAUDE_PLUGIN_DATA/bin/`, falling back to
+`~/.local/share/agent-coordinator/plugin/bin/`. It verifies the download against
+the release's `SHA256SUMS` when that file exists.
+
+Offline or on download failure, hooks fail open (sessions keep working without a
+coordinator) and the MCP server reports the error. Overrides:
+
+- `AC_PLUGIN_RELEASE_URL`: release download base.
+- `AC_PLUGIN_VERSION`: version to download.
+
+Under the plugin, MCP tools are named
+`mcp__plugin_agent-coordinator_agent-coordinator__<tool>` instead of
+`mcp__agent-coordinator__<tool>`; the hooks handle both.
+
+Do not run both. If you previously ran `agent-coordinator install`, run
+`agent-coordinator install --uninstall` before installing the plugin, otherwise
+every hook fires twice and two MCP servers are registered.
+
+#### Releasing a new plugin version
+
+1. Bump `version` in `packaging/claude-plugin/.claude-plugin/plugin.json` and in
+   `.claude-plugin/marketplace.json`.
+2. Tag `v<version>`. The release workflow fails if the tag and manifests disagree.
+
+The plugin pins that version, so the tag must exist before users can install it.
+
 ### What `install` does
 
 - merges Claude lifecycle hooks into `~/.claude/settings.json` (SessionStart,
