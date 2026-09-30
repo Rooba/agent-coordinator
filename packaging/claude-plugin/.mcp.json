@@ -2,7 +2,7 @@
   "mcpServers": {
     "agent-coordinator": {
       "command": "bash",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/bin/agent-coordinator", "mcp"]
+      "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/agent-coordinator", "mcp"]
     }
   }
 }

@@ -77,7 +77,7 @@ The plugin registers the same ten Claude Code hooks and the same
 `agent-coordinator` MCP server as `agent-coordinator install`, plus a skill with
 the usage guide. No PATH setup or separate binary download is needed.
 
-On first use, the launcher (`bin/agent-coordinator` in the plugin) downloads the
+On first use, the launcher (`scripts/agent-coordinator` in the plugin) downloads the
 release binary matching the plugin's version (`v<version>`, asset
 `agent-coordinator_<os>_<arch>[.exe]`) from GitHub Releases into
 `$CLAUDE_PLUGIN_DATA/bin/`, falling back to

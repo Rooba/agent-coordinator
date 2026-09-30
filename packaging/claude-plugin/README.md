@@ -23,7 +23,7 @@ first, or every hook fires twice.
 
 ## How the binary arrives
 
-`bin/agent-coordinator` is a small bash launcher. On first use it downloads the release
+`scripts/agent-coordinator` is a small bash launcher. On first use it downloads the release
 binary matching the plugin version from GitHub Releases into
 `${CLAUDE_PLUGIN_DATA}/bin/agent-coordinator-<version>` (outside Claude Code:
 `${XDG_DATA_HOME:-~/.local/share}/agent-coordinator/plugin/bin`). The download is verified
