@@ -11,6 +11,7 @@
       "source": "./packaging/claude-plugin",
       "description": "Presence, status, and messaging for concurrent coding agents sharing a workspace.",
       "version": "0.5.0",
+      "license": "MIT",
       "keywords": [
         "agents",
         "multi-agent",
