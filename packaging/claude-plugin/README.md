@@ -32,6 +32,9 @@ cached binary. Windows needs Git Bash, which Claude Code already requires there.
 
 Offline, hooks exit 0 silently so sessions keep working; the MCP server reports one error line.
 
+What the plugin stores locally, for how long, and its only network access are described in
+[PRIVACY.md](PRIVACY.md).
+
 Environment overrides:
 
 - `AC_PLUGIN_VERSION` - release version to run instead of the one in `plugin.json`.
