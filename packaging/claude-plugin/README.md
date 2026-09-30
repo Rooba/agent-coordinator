@@ -26,8 +26,8 @@ first, or every hook fires twice.
 `bin/agent-coordinator` is a small bash launcher. On first use it downloads the release
 binary matching the plugin version from GitHub Releases into
 `${CLAUDE_PLUGIN_DATA}/bin/agent-coordinator-<version>` (outside Claude Code:
-`${XDG_DATA_HOME:-~/.local/share}/agent-coordinator/plugin/bin`). When the release publishes
-`SHA256SUMS`, the download is verified against it and rejected on mismatch. Later runs reuse the
+`${XDG_DATA_HOME:-~/.local/share}/agent-coordinator/plugin/bin`). The download is verified
+against the release's `SHA256SUMS` and refused on a mismatch or a missing checksum file. Later runs reuse the
 cached binary. Windows needs Git Bash, which Claude Code already requires there.
 
 Offline, hooks exit 0 silently so sessions keep working; the MCP server reports one error line.

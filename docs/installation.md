@@ -82,7 +82,7 @@ release binary matching the plugin's version (`v<version>`, asset
 `agent-coordinator_<os>_<arch>[.exe]`) from GitHub Releases into
 `$CLAUDE_PLUGIN_DATA/bin/`, falling back to
 `~/.local/share/agent-coordinator/plugin/bin/`. It verifies the download against
-the release's `SHA256SUMS` when that file exists.
+the release's `SHA256SUMS` and refuses to run on a mismatch or a missing checksum file.
 
 Offline or on download failure, hooks fail open (sessions keep working without a
 coordinator) and the MCP server reports the error. Overrides:

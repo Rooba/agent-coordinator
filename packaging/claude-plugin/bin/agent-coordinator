@@ -40,15 +40,13 @@ fetch() {
 # Prints the SHA-256 hex digest of a file.
 sha256() { { sha256sum "$1" 2>/dev/null || shasum -a 256 "$1"; } | cut -d' ' -f1; }
 
-# Downloads the asset, checks it against SHA256SUMS when the release has one, then installs it atomically.
+# Downloads the asset and the release checksums, refuses on any mismatch, then installs it atomically.
 download() (
   mkdir -p "$data/bin" && tmp="$(mktemp "$data/bin/.download.XXXXXX")" || exit 1
   trap 'rm -f "$tmp" "$tmp.sums"' EXIT
-  fetch "$base/$asset" "$tmp" || exit 1
-  if fetch "$base/SHA256SUMS" "$tmp.sums"; then
-    want="$(awk -v a="$asset" '$2 == a || $2 == "*" a { print $1 }' "$tmp.sums")"
-    [ -n "$want" ] && [ "$want" = "$(sha256 "$tmp")" ] || exit 1
-  fi
+  fetch "$base/$asset" "$tmp" && fetch "$base/SHA256SUMS" "$tmp.sums" || exit 1
+  want="$(awk -v a="$asset" '$2 == a || $2 == "*" a { print $1 }' "$tmp.sums")"
+  [ -n "$want" ] && [ "$want" = "$(sha256 "$tmp")" ] || exit 1
   chmod 755 "$tmp" && mv -f "$tmp" "$target"
 )
 
