@@ -37,8 +37,8 @@ fetch() {
   if command -v curl >/dev/null; then curl -fsSL --retry 2 -o "$2" "$1"; else wget -q -O "$2" "$1"; fi 2>/dev/null
 }
 
-# Prints the SHA-256 hex digest of a file.
-sha256() { { sha256sum "$1" 2>/dev/null || shasum -a 256 "$1"; } | cut -d' ' -f1; }
+# Prints the SHA-256 hex digest of a file, hashing stdin so no filename is echoed or escaped.
+sha256() { { sha256sum 2>/dev/null || shasum -a 256; } < "$1" | cut -d' ' -f1; }
 
 # Downloads the asset and the release checksums, refuses on any mismatch, then installs it atomically.
 download() (
