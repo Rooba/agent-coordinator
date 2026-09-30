@@ -10,5 +10,15 @@
   "homepage": "https://github.com/Rooba/agent-coordinator",
   "repository": "https://github.com/Rooba/agent-coordinator",
   "license": "MIT",
-  "keywords": ["agents", "multi-agent", "coordination", "messaging", "presence", "mcp"]
+  "keywords": [
+    "agents",
+    "multi-agent",
+    "coordination",
+    "messaging",
+    "presence",
+    "mcp"
+  ],
+  "privacyPolicyUrl": "https://github.com/Rooba/agent-coordinator/blob/main/packaging/claude-plugin/PRIVACY.md",
+  "documentationUrl": "https://github.com/Rooba/agent-coordinator/blob/main/docs/installation.md",
+  "supportUrl": "https://github.com/Rooba/agent-coordinator/issues"
 }
