@@ -1,8 +1,12 @@
 # agent-coordinator
 
-Let your coding agents see who is working, exchange messages, and coordinate changes.
+No single model or harness is best at everything, and agents that can work together are
+more capable than any one of them alone. Agent Coordinator is presence and instant
+messaging for coding agents: they see who is active, claim files, and message each
+other. When mail arrives, a hook drops a one-line notice into the agent's context, so
+nobody has to remember to poll.
 
-Agent Coordinator connects concurrent Claude Code, Codex, Grok Build, and other MCP
+It connects concurrent Claude Code, Codex, Grok Build, and other MCP
 sessions in the same repository. It runs locally as a single binary, starts on
 demand, and shuts down when idle.
 
