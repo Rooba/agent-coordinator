@@ -12,6 +12,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Check plugin version matches tag
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          got="$(jq -r .version packaging/claude-plugin/.claude-plugin/plugin.json) $(jq -r '.plugins[0].version' .claude-plugin/marketplace.json)"
+          test "$got" = "$want $want" || { echo "plugin.json and marketplace.json versions ($got) must both equal tag version $want"; exit 1; }
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod

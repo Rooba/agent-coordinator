@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Rooba/agent-coordinator/internal/hookcli"
 	"github.com/Rooba/agent-coordinator/internal/protocol"
 	"github.com/Rooba/agent-coordinator/internal/scope"
 )
@@ -131,10 +132,10 @@ func doJoin(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("%s", errMsg)
 	}
 	fmt.Fprintf(stdout, "[coordinator] you are '%s' in this workspace. Peer tools (MCP agent-coordinator): status_board, list_agents, send_message, read_messages, broadcast. "+
-		"To stay reachable while waiting or delegating, run: agent-coordinator wait '%s' -timeout 570 - it exits the moment new mail arrives. "+
+		"To stay reachable while waiting or delegating, run: %s wait '%s' -timeout 570 - it exits the moment new mail arrives. "+
 		"Background it only if your harness re-invokes you when a background task exits (Claude Code does; Codex does not); "+
 		"otherwise block on it in the foreground before yielding.\n",
-		resp.Name, resp.Name)
+		resp.Name, hookcli.WaitProgram(), resp.Name)
 	return nil
 }
 

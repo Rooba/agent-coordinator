@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -194,13 +195,30 @@ func Run(stdin io.Reader, stdout io.Writer, socketPath string) {
 		if resp.Name != "" {
 			emit(stdout, "SessionStart", fmt.Sprintf(
 				"[coordinator] you are '%s' in this workspace. Peer tools (MCP agent-coordinator): status_board, list_agents, send_message, read_messages, broadcast. "+
-					"To stay reachable while waiting on a peer, run: agent-coordinator wait '%s' -timeout 570 - it exits the moment a DM arrives. "+
+					"To stay reachable while waiting on a peer, run: %s wait '%s' -timeout 570 - it exits the moment a DM arrives. "+
 					"Run it in the FOREGROUND and block on it unless you know your harness starts a new turn when a background task exits "+
 					"(Claude Code does; Codex background terminals do NOT - they yield and never call you back). "+
 					"When it returns, call read_messages, then re-arm. Do not end your turn with an unread inbox and no armed wait.",
-				resp.Name, resp.Name))
+				resp.Name, WaitProgram(), resp.Name))
 		}
 	}
+}
+
+// WaitProgram names the binary to put in wait hints: the bare name when it is
+// on PATH (a plugin install is not), otherwise this executable's own path.
+func WaitProgram() string {
+	const name = "agent-coordinator"
+	if _, err := exec.LookPath(name); err == nil {
+		return name
+	}
+	exe, err := os.Executable()
+	switch {
+	case err != nil:
+		return name
+	case strings.Contains(exe, " "):
+		return `"` + exe + `"`
+	}
+	return exe
 }
 
 // preToolUse records that a tool is starting, and guards coordinator identity
@@ -307,14 +325,14 @@ func parentName(sc, sessionID, socketPath string) string {
 }
 
 // coordToolCall reports whether a tool call targets the named coordinator tool
-// - the MCP name, the hookless alias, or a generic use_tool wrapper naming it -
-// and the 'from' argument it carries (looking inside the wrapper's nested args).
+// (under its direct, plugin-scoped, or hookless server name, or via a use_tool
+// wrapper) and the 'from' argument it carries.
 func coordToolCall(tool string, input map[string]any, want string) (match bool, from string) {
 	str := func(m map[string]any, k string) string { s, _ := m[k].(string); return s }
-	switch tool {
-	case "mcp__agent-coordinator__" + want, "agent-coordinator__" + want:
+	switch server, named := strings.CutSuffix(tool, "__"+want); {
+	case named && strings.HasSuffix(server, "agent-coordinator"):
 		return true, str(input, "from")
-	case "use_tool":
+	case tool == "use_tool":
 		if n := str(input, "name"); n != want && !strings.HasSuffix(n, "__"+want) {
 			return false, ""
 		}

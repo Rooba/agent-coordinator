@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -93,6 +94,15 @@ func TestPostToolUseSilentWhenNoNotices(t *testing.T) {
 }
 
 func TestSessionStartIntroducesName(t *testing.T) {
+	// Pin PATH to a fake install so the hint names the bare program on any host.
+	bin, exe := t.TempDir(), "agent-coordinator"
+	if runtime.GOOS == "windows" {
+		exe += ".exe"
+	}
+	if err := os.WriteFile(filepath.Join(bin, exe), nil, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
 	sock, got := fakeDaemon(t, protocol.Response{OK: true, Name: "amber-fox"})
 	var out bytes.Buffer
 	Run(bytes.NewReader(fixture(t, "session_start.json")), &out, sock)
@@ -105,6 +115,28 @@ func TestSessionStartIntroducesName(t *testing.T) {
 	// The injection teaches the wake pattern with the agent's actual name.
 	if !strings.Contains(out.String(), "agent-coordinator wait 'amber-fox'") {
 		t.Fatalf("missing wake-pattern teaching: %s", out.String())
+	}
+}
+
+// Off PATH (a plugin install), the hint names this executable's absolute path.
+func TestSessionStartWaitHintUsesExecutableOffPath(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sock, _ := fakeDaemon(t, protocol.Response{OK: true, Name: "amber-fox"})
+	var out bytes.Buffer
+	Run(bytes.NewReader(fixture(t, "session_start.json")), &out, sock)
+	var env struct {
+		HookSpecificOutput struct{ AdditionalContext string } `json:"hookSpecificOutput"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &env); err != nil {
+		t.Fatalf("stdout %q: %v", out.String(), err)
+	}
+	ctx := env.HookSpecificOutput.AdditionalContext
+	if !strings.Contains(ctx, exe) || !strings.Contains(ctx, " wait 'amber-fox' -timeout 570") {
+		t.Fatalf("want wait hint naming %s: %s", exe, ctx)
 	}
 }
 
@@ -356,8 +388,8 @@ func TestPreToolUseAllowsSubagentReadWithFrom(t *testing.T) {
 	}
 }
 
-// The deny must also catch the tool-name variants foreign harnesses present:
-// the hookless alias and a generic use_tool wrapper naming read_messages.
+// The deny must also catch the other names read_messages arrives under: the
+// hookless alias, a use_tool wrapper, and the plugin-scoped MCP name.
 func TestPreToolUseDeniesBareSubagentReadVariants(t *testing.T) {
 	variants := map[string]string{
 		"alias": `{"session_id":"parent-sess","cwd":"/x","hook_event_name":"PreToolUse",` +
@@ -365,6 +397,9 @@ func TestPreToolUseDeniesBareSubagentReadVariants(t *testing.T) {
 			`"agent_id":"a828b0d3d8ca1b28e","agent_type":"Explore"}`,
 		"use_tool": `{"session_id":"parent-sess","cwd":"/x","hook_event_name":"PreToolUse",` +
 			`"tool_name":"use_tool","tool_input":{"name":"read_messages","args":{}},` +
+			`"agent_id":"a828b0d3d8ca1b28e","agent_type":"Explore"}`,
+		"plugin": `{"session_id":"parent-sess","cwd":"/x","hook_event_name":"PreToolUse",` +
+			`"tool_name":"mcp__plugin_agent-coordinator_agent-coordinator__read_messages","tool_input":{},` +
 			`"agent_id":"a828b0d3d8ca1b28e","agent_type":"Explore"}`,
 	}
 	for label, input := range variants {
@@ -389,6 +424,9 @@ func TestPreToolUseAllowsVariantsWithFrom(t *testing.T) {
 		"use_tool nested args": `{"session_id":"parent-sess","cwd":"/x","hook_event_name":"PreToolUse",` +
 			`"tool_name":"use_tool","tool_input":{"name":"read_messages","args":{"from":"quick-wolf/explore-1"}},` +
 			`"agent_id":"a828b0d3d8ca1b28e","agent_type":"Explore"}`,
+		"plugin": `{"session_id":"parent-sess","cwd":"/x","hook_event_name":"PreToolUse",` +
+			`"tool_name":"mcp__plugin_agent-coordinator_agent-coordinator__read_messages","tool_input":{"from":"quick-wolf/explore-1"},` +
+			`"agent_id":"a828b0d3d8ca1b28e","agent_type":"Explore"}`,
 	}
 	for label, input := range variants {
 		sock, got := fakeDaemonFunc(t, func(r protocol.Request) protocol.Response {
@@ -405,6 +443,21 @@ func TestPreToolUseAllowsVariantsWithFrom(t *testing.T) {
 		if len(*got) != 2 || (*got)[0].Op != protocol.OpWhoami || (*got)[1].Op != protocol.OpEvent {
 			t.Fatalf("%s: want parent-name lookup then start: %+v", label, *got)
 		}
+	}
+}
+
+// Only the coordinator's own server counts: another server's read_messages passes through.
+func TestPreToolUseIgnoresOtherServerRead(t *testing.T) {
+	sock, got := fakeDaemon(t, protocol.Response{OK: true})
+	var out bytes.Buffer
+	Run(strings.NewReader(`{"session_id":"parent-sess","cwd":"/x","hook_event_name":"PreToolUse",`+
+		`"tool_name":"mcp__other-server__read_messages","tool_input":{},`+
+		`"agent_id":"a828b0d3d8ca1b28e","agent_type":"Explore"}`), &out, sock)
+	if out.Len() != 0 {
+		t.Fatalf("other server's read must not deny: %s", out.String())
+	}
+	if len(*got) != 1 || (*got)[0].Op != protocol.OpEvent {
+		t.Fatalf("other server's read must only record a start: %+v", *got)
 	}
 }
 
@@ -472,6 +525,9 @@ func TestPreToolUseDeniesSubagentWhoamiVariants(t *testing.T) {
 			`"agent_id":"a828b0d3d8ca1b28e","agent_type":"Explore"}`,
 		"use_tool mcp name": `{"session_id":"parent-sess","cwd":"/x","hook_event_name":"PreToolUse",` +
 			`"tool_name":"use_tool","tool_input":{"name":"mcp__agent-coordinator__whoami"},` +
+			`"agent_id":"a828b0d3d8ca1b28e","agent_type":"Explore"}`,
+		"plugin": `{"session_id":"parent-sess","cwd":"/x","hook_event_name":"PreToolUse",` +
+			`"tool_name":"mcp__plugin_agent-coordinator_agent-coordinator__whoami","tool_input":{},` +
 			`"agent_id":"a828b0d3d8ca1b28e","agent_type":"Explore"}`,
 	}
 	for label, input := range variants {

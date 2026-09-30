@@ -1,0 +1,24 @@
+{
+  "name": "agent-coordinator",
+  "description": "Claude Code plugin for agent-coordinator: presence, status, and messaging for concurrent coding agents.",
+  "owner": {
+    "name": "Rooba",
+    "url": "https://github.com/Rooba"
+  },
+  "plugins": [
+    {
+      "name": "agent-coordinator",
+      "source": "./packaging/claude-plugin",
+      "description": "Presence, status, and messaging for concurrent coding agents sharing a workspace.",
+      "version": "0.5.0",
+      "keywords": [
+        "agents",
+        "multi-agent",
+        "coordination",
+        "messaging",
+        "presence",
+        "mcp"
+      ]
+    }
+  ]
+}

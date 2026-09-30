@@ -1,0 +1,13 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "agent-coordinator",
+  "version": "0.5.0",
+  "description": "Presence, status, and messaging for concurrent coding agents sharing a workspace.",
+  "author": {
+    "name": "Rooba",
+    "url": "https://github.com/Rooba"
+  },
+  "homepage": "https://github.com/Rooba/agent-coordinator",
+  "repository": "https://github.com/Rooba/agent-coordinator",
+  "keywords": ["agents", "multi-agent", "coordination", "messaging", "presence", "mcp"]
+}

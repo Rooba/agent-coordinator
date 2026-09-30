@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/Rooba/agent-coordinator/internal/hookcli"
 	"github.com/Rooba/agent-coordinator/internal/protocol"
 	"github.com/Rooba/agent-coordinator/internal/scope"
 )
@@ -319,7 +320,7 @@ func runSummon(args []string) {
 		line += " launcher=" + resp.Launcher.Name
 	}
 	if w, err := once(unixSockAddr(), protocol.Request{Op: protocol.OpWhoami, Scope: cwdScope(), SessionID: sid}); err == nil && w.Name != "" {
-		line += "\narm: agent-coordinator wait '" + w.Name + "'"
+		line += "\narm: " + hookcli.WaitProgram() + " wait '" + w.Name + "'"
 	}
 	fmt.Println(line)
 }

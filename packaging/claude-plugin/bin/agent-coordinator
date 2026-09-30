@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Runs the agent-coordinator release binary pinned by this plugin's version,
+# downloading it on first use.
+set -euo pipefail
+
+root="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+data="${CLAUDE_PLUGIN_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/agent-coordinator/plugin}"
+version="${AC_PLUGIN_VERSION:-$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+  "$root/.claude-plugin/plugin.json" 2>/dev/null || true)}"
+base="${AC_PLUGIN_RELEASE_URL:-https://github.com/Rooba/agent-coordinator/releases/download}/v$version"
+
+# Hooks fail open so sessions keep working offline; everything else reports one line.
+cmd="${1:-}"
+fail() {
+  [ "$cmd" = hook ] && exit 0
+  echo "agent-coordinator plugin: $1" >&2
+  exit 1
+}
+
+ext=""
+case "$(uname -s)" in
+  Linux) os=linux ;;
+  Darwin) os=darwin ;;
+  MINGW* | MSYS* | CYGWIN*) os=windows ext=.exe ;;
+  *) os="" ;;
+esac
+case "$(uname -m)" in
+  x86_64 | amd64) arch=amd64 ;;
+  aarch64 | arm64) arch=arm64 ;;
+  *) arch="" ;;
+esac
+asset="agent-coordinator_${os}_${arch}${ext}"
+target="$data/bin/agent-coordinator-$version$ext"
+
+# Fetches a URL into a file with curl, or wget when curl is absent.
+fetch() {
+  if command -v curl >/dev/null; then curl -fsSL --retry 2 -o "$2" "$1"; else wget -q -O "$2" "$1"; fi 2>/dev/null
+}
+
+# Prints the SHA-256 hex digest of a file.
+sha256() { { sha256sum "$1" 2>/dev/null || shasum -a 256 "$1"; } | cut -d' ' -f1; }
+
+# Downloads the asset, checks it against SHA256SUMS when the release has one, then installs it atomically.
+download() (
+  mkdir -p "$data/bin" && tmp="$(mktemp "$data/bin/.download.XXXXXX")" || exit 1
+  trap 'rm -f "$tmp" "$tmp.sums"' EXIT
+  fetch "$base/$asset" "$tmp" || exit 1
+  if fetch "$base/SHA256SUMS" "$tmp.sums"; then
+    want="$(awk -v a="$asset" '$2 == a || $2 == "*" a { print $1 }' "$tmp.sums")"
+    [ -n "$want" ] && [ "$want" = "$(sha256 "$tmp")" ] || exit 1
+  fi
+  chmod 755 "$tmp" && mv -f "$tmp" "$target"
+)
+
+[ -n "$version" ] || fail "no version found in $root/.claude-plugin/plugin.json"
+[ -n "$os" ] && [ -n "$arch" ] || fail "unsupported platform: $(uname -sm)"
+# A concurrent run may have installed the binary while this one was downloading.
+[ -x "$target" ] || download || [ -x "$target" ] || fail "could not download or verify $base/$asset"
+exec "$target" "$@"
