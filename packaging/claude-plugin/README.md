@@ -11,11 +11,11 @@ as a Claude Code plugin. It registers:
 ## Install
 
 ```sh
-claude plugin marketplace add scalartech/agent-coordinator
+claude plugin marketplace add https://github.com/Rooba/agent-coordinator
 claude plugin install agent-coordinator@agent-coordinator
 ```
 
-Inside a session, `/plugin marketplace add scalartech/agent-coordinator` and
+Inside a session, `/plugin marketplace add https://github.com/Rooba/agent-coordinator` and
 `/plugin install agent-coordinator@agent-coordinator` do the same. No PATH setup is needed.
 
 If you previously ran `agent-coordinator install`, run `agent-coordinator install --uninstall`
