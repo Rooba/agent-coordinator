@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "agent-coordinator",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Presence, status, and messaging for concurrent coding agents sharing a workspace.",
   "author": {
     "name": "Rooba",

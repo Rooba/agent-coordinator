@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   release:
@@ -15,11 +16,16 @@ jobs:
       - name: Check plugin version matches tag
         run: |
           want="${GITHUB_REF_NAME#v}"
-          got="$(jq -r .version packaging/claude-plugin/.claude-plugin/plugin.json) $(jq -r '.plugins[0].version' .claude-plugin/marketplace.json)"
-          test "$got" = "$want $want" || { echo "plugin.json and marketplace.json versions ($got) must both equal tag version $want"; exit 1; }
+          # Every plugin version field and pinned npm package must collapse to the one tag version.
+          got="$(jq -rs '[.[0].version, .[1].plugins[0].version, .[2].version, .[2].optionalDependencies[]] | unique | join(" ")' \
+            packaging/claude-plugin/.claude-plugin/plugin.json .claude-plugin/marketplace.json packaging/claude-plugin/package.json)"
+          test "$got" = "$want" || { echo "plugin.json, marketplace.json, and package.json versions ($got) must all equal tag version $want"; exit 1; }
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
       - name: Build binaries
         run: |
           mkdir -p dist
@@ -64,3 +70,34 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+      - name: Publish npm platform packages
+        if: vars.NPM_PUBLISH == 'true'
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Without a token, npm authenticates through OIDC trusted publishing.
+          if [ -n "$NPM_TOKEN" ]; then npm config set //registry.npmjs.org/:_authToken "$NPM_TOKEN"; fi
+          for target in linux/amd64 linux/arm64 windows/amd64 darwin/amd64 darwin/arm64; do
+            GOOS="${target%/*}"
+            GOARCH="${target#*/}"
+            ext=""
+            os="$GOOS"
+            cpu="$GOARCH"
+            if [ "$GOOS" = "windows" ]; then ext=".exe"; os="win32"; fi
+            if [ "$GOARCH" = "amd64" ]; then cpu="x64"; fi
+            name="agent-coordinator-cli-${os}-${cpu}"
+            # Skip versions already on the registry so a re-run only publishes what is missing.
+            if npm view "${name}@${VERSION}" version >/dev/null 2>&1; then
+              echo "${name}@${VERSION} is already published"
+              continue
+            fi
+            stage="$(mktemp -d)"
+            jq --arg n "$name" --arg v "$VERSION" --arg os "$os" --arg cpu "$cpu" --arg f "agent-coordinator${ext}" \
+              '.name = $n | .version = $v | .os = [$os] | .cpu = [$cpu] | .files = [$f]' \
+              packaging/npm/package.json > "$stage/package.json"
+            cp packaging/npm/README.md LICENSE "$stage/"
+            install -m 0755 "dist/agent-coordinator_${GOOS}_${GOARCH}${ext}" "$stage/agent-coordinator${ext}"
+            npm publish "$stage" --access public --provenance
+            rm -rf "$stage"
+          done

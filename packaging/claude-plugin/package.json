@@ -1,0 +1,14 @@
+{
+  "name": "agent-coordinator-plugin",
+  "version": "0.5.1",
+  "private": true,
+  "description": "Pins the platform-specific agent-coordinator binaries that Claude Code installs with this plugin.",
+  "license": "MIT",
+  "optionalDependencies": {
+    "agent-coordinator-cli-darwin-arm64": "0.5.1",
+    "agent-coordinator-cli-darwin-x64": "0.5.1",
+    "agent-coordinator-cli-linux-arm64": "0.5.1",
+    "agent-coordinator-cli-linux-x64": "0.5.1",
+    "agent-coordinator-cli-win32-x64": "0.5.1"
+  }
+}
