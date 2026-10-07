@@ -1,0 +1,20 @@
+{
+  "name": "agent-coordinator-cli-PLATFORM",
+  "version": "0.0.0",
+  "description": "Platform-specific agent-coordinator binary installed by the agent-coordinator Claude Code plugin.",
+  "license": "MIT",
+  "author": "Rooba",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Rooba/agent-coordinator"
+  },
+  "homepage": "https://github.com/Rooba/agent-coordinator",
+  "os": [],
+  "cpu": [],
+  "files": [
+    "agent-coordinator"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

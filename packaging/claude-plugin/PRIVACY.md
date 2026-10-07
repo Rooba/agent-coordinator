@@ -29,10 +29,13 @@ exits after ten idle minutes. Delete the database file to remove everything.
 
 ## Network access
 
-- On first use, and after a version bump, the launcher downloads the release binary and its
-  `SHA256SUMS` from GitHub Releases and verifies the checksum. No user data is sent.
+- The plugin makes no network requests of its own. Claude Code installs its pinned npm
+  packages, which hold the platform binary, when the plugin is installed.
 - The cross-workspace relay and the Windows eyes bridge are optional and connect only to
   endpoints you configure yourself.
+- Running `agent-coordinator eyes-setup` on WSL downloads the Windows host program from the
+  project's GitHub Releases and verifies it against the release checksums. Nothing runs that
+  command unless you do.
 
 ## Personal data and credentials
 

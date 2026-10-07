@@ -21,4 +21,8 @@ uninstall:
 clean:
 	rm -f $(BIN) $(BIN).exe
 
-.PHONY: build build-windows test install uninstall clean
+# Needs the npm packages for the pinned plugin version to be published first.
+plugin-lock:
+	cd packaging/claude-plugin && npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+
+.PHONY: build build-windows test install uninstall clean plugin-lock

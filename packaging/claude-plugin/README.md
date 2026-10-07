@@ -23,26 +23,28 @@ first, or every hook fires twice.
 
 ## How the binary arrives
 
-`scripts/agent-coordinator` is a small bash launcher. On first use it downloads the release
-binary matching the plugin version from GitHub Releases into
-`${CLAUDE_PLUGIN_DATA}/bin/agent-coordinator-<version>` (outside Claude Code:
-`${XDG_DATA_HOME:-~/.local/share}/agent-coordinator/plugin/bin`). The download is verified
-against the release's `SHA256SUMS` and refused on a mismatch or a missing checksum file. Later runs reuse the
-cached binary. Windows needs Git Bash, which Claude Code already requires there.
+The binary ships as one npm package per platform: `agent-coordinator-cli-linux-x64`,
+`-linux-arm64`, `-darwin-x64`, `-darwin-arm64`, and `-win32-x64`, built and published with
+provenance by this repository's release workflow. `package.json` lists them as optional
+dependencies and `package-lock.json` pins each to an exact version and integrity hash. When the
+plugin is installed, Claude Code installs the package for your platform with install scripts
+disabled, into `${CLAUDE_PLUGIN_ROOT}/node_modules/agent-coordinator-cli-<os>-<cpu>/`.
 
-Offline, hooks exit 0 silently so sessions keep working; the MCP server reports one error line.
+`scripts/agent-coordinator` is a small bash launcher that runs that binary. The plugin makes no
+network requests of its own. Windows needs Git Bash, which Claude Code already requires there.
 
-What the plugin stores locally, for how long, and its only network access are described in
+If the binary is missing, hooks exit 0 silently so sessions keep working, and the MCP server
+reports one error line asking you to reinstall the plugin.
+
+What the plugin stores locally, for how long, and what reaches the network are described in
 [PRIVACY.md](PRIVACY.md).
-
-Environment overrides:
-
-- `AC_PLUGIN_VERSION` - release version to run instead of the one in `plugin.json`.
-- `AC_PLUGIN_RELEASE_URL` - release download base (default
-  `https://github.com/Rooba/agent-coordinator/releases/download`).
 
 ## Releasing
 
-Bump `version` in `.claude-plugin/plugin.json` here and in the repository root
-`.claude-plugin/marketplace.json`, then tag `v<version>`. The release workflow refuses a tag
-that does not match the plugin version.
+1. Bump `version` in `.claude-plugin/plugin.json` here, in the repository root
+   `.claude-plugin/marketplace.json`, and in `package.json` (its `version` and every
+   `optionalDependencies` entry).
+2. Tag `v<version>` and push the tag. The release workflow refuses a tag that does not match
+   these versions; otherwise it builds the release and publishes the npm packages.
+3. Run `make plugin-lock` from the repository root, commit `package-lock.json`, push, and
+   resubmit the plugin to the directory.
