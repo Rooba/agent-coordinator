@@ -6,7 +6,7 @@
   "author": "Rooba",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Rooba/agent-coordinator"
+    "url": "git+https://github.com/Rooba/agent-coordinator.git"
   },
   "homepage": "https://github.com/Rooba/agent-coordinator",
   "os": [],
