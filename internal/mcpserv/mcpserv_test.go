@@ -167,6 +167,11 @@ func TestInitializeAndList(t *testing.T) {
 		!strings.Contains(out[0], "agent-coordinator") || !strings.Contains(out[0], `"instructions"`) {
 		t.Fatalf("initialize: %s", out[0])
 	}
+	for _, want := range []string{"mail notification arrives, call read_messages", "wake: monitor, do not arm wait", "always for subagents", " wait '\\u003cyour name\\u003e' -timeout 570"} {
+		if !strings.Contains(out[0], want) {
+			t.Fatalf("instructions missing wake rule %q: %s", want, out[0])
+		}
+	}
 	for _, tool := range []string{
 		"register_agent", "whoami", "status_board", "list_agents", "send_message",
 		"read_messages", "peek_messages", "broadcast", "claim", "release",
@@ -376,11 +381,11 @@ func TestWhoamiReturnsBoundIdentity(t *testing.T) {
 	dir := stubBind(t, []int{999, 500})
 	hookcli.WriteBind(dir, hookcli.Bind{SessionID: "claude-uuid-1", Scope: scope.Resolve(cwd),
 		Name: "quick-wolf", Pids: []int{500}, TS: time.Now().Unix()})
-	sock, got := fakeDaemon(t, protocol.Response{OK: true, Name: "quick-wolf", AgentID: "abc123", Source: "hook"})
+	sock, got := fakeDaemon(t, protocol.Response{OK: true, Name: "quick-wolf", AgentID: "abc123", Source: "hook", Wake: "monitor"})
 	out := rpc(t, sock,
 		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"whoami","arguments":{}}}`)
 	// The identity JSON is nested in the RPC envelope, so its quotes arrive escaped.
-	for _, want := range []string{`\"name\": \"quick-wolf\"`, `\"agent_id\": \"abc123\"`, `\"source\": \"hook\"`} {
+	for _, want := range []string{`\"name\": \"quick-wolf\"`, `\"agent_id\": \"abc123\"`, `\"source\": \"hook\"`, `\"wake\": \"monitor\"`} {
 		if !strings.Contains(out[0], want) {
 			t.Fatalf("whoami output missing %s: %s", want, out[0])
 		}

@@ -45,6 +45,7 @@ One binary, several subcommands:
   deny a subagent's attempt to read the parent's messages.
 - `mcp` - stdio MCP server exposing the peer tools, backed by the same socket.
 - `wait` - blocks until **new** mail arrives for an agent (see wake pattern).
+- `watch` - session-long mail monitor; prints one stdout line per unread batch (see wake pattern).
 - `join` - one-shot register + print the SessionStart injection line (for
   harnesses without hooks, or manual bootstrap).
 - `board` - print the workspace board (`--live` active+idle only, `--all`
@@ -88,6 +89,19 @@ respawned by the next event. A stamp file next to the socket
 client processes, and the daemon takes an OS file lock (`<sock>.lock`)
 before binding, so racing spawns self-resolve - the losers exit quietly. On
 Linux, systemd socket activation still works as an optional nicety.
+
+There is no restart subcommand. The process that bound the socket keeps
+serving until it idle-exits (10 minutes) or is stopped. A daemon built
+before the watcher flag ignores that flag, so `wake` stays `manual` until
+a client of the new binary is the one that spawns the replacement. Stop
+the listener, then run any command from the new binary (`board` is
+enough):
+
+```
+sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/agent-coordinator.sock"
+[ -S "$sock" ] || sock="/tmp/agent-coordinator-$(id -u)/agent-coordinator.sock"
+if [ -S "$sock" ]; then kill "$(lsof -t -- "$sock" | head -1)"; fi
+```
 
 The push path: agent B calls `send_message`. The next time agent A
 finishes any tool call, A's PostToolUse hook reports the event and the
@@ -149,7 +163,44 @@ on exit, so under Codex the wait must be run in the FOREGROUND as the
 last action of the turn. Wait for the `armed` line, then delegate; if
 the process is killed or times out, promptly re-arm it. The SessionStart
 injection (or `agent-coordinator join`) teaches every agent this pattern
-with its own name filled in.
+with its own name filled in. A live mail monitor suppresses that reminder
+on a later prompt: the UserPromptSubmit hook says the monitor is armed only
+while a watcher peek is fresh.
+
+### Session mail monitor (`watch`)
+
+```
+agent-coordinator watch [<name>] [-interval <seconds>] [-quiet <seconds>]
+```
+
+`watch` is the process a harness monitor keeps running for the session.
+With no name it resolves the agent the same way the MCP server does:
+workspace scope plus pid ancestry, retrying until the SessionStart hook
+writes the bind file (1s, backing off to 5s). An explicit name skips that
+lookup. Stderr prints `watch: bound as <name>` once.
+
+`watch <name>` uses the same per-name cursor file as `wait` for that
+name. A monitor started with no name keeps a separate cursor keyed by
+the bound session, so it does not resume or advance the manual `wait`
+checkpoint. Stdout is one `mail from=<names> count=N ids=...` line per
+batch, after a quiet window (default 1 second) so a burst is a single
+line. Both flags are integer seconds, same as `wait -timeout`. A newer
+id prints again even while older mail is still unread. The set of ids
+this process has already printed stays in memory only, so a restart
+announces mail that is still unread. The durable cursor advances only
+after that mail is consumed, same as `wait`.
+
+Each peek is marked as a watcher. For about 10 seconds after the last peek
+the session reports `wake: monitor` from `whoami` and `status_board`;
+otherwise `wake: manual`. The process exits on SIGTERM, SIGINT, or a closed
+stdout. A daemon gap retries with backoff and writes at most one stderr
+note; stdout stays empty until there is mail.
+
+The Claude Code plugin starts this command from `monitors/monitors.json`
+when that host runs plugin monitors (interactive session, Monitor tool
+available, v2.1.105+; not from a project-scope plugin). The Codex, Kimi
+Code CLI, Cursor, Gemini CLI, and OpenCode installs in this repo, and any
+Claude Code session with no live monitor, keep `wait`.
 
 ### Bootstrap without hooks (`join`)
 

@@ -75,7 +75,85 @@ there too.
 
 The plugin registers the same ten Claude Code hooks and the same
 `agent-coordinator` MCP server as `agent-coordinator install`, plus a skill with
-the usage guide. No PATH setup or separate binary download is needed.
+the usage guide, plus one session monitor. No PATH setup or separate binary
+download is needed.
+
+#### Mail monitor
+
+`monitors/monitors.json` declares a monitor named `mail`. Its command is
+`bash "${CLAUDE_PLUGIN_ROOT}/scripts/agent-coordinator" watch`. On Claude Code
+v2.1.105 and later, an interactive session starts that process when the
+Monitor tool is available, and each stdout line becomes a task notification
+(`mail from=... count=N ids=...`). The default trigger is `always`: session
+start and plugin reload. The agent calls `read_messages` and does not also
+arm `wait` while `whoami` reports `wake: monitor`.
+
+Claude Code skips the monitor in noninteractive `claude -p` sessions, and in
+sessions where the API provider or telemetry settings make the Monitor tool
+unavailable. A project-scope plugin (enabled from the repository) does not
+load background monitors; a personal-scope install does. Those limits are
+Claude Code's, from the [monitors component](https://code.claude.com/docs/en/plugins/components#monitors)
+and the [loading reference](https://code.claude.com/docs/en/plugins/loading).
+`agent-coordinator install` only writes hooks and MCP config, so that setup
+keeps the manual `wait` wake. A skipped monitor leaves `wake: manual`, and
+the SessionStart line still tells the agent to arm `wait`.
+
+Grok Build can arm `agent-coordinator watch` once through its own monitor
+tool (`persistent: true`). The Codex, Kimi Code CLI, Cursor, Gemini CLI, and
+OpenCode installs in this repo keep `wait`.
+
+#### Try the monitor from this tree
+
+Use an interactive session. The published npm package will not contain
+`watch` until the next release, so point the plugin launcher at a binary
+built from this tree. The launcher looks up
+`${CLAUDE_PLUGIN_ROOT}/node_modules/agent-coordinator-cli-<os>-<cpu>/agent-coordinator`
+(`linux-x64`, `linux-arm64`, `darwin-x64`, `darwin-arm64`, or `win32-x64`;
+`.exe` on Windows). That `node_modules` directory is gitignored.
+
+```
+mkdir -p packaging/claude-plugin/node_modules/agent-coordinator-cli-linux-x64
+go build -o packaging/claude-plugin/node_modules/agent-coordinator-cli-linux-x64/agent-coordinator ./cmd/agent-coordinator
+```
+
+If `agent-coordinator install` already merged hooks into `~/.claude/settings.json`,
+remove them first or every hook fires twice:
+
+```
+agent-coordinator install --uninstall
+```
+
+Remove a previously installed copy of this plugin, then add this repo as a
+marketplace and install the plugin at user scope (the marketplace name is
+`agent-coordinator`):
+
+```
+claude plugin uninstall agent-coordinator@agent-coordinator
+claude plugin marketplace add /absolute/path/to/agent-coordinator-go
+claude plugin install agent-coordinator@agent-coordinator --scope user
+```
+
+A marketplace added from a local path loads the plugin in place, so the next
+session start or `/reload-plugins` picks up source edits. The default monitor
+trigger starts on that reload. A copied plugin that updates mid-session keeps
+the previous monitor binary until the next session.
+
+The daemon already running is the old binary until it is stopped. That
+process ignores the watcher flag, so `wake` stays `manual`. There is no
+restart subcommand. Stop the listener on the socket, then let the new
+binary spawn the replacement:
+
+```
+sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/agent-coordinator.sock"
+[ -S "$sock" ] || sock="/tmp/agent-coordinator-$(id -u)/agent-coordinator.sock"
+if [ -S "$sock" ]; then kill "$(lsof -t -- "$sock" | head -1)"; fi
+packaging/claude-plugin/node_modules/agent-coordinator-cli-linux-x64/agent-coordinator board >/dev/null
+```
+
+After SessionStart writes the bind file, the task panel shows `mail`
+("coordinator mail: DMs from peer agents") and `whoami` reports
+`wake: monitor`. If that task is absent, the host skipped monitors: arm
+`wait` as before.
 
 The binary ships as one npm package per platform (`agent-coordinator-cli-<os>-<cpu>`
 for linux-x64, linux-arm64, darwin-x64, darwin-arm64, and win32-x64), built and

@@ -39,4 +39,5 @@ Thumbs.db
 /pkg/mod/
 
 /agent-coordinator
-/.ignore//packaging/claude-plugin/node_modules/
+/.ignore/
+/packaging/claude-plugin/node_modules/

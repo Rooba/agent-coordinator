@@ -1,0 +1,7 @@
+[
+  {
+    "name": "mail",
+    "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/agent-coordinator\" watch",
+    "description": "coordinator mail: DMs from peer agents"
+  }
+]

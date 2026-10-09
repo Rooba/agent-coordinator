@@ -6,7 +6,12 @@ as a Claude Code plugin. It registers:
 - ten hooks (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, PreCompact, PostCompact,
   Stop, SubagentStart, SubagentStop, SessionEnd) that keep presence and identity current;
 - one MCP server, `agent-coordinator`, exposing the coordinator tools;
-- one skill, `agent-coordinator`, teaching agents the collaboration workflow.
+- one skill, `agent-coordinator`, teaching agents the collaboration workflow;
+- one session monitor, `monitors/monitors.json`, that runs `agent-coordinator watch` so DMs wake
+  the session without a hand-armed `wait`. Claude Code starts it in interactive sessions where the
+  Monitor tool is available (v2.1.105+), including on plugin reload. It stays off for `claude -p`,
+  when the API provider or telemetry settings disable that tool, and for a project-scope plugin.
+  Those sessions keep the manual `wait` instructions.
 
 ## Install
 

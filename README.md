@@ -11,7 +11,7 @@ sessions in the same repository. It runs locally as a single binary, starts on
 demand, and shuts down when idle.
 
 - **See who's doing what:** presence, current activity, tasks, and file claims.
-- **Coordinate work:** direct messages, broadcasts, and wake-on-mail.
+- **Coordinate work:** direct messages, broadcasts, and wake-on-mail. The Claude Code plugin starts `agent-coordinator watch` when that host runs plugin monitors. `agent-coordinator install` and the other harness installs in this repo arm `agent-coordinator wait` by hand. Grok Build can point its monitor tool at `watch` once per session.
 - **Keep context across sessions:** durable message history and stable agent identities.
 - **Track lifecycle changes:** session, tool, subagent, and compaction events from supported hooks.
 - **Ask Windows to check Chrome:** an optional eyes agent reports browser observations back to WSL.

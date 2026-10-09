@@ -55,6 +55,9 @@ type Request struct {
 	// this value. Wait baselines on HighWater at arm time so stale backlog
 	// never wakes; only newer mail does.
 	AfterID int64 `json:"after_id,omitempty"`
+	// Watcher marks an OpPeek as coming from a session's persistent mail
+	// monitor, so the daemon can report that the session wakes on its own.
+	Watcher bool `json:"watcher,omitempty"`
 	// OnlyIfNoHook makes OpRegister refuse to mint a new identity while the
 	// scope has live hook-registered agents (the caller should bind instead).
 	OnlyIfNoHook bool `json:"only_if_no_hook,omitempty"`
@@ -204,6 +207,8 @@ type AgentInfo struct {
 	Origin       string   `json:"origin,omitempty"`
 	Platform     string   `json:"platform,omitempty"`
 	Capabilities []string `json:"capabilities,omitempty"`
+	// Wake is "monitor" while the agent's mail monitor polls, else "manual" (it arms wait itself).
+	Wake string `json:"wake,omitempty"`
 }
 
 // EyesTaskInfo is one eyes task rendered for a reader. Elapsed and Remaining
@@ -292,6 +297,10 @@ type Response struct {
 	AgentID string `json:"agent_id,omitempty"`
 	Source  string `json:"source,omitempty"`
 	Parent  string `json:"parent,omitempty"`
+	Wake    string `json:"wake,omitempty"` // whoami: "monitor" | "manual", as on AgentInfo
+	// MonitorArmed is set once on a UserPromptSubmit event answer when the
+	// session's mail monitor is live, so the hook tells the model one time.
+	MonitorArmed bool `json:"monitor_armed,omitempty"`
 	// Claims / History carry the claims-ledger and message-journal listings.
 	Claims  []ClaimInfo   `json:"claims,omitempty"`
 	History []HistoryInfo `json:"history,omitempty"`

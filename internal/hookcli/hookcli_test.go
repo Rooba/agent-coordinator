@@ -816,3 +816,28 @@ func TestFirstChildPreToolUseIntroducesWithoutEatingMail(t *testing.T) {
 		t.Fatalf("parent Stop should still see the notice: %s", out.String())
 	}
 }
+
+func TestUserPromptSubmitAnnouncesArmedMonitorOnlyWhenDaemonSaysSo(t *testing.T) {
+	const input = `{"session_id":"s1","cwd":"/home/user/agent-coordinator-go","hook_event_name":"UserPromptSubmit","prompt":"go"}`
+	t.Setenv("CLAUDE_PLUGIN_ROOT", "/plugin") // install type alone must never claim armed
+	for _, armed := range []bool{false, true} {
+		sock, _ := fakeDaemon(t, protocol.Response{OK: true, MonitorArmed: armed})
+		var out bytes.Buffer
+		Run(strings.NewReader(input), &out, sock)
+		if got := strings.Contains(out.String(), "your mail monitor is armed"); got != armed {
+			t.Fatalf("armed=%v: stdout %q", armed, out.String())
+		}
+		if armed && !strings.Contains(out.String(), "do not arm wait") {
+			t.Fatalf("armed notice must tell the model to stop arming wait: %s", out.String())
+		}
+	}
+}
+
+func TestUserPromptSubmitFromSubagentTargetsChildRow(t *testing.T) {
+	const input = `{"session_id":"s1","cwd":"/home/user/agent-coordinator-go","hook_event_name":"UserPromptSubmit","prompt":"go","agent_id":"kid","agent_type":"worker"}`
+	sock, got := fakeDaemon(t, protocol.Response{OK: true})
+	Run(strings.NewReader(input), &bytes.Buffer{}, sock)
+	if len(*got) != 1 || (*got)[0].AgentID != "kid" || (*got)[0].AgentType != "worker" {
+		t.Fatalf("child prompt must carry its subagent fields so the daemon never treats it as the parent: %+v", *got)
+	}
+}

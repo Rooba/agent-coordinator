@@ -18,6 +18,7 @@ import (
 	"github.com/Rooba/agent-coordinator/internal/paths"
 	"github.com/Rooba/agent-coordinator/internal/protocol"
 	"github.com/Rooba/agent-coordinator/internal/scope"
+	"github.com/Rooba/agent-coordinator/internal/wake"
 )
 
 // runWait blocks until the named agent receives mail newer than its durable
@@ -59,22 +60,7 @@ func runWait(args []string) {
 		fmt.Println("timeout")
 		os.Exit(1)
 	}
-	from := strings.Join(result.Froms, ",")
-	if from == "" {
-		from = "?"
-	}
-	ids := make([]string, len(result.IDs))
-	for i, id := range result.IDs {
-		ids[i] = fmt.Sprintf("%d", id)
-	}
-	fmt.Printf("mail from=%s count=%d ids=%s\n", from, result.Unread, strings.Join(ids, ","))
-}
-
-// waitResult is the machine-parseable summary printed on a successful wake.
-type waitResult struct {
-	Unread int
-	IDs    []int64
-	Froms  []string
+	fmt.Println(wake.Line(result))
 }
 
 // A checkpoint survives ordinary timeouts and killed waiter processes, but
@@ -86,32 +72,32 @@ const waitStateTTL = 24 * time.Hour
 // leaves it behind the unread delivery until a later quiet peek proves the
 // mail was consumed. Definitive daemon refusals fail fast, while transport
 // failures remain misses because the daemon may be idle-restarting.
-func waitForMail(socketPath, statePath, sc, name string, timeout, interval time.Duration, armed func(int64)) (waitResult, bool, error) {
+func waitForMail(socketPath, statePath, sc, name string, timeout, interval time.Duration, armed func(int64)) (wake.Info, bool, error) {
 	now := time.Now()
 	deadline := now.Add(timeout)
 	afterID, ok := loadWaitState(statePath, now)
 	if !ok {
-		switch info, err := peekOnce(socketPath, sc, name, 0); {
+		switch info, err := peekOnce(socketPath, protocol.Request{Scope: sc, From: name}); {
 		case err == nil:
 			afterID = info.HighWater
 		case errors.As(err, new(daemonErr)):
-			return waitResult{}, false, err
+			return wake.Info{}, false, err
 		}
 		if err := saveWaitState(statePath, afterID); err != nil {
-			return waitResult{}, false, fmt.Errorf("save arm state: %w", err)
+			return wake.Info{}, false, fmt.Errorf("save arm state: %w", err)
 		}
 	} else if err := os.Chtimes(statePath, now, now); err != nil {
-		return waitResult{}, false, fmt.Errorf("refresh arm state: %w", err)
+		return wake.Info{}, false, fmt.Errorf("refresh arm state: %w", err)
 	}
 	if armed != nil {
 		armed(afterID)
 	}
 	for {
-		info, err := peekOnce(socketPath, sc, name, afterID)
+		info, err := peekOnce(socketPath, protocol.Request{Scope: sc, From: name, AfterID: afterID})
 		if err == nil && info.Unread > 0 {
 			// Do not checkpoint unread mail before the wake reaches the harness.
 			// If this process dies now, its replacement must see the same mail.
-			return waitResult{Unread: info.Unread, IDs: info.IDs, Froms: info.Froms}, true, nil
+			return info, true, nil
 		}
 		if err == nil && info.HighWater > afterID {
 			// Deliveries above the cursor have already been consumed. Advancing
@@ -119,14 +105,14 @@ func waitForMail(socketPath, statePath, sc, name string, timeout, interval time.
 			// ever checkpointing past unread mail.
 			afterID = info.HighWater
 			if err := saveWaitState(statePath, afterID); err != nil {
-				return waitResult{}, false, fmt.Errorf("advance consumed state: %w", err)
+				return wake.Info{}, false, fmt.Errorf("advance consumed state: %w", err)
 			}
 		}
 		if errors.As(err, new(daemonErr)) {
-			return waitResult{}, false, err
+			return wake.Info{}, false, err
 		}
 		if time.Now().After(deadline) {
-			return waitResult{}, false, nil
+			return wake.Info{}, false, nil
 		}
 		time.Sleep(interval)
 	}
@@ -196,43 +182,37 @@ func retryWaitStateRename(rename func() error, onWindows bool, sleep func(time.D
 	}
 }
 
-type peekInfo struct {
-	Unread    int
-	HighWater int64
-	IDs       []int64
-	Froms     []string
-}
-
 // daemonErr is a definitive refusal from a live daemon (e.g. "no agent X in
 // this workspace"), as opposed to a transient transport failure.
 type daemonErr string
 
 func (e daemonErr) Error() string { return string(e) }
 
-func peekOnce(socketPath, sc, name string, afterID int64) (peekInfo, error) {
+// peekOnce asks the daemon for unread mail above req.AfterID as the identity
+// req carries (From, or SessionID for a bound monitor).
+func peekOnce(socketPath string, req protocol.Request) (wake.Info, error) {
 	conn, err := dialer.Dial(socketPath, time.Second)
 	if err != nil {
-		return peekInfo{}, err
+		return wake.Info{}, err
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(2 * time.Second))
-	b, err := json.Marshal(protocol.Request{
-		Op: protocol.OpPeek, Scope: sc, From: name, AfterID: afterID,
-	})
+	req.Op = protocol.OpPeek
+	b, err := json.Marshal(req)
 	if err != nil {
-		return peekInfo{}, err
+		return wake.Info{}, err
 	}
 	if _, err := conn.Write(append(b, '\n')); err != nil {
-		return peekInfo{}, err
+		return wake.Info{}, err
 	}
 	var resp protocol.Response
 	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		return peekInfo{}, err
+		return wake.Info{}, err
 	}
 	if !resp.OK {
-		return peekInfo{}, daemonErr(resp.Error)
+		return wake.Info{}, daemonErr(resp.Error)
 	}
-	return peekInfo{
+	return wake.Info{
 		Unread: resp.Unread, HighWater: resp.HighWater,
 		IDs: resp.PeekIDs, Froms: resp.PeekFroms,
 	}, nil

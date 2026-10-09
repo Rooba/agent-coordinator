@@ -65,13 +65,6 @@ func sha256Hex(v string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// live reports whether a row is active or idle - the two states that mean
-// somebody is there.
-func (s *Store) live(explicit string, lastSeen int64) bool {
-	st := s.freshStatus(explicit, lastSeen)
-	return st == "active" || st == "idle"
-}
-
 // RelayRegistration is a registration that names its own role: a host broker
 // claiming its launcher row, or an eyes child claiming a row in the
 // requesting workspace. Secret re-claims a session that already exists.
@@ -297,7 +290,8 @@ func (s *Store) VerifyRelaySecret(sessionID, secret string) (RelayIdentity, erro
 // agent, counted by kind. Reserved host: scopes are hidden - they are broker
 // plumbing, and ListEyes is where they belong.
 func (s *Store) ListWorkspaces() ([]protocol.WorkspaceInfo, error) {
-	rows, err := s.db.Query(`SELECT scope, status, last_seen, kind FROM agents ORDER BY scope, registered_at`)
+	w := s.watchedNow()
+	rows, err := s.db.Query(`SELECT scope, agent_id, status, last_seen, kind FROM agents ORDER BY scope, registered_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -305,12 +299,12 @@ func (s *Store) ListWorkspaces() ([]protocol.WorkspaceInfo, error) {
 	byScope := map[string]*protocol.WorkspaceInfo{}
 	var order []string
 	for rows.Next() {
-		var scope, explicit, kind string
+		var scope, aid, explicit, kind string
 		var seen int64
-		if err := rows.Scan(&scope, &explicit, &seen, &kind); err != nil {
+		if err := rows.Scan(&scope, &aid, &explicit, &seen, &kind); err != nil {
 			return nil, err
 		}
-		if strings.HasPrefix(scope, hostScopePrefix) || !s.live(explicit, seen) {
+		if strings.HasPrefix(scope, hostScopePrefix) || !s.live(w, scope, aid, explicit, seen) {
 			continue
 		}
 		w := byScope[scope]
@@ -345,6 +339,7 @@ func (s *Store) ListWorkspaces() ([]protocol.WorkspaceInfo, error) {
 // broker up?" and "is a child already running?". An empty list means the
 // broker is not connected.
 func (s *Store) ListEyes() ([]protocol.AgentInfo, error) {
+	w := s.watchedNow()
 	rows, err := s.db.Query(`SELECT scope, agent_id, name, status, last_seen, kind, origin, platform, caps
 		FROM agents WHERE kind IN (?,?) ORDER BY scope, registered_at`,
 		protocol.KindEyes, protocol.KindLauncher)
@@ -360,10 +355,10 @@ func (s *Store) ListEyes() ([]protocol.AgentInfo, error) {
 			&a.Kind, &a.Origin, &a.Platform, &capsJSON); err != nil {
 			return nil, err
 		}
-		if !s.live(explicit, a.LastSeen) {
+		a.Status = s.freshStatus(w, a.Scope, a.AgentID, explicit, a.LastSeen)
+		if a.Status != "active" && a.Status != "idle" {
 			continue
 		}
-		a.Status = s.freshStatus(explicit, a.LastSeen)
 		json.Unmarshal([]byte(capsJSON), &a.Capabilities)
 		out = append(out, a)
 	}

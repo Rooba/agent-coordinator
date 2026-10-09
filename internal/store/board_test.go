@@ -102,7 +102,7 @@ func TestBoardSnapshotKeepsScopedLatestState(t *testing.T) {
 		t.Fatalf("purged parent remained: %+v", board[0])
 	}
 	got := board[1]
-	want := protocol.AgentInfo{AgentID: agentID("plain"), Name: plain, Status: "active", LastSeen: 1001}
+	want := protocol.AgentInfo{AgentID: agentID("plain"), Name: plain, Status: "active", LastSeen: 1001, Wake: WakeManual}
 	if len(got.Capabilities)+len(got.Files)+len(got.Claims) != 0 {
 		t.Fatalf("unenriched row gained optional fields: %+v", got)
 	}

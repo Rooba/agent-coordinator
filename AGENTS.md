@@ -4,7 +4,7 @@ This workspace is served by the **agent-coordinator**: a lightweight presence + 
 lets multiple agents and sessions see each other and collaborate without colliding. When more than
 one agent or session may share a workspace, USING IT IS NOT OPTIONAL - it markedly improves speed and
 prevents duplicated or conflicting work. The tools below are exposed via the `agent-coordinator`
-MCP server; the `agent-coordinator` CLI provides the `wait` wake-lever.
+MCP server; the `agent-coordinator` CLI provides wake-on-mail (`watch` when a harness monitor is running, `wait` otherwise).
 
 ## Commit checkpoints
 
@@ -53,11 +53,26 @@ details are in the coordinator's [eyes guide](https://github.com/Rooba/agent-coo
 
 ## Wake pattern (be woken, do not busy-poll)
 
-Run `agent-coordinator wait '<yourname>' -timeout <sec>` (default 570s). Once stderr prints
-`armed after_id=N`, its durable cursor covers messages across a killed or timed-out waiter;
-promptly re-arm either one. On success stdout is `mail from=... count=N ids=...`; on timeout it is
-`timeout` (exit 1). Treat exit 0 as a WAKE SIGNAL, promptly confirm with `read_messages`, then
-re-arm; the next quiet peek advances past the mail you consumed.
+Use a mail monitor when one is actually running. Otherwise arm `wait` yourself. `whoami` and
+`status_board` report `wake: monitor` or `wake: manual`. A plugin install, or `CLAUDE_PLUGIN_ROOT`,
+does not by itself mean the monitor started.
+
+**Monitor.** When Claude Code is actually running this plugin's `mail` monitor, each stdout line
+`mail from=... count=N ids=...` is new mail: call `read_messages` and continue. Do not also arm
+`wait`. One UserPromptSubmit line says the monitor is armed while the watcher is live. Claude Code
+starts it on interactive sessions (v2.1.105+) where the Monitor tool is available, including on
+plugin reload; it skips noninteractive `claude -p` and sessions whose API provider or telemetry
+settings disable that tool. A project-scope plugin does not load background monitors.
+`agent-coordinator install` writes hooks only, so it keeps manual `wait`. Grok Build can arm
+`agent-coordinator watch` once through its monitor tool with `persistent: true`. The Codex, Kimi,
+Cursor, Gemini CLI, and OpenCode installs in this repo keep manual `wait`. Subagents always arm
+`wait`: monitor lines arrive in the parent conversation.
+
+**Manual `wait`** when `wake` is `manual`. Run `agent-coordinator wait '<yourname>' -timeout <sec>`
+(default 570s). Once stderr prints `armed after_id=N`, its durable cursor covers messages across a
+killed or timed-out waiter; promptly re-arm either one. On success stdout is `mail from=... count=N ids=...`;
+on timeout it is `timeout` (exit 1). Treat exit 0 as a WAKE SIGNAL, promptly confirm with
+`read_messages`, then re-arm; the next quiet peek advances past the mail you consumed.
 
 Foreground or background depends on your harness. Background is correct only where the harness
 starts a NEW TURN when a background task exits - Claude Code does this. Codex does not: its
