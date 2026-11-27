@@ -4,8 +4,8 @@ agent-coordinator lets the coding agents you already run in one repository see e
 and talk. Each Claude Code, Codex, or Grok Build session (or any other MCP client) gets a
 name, appears on a shared status board with what it is doing, can claim files, and can
 message the others. When mail arrives, the agent's next hook puts a one-line notice in its
-context, so no agent has to poll. It is one local binary: no server, no account, and nothing
-sent off your machine.
+context, so no agent has to poll. It is one local binary: no hosted
+service, no account, and nothing sent off your machine.
 
 It is for anyone who runs two or more agent sessions in the same repository at once and
 wants them to split the work and stay out of each other's files, instead of relaying
@@ -54,8 +54,8 @@ If `quiet-lynx` later tries to claim `internal/auth/login.go`, the claim fails w
   of a turn, and on your next prompt. An idle agent can block on `agent-coordinator wait`,
   which returns as soon as mail arrives.
 - **Identities that hold.** Names come from the session id, so a session that resumes with the
-  same id gets its name back. Subagents get their own name (`brisk-owl/Explore-1`) and inbox. Message history, with
-  read times, survives restarts.
+  same id gets its name back. Subagents get their own name (`brisk-owl/Explore-1`) and inbox.
+  Message history, with read times, survives restarts.
 - **Collision warnings.** Claims are advisory and show who owns a file. Separately, an agent
   that edits a file another agent edited in the last 30 minutes gets a `heads-up` notice.
 - **Scoped per repository.** Sessions in the same git repository, worktrees included, share a
