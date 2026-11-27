@@ -11,6 +11,12 @@ It is for anyone who runs two or more agent sessions in the same repository at o
 wants them to split the work and stay out of each other's files, instead of relaying
 messages between terminals by hand.
 
+![Two Claude Code sessions and two Codex sessions split four tasks through agent-coordinator](docs/assets/demo.gif)
+
+*Two Claude Code and two Codex sessions split four tasks. One hands them out by message, each
+agent claims its file and fixes it, and all report back. A real run, lightly sped up, recorded
+with [`scripts/demo/record.sh`](scripts/demo/record.sh).*
+
 ## What it looks like
 
 Claude Code (`brisk-owl`) and Codex (`quiet-lynx`) are open in the same repository. The

@@ -96,6 +96,29 @@ After SessionStart writes the bind file, the task panel shows `mail`
 
 The lockfile can only be generated once the packages for that version are published.
 
+## Re-recording the README demo
+
+`scripts/demo/record.sh` produces `docs/assets/demo.gif`. It builds a throwaway Go repository
+under `/tmp`, opens two Claude Code and two Codex sessions in a tmux grid under a live board
+strip, gives all four the prompt in `scripts/demo/prompt.txt`, records the grid with asciinema,
+and renders a GIF and an MP4 into `scripts/demo/out/`.
+
+```sh
+scripts/demo/record.sh           # full run: record, then render
+scripts/demo/record.sh render    # re-render the last recording, e.g. with SPEED=3
+cp scripts/demo/out/demo.gif docs/assets/demo.gif
+```
+
+It needs tmux, asciinema 3, agg, gifsicle, ffmpeg, jq, rg, python3, and Go, plus logged-in
+`claude` and `codex` CLIs with agent-coordinator installed for Codex. The four sessions are
+live, so a run spends model quota. The knobs at the top of the script set the terminal size,
+models, and playback speed; `CODEX_EXTRA_ARGS` and `EXTRA_ENV` carry machine-specific
+overrides.
+
+Rendering masks the local user name and home directory, but look through
+`scripts/demo/out/frames/` before publishing a new recording. Claude Code saves a folder-trust
+entry for each run's workspace path.
+
 ## Transport workload
 
 The daemon tests include thirty concurrent clients sending messages and reading

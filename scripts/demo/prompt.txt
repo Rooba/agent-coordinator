@@ -1,0 +1,6 @@
+You are one of 4 agents (2 Claude Code, 2 Codex) sharing this repo through the agent-coordinator MCP tools. TODO.md lists 4 small tasks. Begin your first reply with "I am <your coordinator name>".
+1. Call status_board until it lists 4 agents.
+2. The alphabetically-first name sends each agent (itself too) one task with send_message. Everyone else runs `agent-coordinator wait '<your name>' -timeout 120` in the foreground, then read_messages.
+3. claim your file and hold the claim while you work: implement it, run `go test -run <its Test> .`
+4. send_message the first agent "done: <file>", only then release your claim, and stop. The first agent waits for 3 done messages, runs `go test ./...`, broadcasts the result, and ends with a one-line summary of who did what.
+Keep replies short.
