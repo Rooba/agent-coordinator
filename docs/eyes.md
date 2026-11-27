@@ -2,11 +2,17 @@
 
 [Back to the README](../README.md)
 
+This page covers the optional eyes bridge: how to set it up, how to use it from WSL, how to follow
+a running check, and its security limits. Skip it unless your agents run in WSL and you want them
+to check a page in Chrome on the Windows side. Normal coordination does not need it.
+
 The eyes bridge lets an agent running under WSL hand one browser-observation brief to Claude on the
 Windows desktop. The WSL daemon adds an opt-in, authenticated TCP listener; a per-user Windows broker
 polls it, runs the provider in the interactive desktop session, validates one structured report, and
-delivers that report to the WSL requester. Normal same-workspace coordination does not require this
-bridge.
+delivers that report to the WSL requester as ordinary mail.
+
+You need: agent-coordinator installed in WSL, Claude Code installed on Windows and signed in, and
+Chrome with the Claude extension working for the profile you want checked.
 
 ## Quick setup
 
@@ -54,7 +60,7 @@ Useful overrides:
 | --- | --- |
 | `--dry-run` | Inspect the full plan without installing or downloading |
 | `--repair` | Re-pair and repair an existing setup, including after token rotation |
-| `--windows-binary PATH` | Supply an existing Windows binary, including for private releases |
+| `--windows-binary PATH` | Supply an existing Windows binary instead of downloading one |
 | `--addr IP:PORT` | Override the default `127.0.0.1:7400` relay address |
 | `--distro NAME` / `--windows-user NAME` | Override detected WSL/Windows identities |
 | `--claude-exe PATH` | Choose the Windows Claude executable |

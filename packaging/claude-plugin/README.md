@@ -1,17 +1,11 @@
 # agent-coordinator Claude Code plugin
 
-Presence, status, and messaging for concurrent coding agents sharing a workspace, packaged
-as a Claude Code plugin. It registers:
-
-- ten hooks (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, PreCompact, PostCompact,
-  Stop, SubagentStart, SubagentStop, SessionEnd) that keep presence and identity current;
-- one MCP server, `agent-coordinator`, exposing the coordinator tools;
-- one skill, `agent-coordinator`, teaching agents the collaboration workflow;
-- one session monitor, `monitors/monitors.json`, that runs `agent-coordinator watch` so DMs wake
-  the session without a hand-armed `wait`. Claude Code starts it in interactive sessions where the
-  Monitor tool is available (v2.1.105+), including on plugin reload. It stays off for `claude -p`,
-  when the API provider or telemetry settings disable that tool, and for a project-scope plugin.
-  Those sessions keep the manual `wait` instructions.
+This plugin connects concurrent Claude Code sessions in the same repository, and lets them work
+alongside Codex, Grok Build, and other MCP sessions there. Each session gets a name, appears on a
+shared status board, can claim files, and can message the others; mail shows up in the
+recipient's context without polling. This page covers installing the plugin, what it registers,
+how its binary arrives, and how to release it. For what the tool does and how to use it, see the
+[project README](https://github.com/Rooba/agent-coordinator#readme).
 
 ## Install
 
@@ -25,6 +19,18 @@ Inside a session, `/plugin marketplace add https://github.com/Rooba/agent-coordi
 
 If you previously ran `agent-coordinator install`, run `agent-coordinator install --uninstall`
 first, or every hook fires twice.
+
+## What it registers
+
+- ten hooks (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, PreCompact, PostCompact,
+  Stop, SubagentStart, SubagentStop, SessionEnd) that keep presence and identity current;
+- one MCP server, `agent-coordinator`, exposing the coordinator tools;
+- one skill, `agent-coordinator`, teaching agents the collaboration workflow;
+- one session monitor, `monitors/monitors.json`, that runs `agent-coordinator watch` so DMs wake
+  the session without a hand-armed `wait`. Claude Code starts it in interactive sessions where the
+  Monitor tool is available (v2.1.105+), including on plugin reload. It stays off for `claude -p`,
+  when the API provider or telemetry settings disable that tool, and for a project-scope plugin.
+  Those sessions keep the manual `wait` instructions.
 
 ## How the binary arrives
 
@@ -50,6 +56,7 @@ What the plugin stores locally, for how long, and what reaches the network are d
    `.claude-plugin/marketplace.json`, and in `package.json` (its `version` and every
    `optionalDependencies` entry).
 2. Tag `v<version>` and push the tag. The release workflow refuses a tag that does not match
-   these versions; otherwise it builds the release and publishes the npm packages.
+   these versions; otherwise it builds the release and, when the repository variable
+   `NPM_PUBLISH` is `true`, publishes the npm packages.
 3. Run `make plugin-lock` from the repository root, commit `package-lock.json`, push, and
    resubmit the plugin to the directory.
