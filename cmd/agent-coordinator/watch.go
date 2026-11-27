@@ -15,6 +15,7 @@ import (
 	"github.com/Rooba/agent-coordinator/internal/hookcli"
 	"github.com/Rooba/agent-coordinator/internal/paths"
 	"github.com/Rooba/agent-coordinator/internal/protocol"
+	"github.com/Rooba/agent-coordinator/internal/scope"
 	"github.com/Rooba/agent-coordinator/internal/wake"
 )
 
@@ -39,7 +40,7 @@ func runWatch(args []string) {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	sc := cwdScope()
+	sc := scope.Here()
 	req := protocol.Request{Scope: sc, From: name, Watcher: true}
 	cursorKey := name
 	if name == "" {

@@ -47,14 +47,7 @@ func doJoin(args []string, stdout, stderr io.Writer) error {
 
 	sc := strings.TrimSpace(*scopeFlag)
 	if sc == "" {
-		sc = strings.TrimSpace(os.Getenv("AC_SCOPE"))
-	}
-	if sc == "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			cwd = "."
-		}
-		sc = scope.Resolve(cwd)
+		sc = scope.Here()
 	}
 	kind := strings.TrimSpace(*kindFlag)
 	if kind == "" {

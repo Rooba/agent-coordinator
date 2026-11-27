@@ -11,7 +11,8 @@ import (
 	"github.com/Rooba/agent-coordinator/internal/socktest"
 )
 
-// boardDaemon answers every request with OK and records what it received.
+// boardDaemon answers every request with OK, one gone agent and one unread
+// message, and records what it received.
 func boardDaemon(t *testing.T) (string, chan protocol.Request) {
 	t.Helper()
 	sock := filepath.Join(socktest.Dir(t), "d.sock")
@@ -20,7 +21,7 @@ func boardDaemon(t *testing.T) (string, chan protocol.Request) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { l.Close() })
-	reqs := make(chan protocol.Request, 8)
+	reqs := make(chan protocol.Request, 16)
 	go func() {
 		for {
 			c, err := l.Accept()
@@ -33,7 +34,7 @@ func boardDaemon(t *testing.T) (string, chan protocol.Request) {
 			reqs <- req
 			resp := protocol.Response{OK: true, Agents: []protocol.AgentInfo{
 				{Name: "amber-fox", Status: "gone"},
-			}}
+			}, Unread: 1, HighWater: 1, PeekIDs: []int64{1}, PeekFroms: []string{"brisk-owl"}}
 			b, _ := json.Marshal(resp)
 			c.Write(append(b, '\n'))
 			c.Close()
@@ -76,5 +77,31 @@ func TestFetchBoardLiveSendsOpAgents(t *testing.T) {
 	req := <-reqs
 	if req.Op != protocol.OpAgents || req.IncludeGone {
 		t.Fatalf("--live must send OpAgents without IncludeGone, got %+v", req)
+	}
+}
+
+func TestScopedCommandsHonorACScope(t *testing.T) {
+	commands := map[string]func(){
+		"board":      func() { runBoard(nil) },
+		"wait":       func() { runWait([]string{"amber-fox", "-timeout", "5"}) },
+		"workspaces": func() { runWorkspaces(nil) },
+		"eyes":       func() { runEyes(nil) },
+	}
+	for name, run := range commands {
+		t.Run(name, func(t *testing.T) {
+			sock, reqs := boardDaemon(t)
+			t.Setenv("AC_SOCKET", sock)
+			t.Setenv("AC_DB", filepath.Join(t.TempDir(), "coordinator.db"))
+			t.Setenv("AC_SCOPE", "/elsewhere")
+			run()
+			if len(reqs) == 0 {
+				t.Fatalf("%s sent no requests", name)
+			}
+			for len(reqs) > 0 {
+				if req := <-reqs; req.Scope != "/elsewhere" {
+					t.Fatalf("%s sent scope %q, want AC_SCOPE /elsewhere", name, req.Scope)
+				}
+			}
+		})
 	}
 }

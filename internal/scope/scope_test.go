@@ -83,3 +83,16 @@ func TestResolveGitFileWithoutGitdirFallsBack(t *testing.T) {
 		t.Fatalf("got %q want %q", got, want)
 	}
 }
+
+func TestEffectivePrefersACScope(t *testing.T) {
+	dir := t.TempDir()
+	want, _ := filepath.EvalSymlinks(dir)
+	t.Setenv("AC_SCOPE", "")
+	if got := Effective(dir); got != want {
+		t.Fatalf("without AC_SCOPE got %q want %q", got, want)
+	}
+	t.Setenv("AC_SCOPE", "  /elsewhere ")
+	if got := Effective(dir); got != "/elsewhere" {
+		t.Fatalf("with AC_SCOPE got %q want /elsewhere", got)
+	}
+}

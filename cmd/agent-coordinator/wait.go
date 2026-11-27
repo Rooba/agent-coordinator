@@ -39,11 +39,7 @@ func runWait(args []string) {
 	if err := fs.Parse(args[1:]); err != nil || fs.NArg() != 0 || *timeout <= 0 || *interval <= 0 {
 		usage()
 	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		cwd = "."
-	}
-	sc := scope.Resolve(cwd)
+	sc := scope.Here()
 	statePath, err := waitStatePath(sc, name)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "wait: %v\n", err)

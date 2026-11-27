@@ -202,8 +202,8 @@ session with no live monitor use `wait`. `whoami` and `status_board` report
 agent-coordinator wait <name> [-timeout <seconds>] [-interval <seconds>]
 ```
 
-`wait` resolves the workspace scope from its cwd and checkpoints
-the agent's **high-water** message id, then polls the daemon (read-only peek,
+`wait` resolves the workspace scope from its cwd (or `AC_SCOPE`) and
+checkpoints the agent's **high-water** message id, then polls the daemon (read-only peek,
 default every 2s) until a later unread message appears. It prints
 `armed after_id=N` to stderr only after that checkpoint is durable; delegate
 or idle after seeing it. A first-ever arm ignores the backlog included in its
@@ -289,9 +289,9 @@ host bridge; run `agent-coordinator join -h` for details.
   (honors `XDG_STATE_HOME`; `%LOCALAPPDATA%\agent-coordinator\coordinator.db`
   on Windows).
 - `AC_SCOPE` - pin the workspace scope instead of resolving it from the
-  working directory. Honored by `hook`, `mcp`, `join`, `watch`, and the
-  `workspaces`, `eyes`, `relay`, `request-eyes`, and `cancel-eyes` commands;
-  `board` and `wait` always use the working directory.
+  working directory. Every command that talks to a workspace honors it
+  (`hook`, `mcp`, `join`, `wait`, `watch`, `board`, and the relay and eyes
+  commands); `join -scope` takes precedence.
 - `AC_DEBUG` - when set, the hook logs diagnostics to stderr instead of
   failing silently. Try `AC_DEBUG=1 agent-coordinator hook < event.json`.
 - `AC_NO_SPAWN` - when set, clients never spawn the daemon on a missed dial
@@ -341,7 +341,8 @@ call. Keep broadcasts need-to-know only: schema changes, lock handoffs,
 
 ## Scope semantics
 
-An agent's scope is the git repository root of its working directory.
+An agent's scope is the git repository root of its working directory, unless
+`AC_SCOPE` overrides it.
 Linked worktrees resolve to the MAIN repository root, so a session working
 in a worktree shares the board with sessions in the main checkout.
 Non-git directories scope to themselves. `AC_SCOPE` overrides the result.

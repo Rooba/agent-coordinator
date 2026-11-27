@@ -56,12 +56,8 @@ var (
 )
 
 func Serve(stdin io.Reader, stdout io.Writer, socketPath, cwd string) error {
-	sc := strings.TrimSpace(os.Getenv("AC_SCOPE"))
-	if sc == "" {
-		sc = scope.Resolve(cwd)
-	}
 	s := &server{
-		scope:      sc,
+		scope:      scope.Effective(cwd),
 		socketPath: socketPath,
 		sessionID:  newSessionID(),
 		source:     "mcp",
