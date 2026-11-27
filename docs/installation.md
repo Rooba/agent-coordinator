@@ -88,8 +88,8 @@ and the [loading reference](https://code.claude.com/docs/en/plugins/loading).
 keeps the manual `wait` wake. A skipped monitor leaves `wake: manual`, and
 the SessionStart line still tells the agent to arm `wait`.
 
-The `watch` command the monitor runs is newer than the v0.5.1 release. Until the
-next release, try the monitor with a binary built from source; see
+The monitor needs plugin version 0.6.0 or newer, the first release whose binary
+has the `watch` command. To try it with unreleased changes, see
 [Development](development.md#try-the-plugin-monitor-from-source).
 
 Grok Build can arm `agent-coordinator watch` once through its own monitor
@@ -193,10 +193,10 @@ agent-coordinator install --uninstall
 
 (or `make uninstall` from a source checkout). It removes the systemd units,
 strips exactly the hooks it added (including the Grok hooks file), and
-deregisters the MCP server from Claude Code, Codex, and OpenCode. It does not
-remove the Grok Build MCP registration; run `grok mcp remove --scope user agent-coordinator`
-for that. State in `~/.local/state/agent-coordinator/` is left behind; delete it
-by hand for a clean slate.
+deregisters the MCP server from every client install registered it with
+(Claude Code, Codex, Grok Build, and OpenCode). State in
+`~/.local/state/agent-coordinator/` is left behind; delete it by hand for a
+clean slate.
 
 For the plugin: `claude plugin uninstall agent-coordinator@agent-coordinator`.
 

@@ -32,9 +32,8 @@ darwin/amd64, and darwin/arm64.
 
 ## Try the plugin monitor from source
 
-Use an interactive session. The published npm package will not contain
-`watch` until the next release, so point the plugin launcher at a binary
-built from this tree. The launcher looks up
+Use an interactive session. To run the monitor against unreleased changes,
+point the plugin launcher at a binary built from this tree. The launcher looks up
 `${CLAUDE_PLUGIN_ROOT}/node_modules/agent-coordinator-cli-<os>-<cpu>/agent-coordinator`
 (`linux-x64`, `linux-arm64`, `darwin-x64`, `darwin-arm64`, or `win32-x64`;
 `.exe` on Windows). That `node_modules` directory is gitignored.

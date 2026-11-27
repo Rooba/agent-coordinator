@@ -406,12 +406,16 @@ func uninstallOpenCode(binPath, home string) error {
 	return writeFileAtomic(path, out, 0o644)
 }
 
-func registerMCPClients(binPath string, run func(string, ...string) error) error {
-	clients := []struct {
-		name   string
-		remove []string
-		add    []string
-	}{
+type mcpClient struct {
+	name   string
+	remove []string
+	add    []string
+}
+
+// mcpClients is the single list of CLI harnesses install registers with, so
+// uninstall always removes exactly what install added.
+func mcpClients(binPath string) []mcpClient {
+	return []mcpClient{
 		{
 			name:   "claude",
 			remove: []string{"mcp", "remove", "--scope", "user", "agent-coordinator"},
@@ -428,27 +432,29 @@ func registerMCPClients(binPath string, run func(string, ...string) error) error
 			add:    []string{"mcp", "add", "--scope", "user", "agent-coordinator", "--", binPath, "mcp"},
 		},
 	}
-	for _, client := range clients {
-		// Replacing our named entry is what makes reinstall repair stale paths.
-		if err := run(client.name, client.remove...); errors.Is(err, exec.ErrNotFound) {
-			fmt.Fprintf(os.Stderr, "note: %s not installed; skipping MCP registration\n", client.name)
-			continue
+}
+
+func registerMCPClients(binPath string, run func(string, ...string) error) error {
+	for _, c := range mcpClients(binPath) {
+		// Removing first lets a reinstall repair a stale binary path.
+		err := run(c.name, c.remove...)
+		if !errors.Is(err, exec.ErrNotFound) {
+			err = run(c.name, c.add...)
 		}
-		if err := run(client.name, client.add...); err != nil {
-			if errors.Is(err, exec.ErrNotFound) {
-				fmt.Fprintf(os.Stderr, "note: %s not installed; skipping MCP registration\n", client.name)
-				continue
-			}
-			return fmt.Errorf("%s mcp add: %w", client.name, err)
+		switch {
+		case errors.Is(err, exec.ErrNotFound):
+			fmt.Fprintf(os.Stderr, "note: %s not installed; skipping MCP registration\n", c.name)
+		case err != nil:
+			return fmt.Errorf("%s mcp add: %w", c.name, err)
 		}
 	}
 	return nil
 }
 
-func unregisterMCPClients(run func(string, ...string) error) {
-	_ = run("claude", "mcp", "remove", "--scope", "user", "agent-coordinator")
-	_ = run("codex", "mcp", "remove", "agent-coordinator")
-	_ = run("grok", "mcp", "remove", "--scope", "user", "agent-coordinator")
+func unregisterMCPClients(binPath string, run func(string, ...string) error) {
+	for _, c := range mcpClients(binPath) {
+		_ = run(c.name, c.remove...)
+	}
 }
 
 func installHookConfig(path, binPath string, merge func([]byte, string) ([]byte, bool, error)) error {
@@ -607,7 +613,7 @@ func Uninstall(binPath, home string, run func(string, ...string) error) error {
 			os.Remove(grokHooksPath)
 		}
 	}
-	unregisterMCPClients(run)
+	unregisterMCPClients(binPath, run)
 	if err := uninstallOpenCode(binPath, home); err != nil {
 		fmt.Fprintln(os.Stderr, "note: OpenCode MCP config:", err)
 	}
