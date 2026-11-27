@@ -13,17 +13,6 @@ import (
 	"github.com/Rooba/agent-coordinator/internal/scope"
 )
 
-func cwdScope() string {
-	if v := strings.TrimSpace(os.Getenv("AC_SCOPE")); v != "" {
-		return v
-	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		cwd = "."
-	}
-	return scope.Resolve(cwd)
-}
-
 func mustOnce(cmd string, req protocol.Request) protocol.Response {
 	resp, err := once(unixSockAddr(), req)
 	if err != nil {
@@ -98,7 +87,7 @@ func runWorkspaces(args []string) {
 		fmt.Fprintln(os.Stderr, "usage: agent-coordinator workspaces [--json]")
 		os.Exit(2)
 	}
-	resp := mustOnce("workspaces", protocol.Request{Op: protocol.OpListWorkspaces, Scope: cwdScope()})
+	resp := mustOnce("workspaces", protocol.Request{Op: protocol.OpListWorkspaces, Scope: scope.Here()})
 	if *asJSON {
 		ws := resp.Workspaces
 		if ws == nil {
@@ -133,7 +122,7 @@ func runEyes(args []string) {
 		runEyesTasks(*asJSON, *mine)
 		return
 	}
-	resp := mustOnce("eyes", protocol.Request{Op: protocol.OpListEyes, Scope: cwdScope()})
+	resp := mustOnce("eyes", protocol.Request{Op: protocol.OpListEyes, Scope: scope.Here()})
 	if *asJSON {
 		agents := resp.Agents
 		if agents == nil {
@@ -156,7 +145,7 @@ func runEyes(args []string) {
 // whether it is alive and how long it has left. --mine narrows it to the
 // tasks this session asked for.
 func runEyesTasks(asJSON, mine bool) {
-	resp := mustOnce("eyes", protocol.Request{Op: protocol.OpListEyesTasks, Scope: cwdScope(), Mine: mine})
+	resp := mustOnce("eyes", protocol.Request{Op: protocol.OpListEyesTasks, Scope: scope.Here(), Mine: mine})
 	if asJSON {
 		tasks := resp.EyesTasks
 		if tasks == nil {
@@ -265,7 +254,7 @@ func runRelay(args []string) {
 	}
 	req := protocol.Request{
 		Op:        protocol.OpSendWorkspace,
-		Scope:     cwdScope(),
+		Scope:     scope.Here(),
 		SessionID: sid,
 		Body:      body,
 		Target:    cliTarget(*workspace, *to, *agentID),
@@ -304,7 +293,7 @@ func runSummon(args []string) {
 	}
 	req := protocol.Request{
 		Op:        protocol.OpRequestEyes,
-		Scope:     cwdScope(),
+		Scope:     scope.Here(),
 		SessionID: sid,
 		Runtime:   *runtime,
 		Brief:     brief,
@@ -319,7 +308,7 @@ func runSummon(args []string) {
 	if resp.Launcher != nil && resp.Launcher.Name != "" {
 		line += " launcher=" + resp.Launcher.Name
 	}
-	if w, err := once(unixSockAddr(), protocol.Request{Op: protocol.OpWhoami, Scope: cwdScope(), SessionID: sid}); err == nil && w.Name != "" {
+	if w, err := once(unixSockAddr(), protocol.Request{Op: protocol.OpWhoami, Scope: scope.Here(), SessionID: sid}); err == nil && w.Name != "" {
 		line += "\narm: " + hookcli.WaitProgram() + " wait '" + w.Name + "'"
 	}
 	fmt.Println(line)
@@ -343,7 +332,7 @@ func runCancelEyes(args []string) {
 	taskID := fs.Arg(0)
 	mustOnce("cancel-eyes", protocol.Request{
 		Op:        protocol.OpCancelEyes,
-		Scope:     cwdScope(),
+		Scope:     scope.Here(),
 		SessionID: sid,
 		TaskID:    taskID,
 	})

@@ -302,9 +302,10 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 	// stamp a return address use this ref, never a client's.
 	var actor protocol.AgentRef
 	var actorIsBroker bool
+	var id store.AgentIdentity
 	if fromOps[req.Op] {
-		id, err := st.ResolveActor(req.Scope, req.SessionID, req.From)
-		if err != nil {
+		var err error
+		if id, err = st.ResolveActor(req.Scope, req.SessionID, req.From); err != nil {
 			return fail(err)
 		}
 		// A from may name a row other than the caller's own, so the same relay
@@ -323,8 +324,10 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 	}
 	// Any identified call is a heartbeat that keeps the row fresh and lifts
 	// sticky idle. The exceptions set their own freshness (register, event,
-	// idle, deregister) or must not resurrect a retired row (whoami).
-	if req.SessionID != "" {
+	// idle, deregister) or must not resurrect a retired row (whoami). A mail
+	// monitor's watcher peek is a machine poll, not the agent acting, so it
+	// never counts as activity.
+	if req.SessionID != "" && !(req.Op == protocol.OpPeek && req.Watcher) {
 		switch req.Op {
 		case protocol.OpRegister, protocol.OpDeregister, protocol.OpIdle, protocol.OpEvent, protocol.OpWhoami:
 		default:
@@ -355,7 +358,7 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 		if err != nil {
 			return fail(err)
 		}
-		return protocol.Response{OK: true, Name: id.Name, AgentID: id.AgentID, Source: id.Source, Parent: id.Parent}
+		return protocol.Response{OK: true, Name: id.Name, AgentID: id.AgentID, Source: id.Source, Parent: id.Parent, Wake: id.Wake}
 	case protocol.OpDeregister:
 		sess := req.SessionID
 		if childSession != "" {
@@ -392,7 +395,9 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 		if err != nil {
 			return fail(err)
 		}
-		return protocol.Response{OK: true, Name: childName, Notices: notices}
+		// A user prompt is the parent's turn starting: the moment to say once that its monitor is armed.
+		armed := req.Tool == "UserPromptSubmit" && childSession == "" && st.AnnounceWatcher(req.Scope, sess)
+		return protocol.Response{OK: true, Name: childName, Notices: notices, MonitorArmed: armed}
 	case protocol.OpAgents:
 		agents, err := st.Agents(req.Scope)
 		if err != nil {
@@ -429,6 +434,9 @@ func dispatch(st *store.Store, req protocol.Request) protocol.Response {
 		info, err := peek(req.Scope, req.From, req.AfterID)
 		if err != nil {
 			return fail(err)
+		}
+		if req.Watcher { // only a monitor whose inbox query works counts as a wake source
+			st.StampWatcher(req.Scope, id)
 		}
 		return withPending(st, req, actorIsBroker, protocol.Response{OK: true, Unread: info.Unread,
 			HighWater: info.HighWater, PeekIDs: info.IDs, PeekFroms: info.Froms})

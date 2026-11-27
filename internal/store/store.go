@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Rooba/agent-coordinator/internal/protocol"
@@ -77,6 +78,24 @@ const (
 type Store struct {
 	db  *sql.DB
 	Now func() time.Time
+
+	watchMu  sync.Mutex
+	watchers map[string]*watcher // keyed by scope + agent id
+}
+
+// WatcherLive is how recently a mail monitor must have polled to count as running.
+const WatcherLive = 10 * time.Second
+
+// Wake modes reported per agent: a running mail monitor, or the agent arms wait itself.
+const (
+	WakeMonitor = "monitor"
+	WakeManual  = "manual"
+)
+
+// watcher is in-memory liveness for one session's mail monitor.
+type watcher struct {
+	seen      time.Time
+	announced bool
 }
 
 // execQuerier is *sql.DB or *sql.Tx. Writes that must be atomic take one, so
@@ -283,19 +302,20 @@ func (s *Store) RegisterIfNoLiveHook(scope, sessionID, source string) (string, e
 // classifies legacy rows that predate the source column. A kind-bearing row
 // (a broker or an eyes child) is never a hook agent.
 func (s *Store) hasLiveHookAgents(scope string) (bool, error) {
-	rows, err := s.db.Query(`SELECT status, last_seen FROM agents
+	w := s.watchedNow()
+	rows, err := s.db.Query(`SELECT agent_id, status, last_seen FROM agents
 		WHERE scope=? AND session_id NOT LIKE 'mcp-%' AND kind=''`, scope)
 	if err != nil {
 		return false, err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var explicit string
+		var aid, explicit string
 		var seen int64
-		if err := rows.Scan(&explicit, &seen); err != nil {
+		if err := rows.Scan(&aid, &explicit, &seen); err != nil {
 			return false, err
 		}
-		if s.live(explicit, seen) {
+		if s.live(w, scope, aid, explicit, seen) {
 			return true, nil
 		}
 	}
@@ -310,6 +330,8 @@ type AgentIdentity struct {
 	Parent  string // parent agent's name, set only for subagent child rows
 	Kind    string
 	Origin  string
+	Child   bool   // a subagent row, which never owns a mail monitor
+	Wake    string // WakeMonitor or WakeManual
 }
 
 // Identity returns the stored identity for a session.
@@ -325,10 +347,75 @@ func (s *Store) Identity(scope, sessionID string) (AgentIdentity, error) {
 	if err != nil {
 		return id, err
 	}
-	if parentSession != "" {
+	if id.Child = parentSession != ""; id.Child {
 		s.db.QueryRow(`SELECT name FROM agents WHERE scope=? AND session_id=?`, scope, parentSession).Scan(&id.Parent)
 	}
+	id.Wake = s.watchedNow().wake(scope, id.AgentID, id.Child)
 	return id, nil
+}
+
+// StampWatcher records a poll from an agent's mail monitor; a poll after a
+// lapse starts a new live stretch that will be announced again. Children are
+// skipped: monitor notifications land in the parent conversation only.
+func (s *Store) StampWatcher(scope string, id AgentIdentity) {
+	if id.Child {
+		return
+	}
+	s.watchMu.Lock()
+	defer s.watchMu.Unlock()
+	if s.watchers == nil {
+		s.watchers = map[string]*watcher{}
+	}
+	key := scope + "\x00" + id.AgentID
+	if _, live := s.watcher(scope, id.AgentID); !live {
+		s.watchers[key] = &watcher{}
+	}
+	s.watchers[key].seen = s.Now()
+}
+
+// AnnounceWatcher is true once per live monitor stretch, so a session is told
+// its monitor is armed exactly one time per stretch.
+func (s *Store) AnnounceWatcher(scope, sessionID string) bool {
+	s.watchMu.Lock()
+	defer s.watchMu.Unlock()
+	w, live := s.watcher(scope, agentID(sessionID))
+	if !live || w.announced {
+		return false
+	}
+	w.announced = true
+	return true
+}
+
+// watcher looks up an agent's monitor and whether it polled recently; callers hold watchMu.
+func (s *Store) watcher(scope, aid string) (*watcher, bool) {
+	w := s.watchers[scope+"\x00"+aid]
+	return w, w != nil && s.Now().Sub(w.seen) <= WatcherLive
+}
+
+// watched is a snapshot of the agents whose mail monitor is live, taken once
+// per call and before any query so no caller holds watchMu over the database.
+type watched map[string]bool
+
+func (s *Store) watchedNow() watched {
+	s.watchMu.Lock()
+	defer s.watchMu.Unlock()
+	out := watched{}
+	for key, w := range s.watchers {
+		if s.Now().Sub(w.seen) <= WatcherLive {
+			out[key] = true
+		}
+	}
+	return out
+}
+
+func (w watched) has(scope, aid string) bool { return w[scope+"\x00"+aid] }
+
+// wake reports how an agent is woken for mail: children never inherit a monitor.
+func (w watched) wake(scope, aid string, child bool) string {
+	if w.has(scope, aid) && !child {
+		return WakeMonitor
+	}
+	return WakeManual
 }
 
 // ResolveActor decides which agent a request acts as. An explicit from must
@@ -567,6 +654,7 @@ func replyRef(stamped string) *protocol.AgentRef {
 // sender. Collected before any write: with SetMaxOpenConns(1) an open cursor
 // holds the sole connection.
 func (s *Store) liveAgents(q execQuerier, scope, exceptID string) ([]string, error) {
+	w := s.watchedNow()
 	rows, err := q.Query(`SELECT agent_id, status, last_seen FROM agents WHERE scope=? AND agent_id != ?`, scope, exceptID)
 	if err != nil {
 		return nil, err
@@ -579,7 +667,7 @@ func (s *Store) liveAgents(q execQuerier, scope, exceptID string) ([]string, err
 		if err := rows.Scan(&aid, &explicit, &seen); err != nil {
 			return nil, err
 		}
-		if s.live(explicit, seen) {
+		if s.live(w, scope, aid, explicit, seen) {
 			out = append(out, aid)
 		}
 	}
@@ -904,46 +992,69 @@ func (s *Store) Housekeep() error {
 	// the requester is still there to be told. A task the sweep could not
 	// settle is reported at the end, never by skipping the purges below.
 	_, expiry := s.ExpireEyesTasks(now)
+	// Drop lapsed monitors and note the live ones, releasing watchMu before
+	// any SQL runs: a watched row is somebody's inbox and must survive purge.
+	s.watchMu.Lock()
+	var retained []any // (scope, agent_id) pairs with a live monitor
+	for key, w := range s.watchers {
+		if now.Sub(w.seen) > WatcherLive {
+			delete(s.watchers, key)
+			continue
+		}
+		scope, aid, _ := strings.Cut(key, "\x00")
+		retained = append(retained, scope, aid)
+	}
+	s.watchMu.Unlock()
+	// watched is a row-value set of the retained pairs, or empty when none.
+	watched := "(VALUES " + strings.TrimSuffix(strings.Repeat("(?,?),", len(retained)/2), ",") + ")"
+	purgeAgents := `DELETE FROM agents WHERE last_seen < ?`
+	purgeArgs := []any{now.Add(-2 * time.Hour).Unix()}
+	purgeClaims := `DELETE FROM claims WHERE NOT EXISTS (
+			SELECT 1 FROM agents a WHERE a.scope = claims.scope AND a.agent_id = claims.agent_id
+			AND a.status != 'gone' AND (a.last_seen >= ?`
+	claimArgs := []any{now.Add(-staleWindow).Unix()}
+	if len(retained) > 0 {
+		purgeAgents += " AND (scope, agent_id) NOT IN " + watched
+		purgeArgs = append(purgeArgs, retained...)
+		purgeClaims += " OR (a.scope, a.agent_id) IN " + watched
+		claimArgs = append(claimArgs, retained...)
+	}
+	purgeClaims += "))"
 	day := int64(86400)
 	stmts := []struct {
-		q   string
-		arg int64
+		q    string
+		args []any
 	}{
-		{`DELETE FROM events WHERE ts < ?`, now.Unix() - 7*day},
-		{`DELETE FROM file_touches WHERE ts < ?`, now.Add(-time.Hour).Unix()},
-		{`DELETE FROM messages WHERE created_at < ? AND id IN (SELECT message_id FROM deliveries GROUP BY message_id HAVING COUNT(*) = SUM(read_at IS NOT NULL))`, now.Unix() - 7*day},
-		{`DELETE FROM messages WHERE created_at < ?`, now.Unix() - 30*day},
-		{`DELETE FROM deliveries WHERE message_id NOT IN (SELECT id FROM messages)`, 0},
+		{`DELETE FROM events WHERE ts < ?`, []any{now.Unix() - 7*day}},
+		{`DELETE FROM file_touches WHERE ts < ?`, []any{now.Add(-time.Hour).Unix()}},
+		{`DELETE FROM messages WHERE created_at < ? AND id IN (SELECT message_id FROM deliveries GROUP BY message_id HAVING COUNT(*) = SUM(read_at IS NOT NULL))`, []any{now.Unix() - 7*day}},
+		{`DELETE FROM messages WHERE created_at < ?`, []any{now.Unix() - 30*day}},
+		{`DELETE FROM deliveries WHERE message_id NOT IN (SELECT id FROM messages)`, nil},
 		// Agents idle-decay to gone after 2h without a heartbeat; explicit gone
 		// rows younger than that keep their board slot until they age out too.
-		{`DELETE FROM agents WHERE last_seen < ?`, now.Add(-2 * time.Hour).Unix()},
+		{purgeAgents, purgeArgs},
 		// Deliveries to a purged recipient can never be read again: drop them.
-		{`DELETE FROM deliveries WHERE agent_id NOT IN (SELECT agent_id FROM agents)`, 0},
+		{`DELETE FROM deliveries WHERE agent_id NOT IN (SELECT agent_id FROM agents)`, nil},
 		// Claims never outlive their holder: drop rows whose holder was purged,
 		// marked gone, or has decayed to gone.
-		{`DELETE FROM claims WHERE NOT EXISTS (
-			SELECT 1 FROM agents a WHERE a.scope = claims.scope AND a.agent_id = claims.agent_id
-			AND a.status != 'gone' AND a.last_seen >= ?)`, now.Add(-staleWindow).Unix()},
-		{`DELETE FROM tasks WHERE updated_at < ?`, now.Unix() - 7*day},
+		{purgeClaims, claimArgs},
+		{`DELETE FROM tasks WHERE updated_at < ?`, []any{now.Unix() - 7*day}},
 		// An eyes task outlives its messages by a day, long enough to explain
 		// a late report and short enough to stay a ledger, not a log.
-		{`DELETE FROM eyes_tasks WHERE updated_at < ?`, now.Unix() - day},
+		{`DELETE FROM eyes_tasks WHERE updated_at < ?`, []any{now.Unix() - day}},
 	}
 	for _, st := range stmts {
-		var err error
-		if st.arg != 0 {
-			_, err = s.db.Exec(st.q, st.arg)
-		} else {
-			_, err = s.db.Exec(st.q)
-		}
-		if err != nil {
+		if _, err := s.db.Exec(st.q, st.args...); err != nil {
 			return err
 		}
 	}
 	return expiry
 }
 
-func (s *Store) freshStatus(explicit string, lastSeen int64) string {
+// freshStatus is the one definition of presence: the explicit status decays
+// with last_seen, except that a row whose mail monitor is live never decays
+// past idle (its DMs still wake somebody).
+func (s *Store) freshStatus(w watched, scope, aid, explicit string, lastSeen int64) string {
 	if explicit == "gone" {
 		return "gone"
 	}
@@ -951,13 +1062,20 @@ func (s *Store) freshStatus(explicit string, lastSeen int64) string {
 	switch {
 	case age <= activeWindow && explicit != "idle":
 		return "active"
-	case age <= idleWindow:
+	case age <= idleWindow || w.has(scope, aid):
 		return "idle"
 	case age <= staleWindow:
 		return "stale"
 	default:
 		return "gone"
 	}
+}
+
+// live reports whether a row is active or idle - the two states that mean
+// somebody is there.
+func (s *Store) live(w watched, scope, aid, explicit string, lastSeen int64) bool {
+	st := s.freshStatus(w, scope, aid, explicit, lastSeen)
+	return st == "active" || st == "idle"
 }
 
 func (s *Store) Agents(scope string) ([]protocol.AgentInfo, error) {
@@ -978,13 +1096,14 @@ func (s *Store) Agents(scope string) ([]protocol.AgentInfo, error) {
 func (s *Store) Board(scope string, includeGone bool) ([]protocol.AgentInfo, error) {
 	// One snapshot replaces five enrichment queries per agent. The store has
 	// one connection, so board polling must leave room for mail and heartbeats.
+	w := s.watchedNow()
 	rows, err := s.db.Query(`
 		WITH task_counts AS (
 			SELECT agent_id, SUM(status='pending') pending, SUM(status='completed') completed
 			FROM tasks WHERE scope=? GROUP BY agent_id
 		)
 		SELECT a.agent_id, a.name, a.status, a.last_seen, a.kind, a.origin, a.platform, a.caps,
-			COALESCE(parent.name, ''), COALESCE(event.activity, ''), COALESCE(event.files, '[]'),
+			a.parent_session_id != '', COALESCE(parent.name, ''), COALESCE(event.activity, ''), COALESCE(event.files, '[]'),
 			COALESCE(task_counts.pending, 0), COALESCE(task_counts.completed, 0),
 			COALESCE((SELECT subject FROM tasks WHERE scope=a.scope AND agent_id=a.agent_id
 				AND status='in_progress' ORDER BY updated_at DESC LIMIT 1), ''),
@@ -1005,16 +1124,18 @@ func (s *Store) Board(scope string, includeGone bool) ([]protocol.AgentInfo, err
 	var out []protocol.AgentInfo
 	for rows.Next() {
 		var explicit, capsJSON, filesJSON, claimsJSON string
+		var child bool
 		var a protocol.AgentInfo
 		if err := rows.Scan(&a.AgentID, &a.Name, &explicit, &a.LastSeen,
-			&a.Kind, &a.Origin, &a.Platform, &capsJSON, &a.Parent, &a.Activity, &filesJSON,
+			&a.Kind, &a.Origin, &a.Platform, &capsJSON, &child, &a.Parent, &a.Activity, &filesJSON,
 			&a.TasksPending, &a.TasksDone, &a.CurrentTask, &claimsJSON); err != nil {
 			return nil, err
 		}
-		a.Status = s.freshStatus(explicit, a.LastSeen)
+		a.Status = s.freshStatus(w, scope, a.AgentID, explicit, a.LastSeen)
 		if a.Status == "gone" && !includeGone {
 			continue
 		}
+		a.Wake = w.wake(scope, a.AgentID, child)
 		json.Unmarshal([]byte(capsJSON), &a.Capabilities)
 		json.Unmarshal([]byte(filesJSON), &a.Files)
 		json.Unmarshal([]byte(claimsJSON), &a.Claims)

@@ -56,12 +56,8 @@ var (
 )
 
 func Serve(stdin io.Reader, stdout io.Writer, socketPath, cwd string) error {
-	sc := strings.TrimSpace(os.Getenv("AC_SCOPE"))
-	if sc == "" {
-		sc = scope.Resolve(cwd)
-	}
 	s := &server{
-		scope:      sc,
+		scope:      scope.Effective(cwd),
 		socketPath: socketPath,
 		sessionID:  newSessionID(),
 		source:     "mcp",
@@ -138,8 +134,9 @@ func (s *server) handle(req rpcReq) (any, map[string]any) {
 				"Identity: if session-start context assigned a coordinator name ('you are <name>'), use it and do not call register_agent; otherwise call register_agent once. " +
 				"If whoami or claim fail after a long idle, call register_agent again to rebind this connection. " +
 				"Subagents share the parent connection and MUST pass from='<their child name>' on read_messages - a bare call drains the PARENT inbox. " +
-				"Wake pattern while waiting on a peer: run `" + hookcli.WaitProgram() + " wait '<your name>' -timeout 570`; it prints `armed after_id=N` once its durable cursor is set and exits when a DM arrives; then call read_messages and re-arm (also after a kill or timeout - the cursor loses no mail) - never busy-poll. " +
-				"Background it ONLY if your harness starts a new turn when a background task exits (Claude Code does; Codex background terminals do not - they yield and never call back); otherwise block on it in the foreground as the last action of your turn. " +
+				"Wake pattern: when a coordinator mail notification arrives, call read_messages. While whoami or status_board reports wake: monitor, do not arm wait. " +
+				"While it reports wake: manual (and always for subagents) stay reachable with `" + hookcli.WaitProgram() + " wait '<your name>' -timeout 570`: it exits when a DM arrives; call read_messages, then re-arm (a kill or timeout loses no mail) - never busy-poll. " +
+				"Background it only if your harness starts a new turn when a background task exits (Claude Code does, Codex does not); otherwise block on it in the foreground as the last action of your turn. " +
 				"Keep DMs short: write long content (plans, surveys, inventories) to a file under <repo>/.ignore/coordination/ and DM a one-line pointer to the path. " +
 				"Collab recipe: agree ONE writer per file up front; before editing a shared hub file, check status_board and take it in the claims ledger (claim/release/list_claims - advisory, not a lock). " +
 				"message_history audits your sent/received mail without clearing anything.",
@@ -487,7 +484,7 @@ func (s *server) whoami() map[string]any {
 	if !resp.OK {
 		return errResult(resp.Error)
 	}
-	out := map[string]any{"name": resp.Name, "agent_id": resp.AgentID, "scope": s.scope, "source": resp.Source}
+	out := map[string]any{"name": resp.Name, "agent_id": resp.AgentID, "scope": s.scope, "source": resp.Source, "wake": resp.Wake}
 	if resp.Parent != "" {
 		out["parent"] = resp.Parent
 	}

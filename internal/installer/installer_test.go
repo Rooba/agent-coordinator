@@ -248,6 +248,33 @@ func TestRegisterMCPClientsSkipsMissingClient(t *testing.T) {
 	}
 }
 
+func TestUnregisterMCPClientsUndoesEveryRegistration(t *testing.T) {
+	var calls [][]string
+	run := func(name string, args ...string) error {
+		calls = append(calls, append([]string{name}, args...))
+		return nil
+	}
+	if err := registerMCPClients("/bin/ac", run); err != nil {
+		t.Fatal(err)
+	}
+	var removes [][]string
+	for i, c := range calls {
+		if len(c) > 2 && c[1] == "mcp" && c[2] == "add" {
+			removes = append(removes, calls[i-1])
+		}
+	}
+	if len(removes) == 0 {
+		t.Fatal("register added no MCP clients")
+	}
+	calls = nil
+	unregisterMCPClients("/bin/ac", run)
+	for _, want := range removes {
+		if !hasCall(calls, want) {
+			t.Fatalf("uninstall left %s registered: want %v in %v", want[0], want, calls)
+		}
+	}
+}
+
 func TestRemoveHooksOnlyOurs(t *testing.T) {
 	merged, _, _ := MergeHooks([]byte(existing), "/bin/ac")
 	out, changed, err := RemoveHooks(merged, "/bin/ac")

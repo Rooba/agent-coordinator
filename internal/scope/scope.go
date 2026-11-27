@@ -6,6 +6,24 @@ import (
 	"strings"
 )
 
+// Effective returns the scope a command should use: AC_SCOPE when set,
+// otherwise the workspace containing cwd.
+func Effective(cwd string) string {
+	if v := strings.TrimSpace(os.Getenv("AC_SCOPE")); v != "" {
+		return v
+	}
+	return Resolve(cwd)
+}
+
+// Here is Effective for the process working directory.
+func Here() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		cwd = "."
+	}
+	return Effective(cwd)
+}
+
 // Resolve maps a working directory to its workspace scope key.
 func Resolve(cwd string) string {
 	dir, err := filepath.Abs(cwd)

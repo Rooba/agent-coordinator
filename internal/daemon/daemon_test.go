@@ -379,3 +379,50 @@ func TestDispatchRefusesForeignFrom(t *testing.T) {
 		t.Fatalf("an unidentified unix caller must still work: %+v", r)
 	}
 }
+
+func TestWatcherPeekDrivesWakeAndOneShotArmed(t *testing.T) {
+	sock, _ := startDaemon(t, time.Minute)
+	reg := roundTrip(t, sock, protocol.Request{Op: protocol.OpRegister, Scope: "/r", SessionID: "p", Source: "hook"})
+	prompt := protocol.Request{Op: protocol.OpEvent, Scope: "/r", SessionID: "p", Tool: "UserPromptSubmit"}
+	whoami := func() string {
+		return roundTrip(t, sock, protocol.Request{Op: protocol.OpWhoami, Scope: "/r", SessionID: "p"}).Wake
+	}
+
+	// A plain peek (wait, peek_messages) is not a monitor.
+	roundTrip(t, sock, protocol.Request{Op: protocol.OpPeek, Scope: "/r", SessionID: "p"})
+	if w := whoami(); w != store.WakeManual || roundTrip(t, sock, prompt).MonitorArmed {
+		t.Fatalf("plain peek must not arm: wake=%q", w)
+	}
+
+	// The monitor polls by name with no session, as `watch` does.
+	if r := roundTrip(t, sock, protocol.Request{Op: protocol.OpPeek, Scope: "/r", From: reg.Name, Watcher: true}); !r.OK {
+		t.Fatalf("watcher peek: %+v", r)
+	}
+	if w := whoami(); w != store.WakeMonitor {
+		t.Fatalf("whoami wake = %q, want monitor", w)
+	}
+	board := roundTrip(t, sock, protocol.Request{Op: protocol.OpBoard, Scope: "/r"})
+	if len(board.Agents) != 1 || board.Agents[0].Wake != store.WakeMonitor {
+		t.Fatalf("board wake: %+v", board.Agents)
+	}
+	other := protocol.Request{Op: protocol.OpEvent, Scope: "/r", SessionID: "p", Tool: "Read"}
+	if roundTrip(t, sock, other).MonitorArmed {
+		t.Fatal("only UserPromptSubmit carries the armed flag")
+	}
+	if !roundTrip(t, sock, prompt).MonitorArmed || roundTrip(t, sock, prompt).MonitorArmed {
+		t.Fatal("armed must be announced on exactly one UserPromptSubmit")
+	}
+}
+
+func TestChildPromptNeverConsumesParentArmedNotice(t *testing.T) {
+	sock, _ := startDaemon(t, time.Minute)
+	reg := roundTrip(t, sock, protocol.Request{Op: protocol.OpRegister, Scope: "/r", SessionID: "p", Source: "hook"})
+	roundTrip(t, sock, protocol.Request{Op: protocol.OpPeek, Scope: "/r", From: reg.Name, Watcher: true})
+	child := protocol.Request{Op: protocol.OpEvent, Scope: "/r", SessionID: "p", AgentID: "kid", Tool: "UserPromptSubmit"}
+	if roundTrip(t, sock, child).MonitorArmed {
+		t.Fatal("a child prompt must not be told the monitor is armed")
+	}
+	if !roundTrip(t, sock, protocol.Request{Op: protocol.OpEvent, Scope: "/r", SessionID: "p", Tool: "UserPromptSubmit"}).MonitorArmed {
+		t.Fatal("the parent's one-shot notice must survive a child prompt")
+	}
+}

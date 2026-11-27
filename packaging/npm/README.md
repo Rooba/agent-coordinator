@@ -5,7 +5,9 @@ CPU. It is not meant to be installed directly: the agent-coordinator Claude Code
 every platform package as an optional dependency pinned to an exact version, and Claude Code
 installs the one matching your machine when the plugin is installed.
 
-agent-coordinator gives concurrent coding agents presence, status, and messaging in a shared
-workspace. Each package is built and published with provenance by the project's release workflow.
+agent-coordinator lets concurrent coding agent sessions in the same repository (Claude Code,
+Codex, Grok Build, and other MCP clients) see each other, claim files, and message each other.
+It runs locally as a single binary. Each package is built and published with provenance by the
+project's release workflow.
 
 Source, documentation, and issues: https://github.com/Rooba/agent-coordinator

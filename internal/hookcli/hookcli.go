@@ -89,7 +89,7 @@ func Run(stdin io.Reader, stdout io.Writer, socketPath string) {
 		debugf("bad input: %v", err)
 		return
 	}
-	sc := resolveScope(in.CWD)
+	sc := scope.Effective(in.CWD)
 	event := canonicalEvent(in.HookEventName)
 	req := protocol.Request{Scope: sc, SessionID: in.SessionID, Kind: strings.TrimSpace(os.Getenv("AC_KIND"))}
 	switch event {
@@ -124,6 +124,7 @@ func Run(stdin io.Reader, stdout io.Writer, socketPath string) {
 		req.Op = protocol.OpEvent
 		req.Tool = "UserPromptSubmit"
 		req.Activity = "Handling user prompt"
+		req.AgentID, req.AgentType = in.AgentID, in.AgentType // a child prompt must never take the parent's armed notice
 		refreshBindFile(sc, in.SessionID)
 	case "PreToolUse":
 		preToolUse(in, sc, socketPath, stdout)
@@ -173,9 +174,12 @@ func Run(stdin io.Reader, stdout io.Writer, socketPath string) {
 		}
 	case "PostToolUse", "UserPromptSubmit":
 		notices := resp.Notices
-		if event == "PostToolUse" && in.AgentID != "" && resp.Name != "" {
+		switch {
+		case event == "PostToolUse" && in.AgentID != "" && resp.Name != "":
 			identity := fmt.Sprintf("[coordinator] you are '%s' in this workspace; use from='%s' on coordinator tools because the MCP connection is shared with the parent.", resp.Name, resp.Name)
 			notices = append([]string{identity}, notices...)
+		case resp.MonitorArmed: // the daemon says this once, and only while the monitor really polls
+			notices = append([]string{monitorArmedNotice}, notices...)
 		}
 		if len(notices) > 0 {
 			emit(stdout, in.HookEventName, strings.Join(notices, "\n"))
@@ -203,6 +207,9 @@ func Run(stdin io.Reader, stdout io.Writer, socketPath string) {
 		}
 	}
 }
+
+// monitorArmedNotice tells the model its mail monitor wakes it, so it stops arming wait.
+const monitorArmedNotice = "[coordinator] your mail monitor is armed: DMs arrive as task notifications; call read_messages when one lands; do not arm wait."
 
 // WaitProgram names the binary to put in wait hints: the bare name when it is
 // on PATH (a plugin install is not), otherwise this executable's own path.
@@ -349,15 +356,6 @@ func coordToolCall(tool string, input map[string]any, want string) (match bool, 
 		return true, ""
 	}
 	return false, ""
-}
-
-// resolveScope uses AC_SCOPE when set so a host eyes process can join a WSL
-// workspace instead of its Windows cwd.
-func resolveScope(cwd string) string {
-	if v := strings.TrimSpace(os.Getenv("AC_SCOPE")); v != "" {
-		return v
-	}
-	return scope.Resolve(cwd)
 }
 
 func normalizePaths(cwd string, paths []string) []string {

@@ -2,14 +2,108 @@
 
 [Back to the README](../README.md)
 
-For the shortest setup path, follow the [README quickstart](../README.md#install).
+This page covers every way to install agent-coordinator, what the installer changes on your
+machine, how to remove it, and what each supported client gets. Most people need only one of
+the two commands in the quick path below; the rest is for other setups and troubleshooting.
 
-### Release binary (easiest)
+## Quick path
 
-Download the binary for your OS from GitHub Releases (linux amd64/arm64,
-windows amd64, darwin amd64/arm64), put it on your PATH, then:
+Claude Code only:
 
+```sh
+claude plugin marketplace add https://github.com/Rooba/agent-coordinator
+claude plugin install agent-coordinator@agent-coordinator
 ```
+
+Any mix of Claude Code, Codex, Grok Build, and OpenCode: put the release binary on your PATH,
+then run:
+
+```sh
+agent-coordinator install
+```
+
+Use one or the other for Claude Code, not both: running both makes every hook fire twice.
+Restart your clients afterwards, and in Codex review and trust the new hooks with `/hooks`.
+
+## Install methods
+
+### Claude Code plugin
+
+```sh
+claude plugin marketplace add https://github.com/Rooba/agent-coordinator
+claude plugin install agent-coordinator@agent-coordinator
+```
+
+Inside a session, use `/plugin marketplace add https://github.com/Rooba/agent-coordinator` and
+`/plugin install agent-coordinator@agent-coordinator`. A listing in the official
+Claude Code plugin directory is being submitted; once approved, it installs from
+there too.
+
+The plugin registers the same ten Claude Code hooks and the same
+`agent-coordinator` MCP server as `agent-coordinator install`, plus a skill with
+the usage guide, plus one session monitor. No PATH setup or separate binary
+download is needed.
+
+If you previously ran `agent-coordinator install`, run
+`agent-coordinator install --uninstall` before installing the plugin, otherwise
+every hook fires twice and two MCP servers are registered.
+
+Under the plugin, MCP tools are named
+`mcp__plugin_agent-coordinator_agent-coordinator__<tool>` instead of
+`mcp__agent-coordinator__<tool>`; the hooks handle both.
+
+#### How the plugin gets its binary
+
+The binary ships as one npm package per platform (`agent-coordinator-cli-<os>-<cpu>`
+for linux-x64, linux-arm64, darwin-x64, darwin-arm64, and win32-x64), built and
+published with provenance by the release workflow. The plugin's `package.json` lists
+them as optional dependencies and its `package-lock.json` pins exact versions. When
+the plugin is installed, Claude Code installs the package for your platform with
+install scripts disabled, into `${CLAUDE_PLUGIN_ROOT}/node_modules/`. The launcher
+(`scripts/agent-coordinator` in the plugin) runs that binary and makes no network
+requests. On Windows it needs Git Bash, which Claude Code already requires there.
+
+If the binary is missing, hooks fail open (sessions keep working without a
+coordinator) and the MCP server reports one error line asking you to reinstall the
+plugin.
+
+#### Mail monitor
+
+The plugin can wake a session the moment a DM arrives, without the agent arming
+`wait` by hand. `monitors/monitors.json` declares a monitor named `mail`. Its command is
+`bash "${CLAUDE_PLUGIN_ROOT}/scripts/agent-coordinator" watch`. On Claude Code
+v2.1.105 and later, an interactive session starts that process when the
+Monitor tool is available, and each stdout line becomes a task notification
+(`mail from=... count=N ids=...`). The default trigger is `always`: session
+start and plugin reload. The agent calls `read_messages` and does not also
+arm `wait` while `whoami` reports `wake: monitor`.
+
+Claude Code skips the monitor in noninteractive `claude -p` sessions, and in
+sessions where the API provider or telemetry settings make the Monitor tool
+unavailable. A project-scope plugin (enabled from the repository) does not
+load background monitors; a personal-scope install does. Those limits are
+Claude Code's, from the [monitors component](https://code.claude.com/docs/en/plugins/components#monitors)
+and the [loading reference](https://code.claude.com/docs/en/plugins/loading).
+`agent-coordinator install` only writes hooks and MCP config, so that setup
+keeps the manual `wait` wake. A skipped monitor leaves `wake: manual`, and
+the SessionStart line still tells the agent to arm `wait`.
+
+The monitor needs plugin version 0.6.0 or newer, the first release whose binary
+has the `watch` command. To try it with unreleased changes, see
+[Development](development.md#try-the-plugin-monitor-from-source).
+
+Grok Build can arm `agent-coordinator watch` once through its own monitor
+tool (`persistent: true`). The Codex and OpenCode installs keep `wait`.
+
+### Release binary
+
+Download the binary for your OS from
+[GitHub Releases](https://github.com/Rooba/agent-coordinator/releases)
+(linux amd64/arm64, windows amd64, darwin amd64/arm64). Assets are named
+`agent-coordinator_<os>_<arch>`; rename yours to `agent-coordinator`
+(`agent-coordinator.exe` on Windows), put it on your PATH, then:
+
+```sh
 agent-coordinator install
 ```
 
@@ -19,19 +113,21 @@ Windows (PowerShell):
 agent-coordinator.exe install
 ```
 
+Each release also attaches a `SHA256SUMS` file and one `.mcpb` MCP bundle per platform.
+
 ### go install
 
-```
+```sh
 go install github.com/Rooba/agent-coordinator/cmd/agent-coordinator@latest
 agent-coordinator install
 ```
 
-For a private repository, set `GOPRIVATE` to its GitHub owner path and use Git
+For a private fork, set `GOPRIVATE` to its GitHub owner path and use Git
 credentials that can read it.
 
 ### From source
 
-```
+```sh
 git clone https://github.com/Rooba/agent-coordinator
 cd agent-coordinator
 make install
@@ -58,60 +154,12 @@ path to your installed binary:
 
 On Windows, use the `.exe` path and JSON-escaped backslashes. The MCP process's
 working directory selects its workspace; launch it in the repository the agents
-share. MCP provides messaging and presence even when the client has no lifecycle
-hook integration. Automatic tool activity and session tracking require hooks.
+share, or set `AC_SCOPE` (see [Configuration](reference.md#configuration)). MCP
+provides messaging and presence even when the client has no lifecycle hook
+integration; the agent calls `register_agent` once to get a name. Automatic tool
+activity and session tracking require hooks.
 
-### Claude Code plugin
-
-```
-claude plugin marketplace add https://github.com/Rooba/agent-coordinator
-claude plugin install agent-coordinator@agent-coordinator
-```
-
-Inside a session, use `/plugin marketplace add https://github.com/Rooba/agent-coordinator` and
-`/plugin install agent-coordinator@agent-coordinator`. A listing in the official
-Claude Code plugin directory is being submitted; once approved, it installs from
-there too.
-
-The plugin registers the same ten Claude Code hooks and the same
-`agent-coordinator` MCP server as `agent-coordinator install`, plus a skill with
-the usage guide. No PATH setup or separate binary download is needed.
-
-The binary ships as one npm package per platform (`agent-coordinator-cli-<os>-<cpu>`
-for linux-x64, linux-arm64, darwin-x64, darwin-arm64, and win32-x64), built and
-published with provenance by the release workflow. The plugin's `package.json` lists
-them as optional dependencies and its `package-lock.json` pins exact versions. When
-the plugin is installed, Claude Code installs the package for your platform with
-install scripts disabled, into `${CLAUDE_PLUGIN_ROOT}/node_modules/`. The launcher
-(`scripts/agent-coordinator` in the plugin) runs that binary and makes no network
-requests. On Windows it needs Git Bash, which Claude Code already requires there.
-
-If the binary is missing, hooks fail open (sessions keep working without a
-coordinator) and the MCP server reports one error line asking you to reinstall the
-plugin.
-
-Under the plugin, MCP tools are named
-`mcp__plugin_agent-coordinator_agent-coordinator__<tool>` instead of
-`mcp__agent-coordinator__<tool>`; the hooks handle both.
-
-Do not run both. If you previously ran `agent-coordinator install`, run
-`agent-coordinator install --uninstall` before installing the plugin, otherwise
-every hook fires twice and two MCP servers are registered.
-
-#### Releasing a new plugin version
-
-1. Bump `version` in `packaging/claude-plugin/.claude-plugin/plugin.json`,
-   `.claude-plugin/marketplace.json`, and `packaging/claude-plugin/package.json`
-   (its `version` and every `optionalDependencies` entry).
-2. Tag `v<version>` and push the tag. The release workflow fails if the tag and
-   manifests disagree; otherwise it builds the release and, when the repository
-   variable `NPM_PUBLISH` is `true`, publishes the npm packages.
-3. Run `make plugin-lock`, commit `packaging/claude-plugin/package-lock.json`, push,
-   and resubmit the plugin to the directory.
-
-The lockfile can only be generated once the packages for that version are published.
-
-### What `install` does
+## What `install` does
 
 - merges Claude lifecycle hooks into `~/.claude/settings.json` (SessionStart,
   UserPromptSubmit, PreToolUse, PostToolUse, PreCompact, PostCompact, Stop, SubagentStart, SubagentStop,
@@ -123,7 +171,8 @@ The lockfile can only be generated once the packages for that version are publis
 - writes Grok Build lifecycle hooks to `~/.grok/hooks/agent-coordinator.json`
   (same set as Claude - dedicated file, not only Claude-compat import),
 - replaces stale `agent-coordinator` MCP registrations for Claude Code, Codex,
-  and Grok Build, and merges the local server into OpenCode's global JSON config,
+  and Grok Build, and merges the local server into OpenCode's global JSON config.
+  A client whose CLI is not installed is skipped with a note,
 - on Linux with systemd, additionally sets up socket activation
   (`agent-coordinator.socket` + `agent-coordinator.service` user units) as a
   nicety, and `try-restart`s the service so a running daemon picks up a new
@@ -133,12 +182,25 @@ No systemd is required anywhere: clients start the daemon on demand, so
 stock WSL, macOS, and native Windows work out of the box. When `systemctl`
 is absent or fails, install prints a note, skips the units, and continues.
 
-Uninstall: `agent-coordinator install --uninstall` (or `make uninstall`).
-It removes the units, strips exactly the hooks it added, and deregisters
-the MCP server. State in `~/.local/state/agent-coordinator/` is left
-behind; delete it by hand for a clean slate.
+Re-run `agent-coordinator install` after an upgrade to add new hooks to an
+existing installation, then review them in Codex's `/hooks`.
 
-### Harness support
+## Uninstall
+
+```sh
+agent-coordinator install --uninstall
+```
+
+(or `make uninstall` from a source checkout). It removes the systemd units,
+strips exactly the hooks it added (including the Grok hooks file), and
+deregisters the MCP server from every client install registered it with
+(Claude Code, Codex, Grok Build, and OpenCode). State in
+`~/.local/state/agent-coordinator/` is left behind; delete it by hand for a
+clean slate.
+
+For the plugin: `claude plugin uninstall agent-coordinator@agent-coordinator`.
+
+## Harness support
 
 - Claude Code: MCP plus session, tool, prompt, stop, and subagent lifecycle tracking.
 - Codex: MCP plus native hook tracking, including subagent identity, compaction,
@@ -157,5 +219,4 @@ for event support and lifecycle timing.
 
 Compaction hooks update activity and send peers a short notice that context is
 being compacted or has been compacted, so important handoff details can be
-restated. They preserve the agent's recorded tasks. Re-run `agent-coordinator install`
-to add new hooks to an existing installation, then review them in Codex's `/hooks`.
+restated. They preserve the agent's recorded tasks.

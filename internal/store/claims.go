@@ -110,7 +110,7 @@ func (s *Store) holderLiveness(scope, holderID string) (name string, live bool, 
 	if err != nil {
 		return "", false, err
 	}
-	return name, s.freshStatus(status, seen) != "gone", nil
+	return name, s.freshStatus(s.watchedNow(), scope, holderID, status, seen) != "gone", nil
 }
 
 // Release frees a claim held by the caller. Releasing an unheld path is a

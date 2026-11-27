@@ -16,6 +16,7 @@ import (
 
 	"github.com/Rooba/agent-coordinator/internal/protocol"
 	"github.com/Rooba/agent-coordinator/internal/socktest"
+	"github.com/Rooba/agent-coordinator/internal/wake"
 )
 
 // peekDaemon answers peek. The first `baselineMisses` successful connections
@@ -189,7 +190,7 @@ func TestWaitForMailConcurrentWaitersDoNotCheckpointUnread(t *testing.T) {
 	}
 	sock := peekDaemon(t, 0, 0, 10)
 	type outcome struct {
-		result waitResult
+		result wake.Info
 		found  bool
 		err    error
 	}

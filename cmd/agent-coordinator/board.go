@@ -30,12 +30,7 @@ func runBoard(args []string) {
 		os.Exit(2)
 	}
 
-	cwd, err := os.Getwd()
-	if err != nil {
-		cwd = "."
-	}
-	sc := scope.Resolve(cwd)
-	agents, err := fetchBoard(paths.Socket(), sc, *live, *all)
+	agents, err := fetchBoard(paths.Socket(), scope.Here(), *live, *all)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "board: %v\n", err)
 		os.Exit(1)

@@ -239,3 +239,65 @@ func TestEventAutoRegisters(t *testing.T) {
 		t.Fatal("event must auto-register unknown session")
 	}
 }
+
+func TestWatcherLivenessWakeAndAnnounce(t *testing.T) {
+	s := open(t)
+	now := time.Unix(1_000_000, 0)
+	s.Now = func() time.Time { return now }
+	s.Register("/r", "p", "hook")
+	child, _, _ := s.RegisterChild("/r", "p", "kid", "worker")
+	wakeOf := func(name string) string {
+		t.Helper()
+		board, err := s.Board("/r", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, a := range board {
+			if a.Name == name {
+				return a.Wake
+			}
+		}
+		t.Fatalf("no board row %q", name)
+		return ""
+	}
+	parent, _ := s.Identity("/r", "p")
+	if parent.Wake != WakeManual || s.AnnounceWatcher("/r", "p") {
+		t.Fatalf("no monitor yet: want manual and no announce, got %+v", parent)
+	}
+
+	s.StampWatcher("/r", parent)
+	if id, _ := s.Identity("/r", "p"); id.Wake != WakeMonitor || wakeOf(id.Name) != WakeMonitor {
+		t.Fatalf("live monitor must report monitor: %+v", id)
+	}
+	if wakeOf(child) != WakeManual {
+		t.Fatal("a child never inherits the parent's monitor")
+	}
+	if !s.AnnounceWatcher("/r", "p") || s.AnnounceWatcher("/r", "p") {
+		t.Fatal("announce must fire exactly once per live stretch")
+	}
+
+	// A child's own watcher poll stamps nothing.
+	kid, _ := s.Identity("/r", ChildSessionID("p", "kid"))
+	s.StampWatcher("/r", kid)
+	if wakeOf(child) != WakeManual {
+		t.Fatal("child watcher poll must leave the child manual")
+	}
+
+	// Polls within the window keep the stretch, and its announced flag, alive.
+	now = now.Add(WatcherLive)
+	s.StampWatcher("/r", parent)
+	if s.AnnounceWatcher("/r", "p") {
+		t.Fatal("a continuous stretch must not re-announce")
+	}
+
+	// A lapse expires liveness; the next poll starts a new stretch that is
+	// announced again even though no prompt saw the lapse.
+	now = now.Add(WatcherLive + time.Second)
+	if id, _ := s.Identity("/r", "p"); id.Wake != WakeManual {
+		t.Fatalf("monitor silent past %v must read manual: %+v", WatcherLive, id)
+	}
+	s.StampWatcher("/r", parent)
+	if !s.AnnounceWatcher("/r", "p") {
+		t.Fatal("a new live stretch after a lapse must announce again")
+	}
+}

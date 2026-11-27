@@ -29,15 +29,23 @@ Under this plugin the tools are named `mcp__plugin_agent-coordinator_agent-coord
 
 ## Wake pattern (do not busy-poll)
 
-When waiting on a peer, run the exact `wait` command the SessionStart line prints (under the
-plugin the binary is not on PATH, so that line carries its full path). In Claude Code, arm it
-as a BACKGROUND task: a new turn starts when it exits.
+This plugin declares a session monitor named `mail` (`monitors/monitors.json`). When Claude Code is
+running it, that process is `agent-coordinator watch`. Each stdout line `mail from=... count=N ids=...`
+is new mail: call `read_messages` and continue. Do not also arm `wait`. `whoami` reports
+`wake: monitor` while the watcher is live, and one prompt-submit line says so. Subagents still arm
+`wait`: those lines arrive in the parent conversation.
+
+When `wake` is `manual`, arm `wait` yourself. Claude Code leaves it manual for noninteractive
+`claude -p`, when the API provider or telemetry settings make the Monitor tool unavailable, and for
+a project-scope plugin. Run the exact command the SessionStart line prints (under the plugin the
+binary is not on PATH, so that line carries its full path). In Claude Code, arm it as a BACKGROUND
+task: a new turn starts when it exits.
 
 - Stderr prints `armed after_id=N` once its durable cursor is set; no mail is lost across a
   kill or timeout.
 - Exit 0 (`mail from=... count=N`) is a wake signal: call `read_messages`, act, then re-arm.
 - Exit 1 (`timeout`): re-arm, lengthening the timeout as work quiesces (570 -> 900 -> 1500s).
-- Idling in multi-agent work without an armed wait is a bug.
+- Idling in multi-agent work with no live mail monitor and no armed wait is a bug.
 
 ## Do
 
