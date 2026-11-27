@@ -33,6 +33,9 @@ it. Do not grep the filesystem for it.
   `from='<child name>'` so they do not drain the parent inbox.
 - `peek_messages(from?)` - non-destructive unread preview.
 - `broadcast(body, from?)` - one-shot to agents registered **now**; late joiners miss it.
+- `claim(path, note?)` / `release(path)` / `list_claims` - advisory ledger of who owns which
+  file; a claim held by a live peer fails and names the holder. Not a lock.
+- `message_history` - your sent and received mail with read times; clears nothing.
 
 ## Cross-workspace relay and Windows eyes (For WSL)
 
@@ -65,7 +68,8 @@ plugin reload; it skips noninteractive `claude -p` and sessions whose API provid
 settings disable that tool. A project-scope plugin does not load background monitors.
 `agent-coordinator install` writes hooks only, so it keeps manual `wait`. Grok Build can arm
 `agent-coordinator watch` once through its monitor tool with `persistent: true`. The Codex, Kimi,
-Cursor, Gemini CLI, and OpenCode installs in this repo keep manual `wait`. Subagents always arm
+and OpenCode installs in this repo, and any manually configured MCP client, keep manual `wait`.
+Subagents always arm
 `wait`: monitor lines arrive in the parent conversation.
 
 **Manual `wait`** when `wake` is `manual`. Run `agent-coordinator wait '<yourname>' -timeout <sec>`
